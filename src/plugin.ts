@@ -5,9 +5,7 @@ import {
   evaluate,
   fingerprint,
   HEAD_SUITES_QUERY,
-  headCommit,
   ONE_PR_QUERY,
-  ONE_PR_WITH_CHECKS_QUERY,
   OPEN_PRS_QUERY,
   mayAct,
   ownerOf,
@@ -23,6 +21,7 @@ import {
   type GraphRuns,
   type GraphSuites,
   type PrCheck,
+  type PrState,
   type Signal,
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
@@ -159,34 +158,34 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
 }
 
 /**
- * Every check run on the head commit: the first page came with the PR read, the rest is paged through (suites, then
- * the runs of each suite), so a run past the first 100 suites or runs is never invisible. Any failed page throws:
- * the caller treats it as transient, never as "not red".
+ * Every check run on the head commit, read by its oid: suites page by page, then the runs of each suite, so a run past
+ * the first 100 suites or runs is never invisible. Any failed page throws: the caller treats it as transient, never
+ * as "not red".
  */
-async function headCheckRuns(ctx: PluginContext, companyId: string, config: DoerWakeConfig, repo: string, commit: { oid: string; checkSuites: GraphSuites }): Promise<CheckRunState[]> {
+async function headCheckRuns(ctx: PluginContext, companyId: string, config: DoerWakeConfig, repo: string, oid: string): Promise<CheckRunState[]> {
   const [o, r] = repo.split("/");
   const runs: CheckRunState[] = [];
-  let suites = commit.checkSuites;
+  let cursor: string | null = null;
   for (;;) {
+    const data: { repository: { object: { checkSuites?: GraphSuites } | null } | null } | null = await githubGraphql(
+      ctx, companyId, config, HEAD_SUITES_QUERY, { o, r, oid, suites: cursor },
+    );
+    const suites: GraphSuites | undefined = data?.repository?.object?.checkSuites;
+    if (!suites) throw new Error(`check suites of ${oid} not readable`);
     for (const suite of suites.nodes) {
       let page = suite.checkRuns;
       for (;;) {
         runs.push(...page.nodes.map((run) => ({ ...run, suite: suite.id })));
         if (!page.pageInfo.hasNextPage) break;
         if (!page.pageInfo.endCursor) throw new Error(`check suite ${suite.id}: next page without a cursor`);
-        const data = await githubGraphql<{ node: { checkRuns?: GraphRuns } | null }>(ctx, companyId, config, SUITE_RUNS_QUERY, { id: suite.id, runs: page.pageInfo.endCursor });
-        if (!data?.node?.checkRuns) throw new Error(`check suite ${suite.id} not readable`);
-        page = data.node.checkRuns;
+        const next = await githubGraphql<{ node: { checkRuns?: GraphRuns } | null }>(ctx, companyId, config, SUITE_RUNS_QUERY, { id: suite.id, runs: page.pageInfo.endCursor });
+        if (!next?.node?.checkRuns) throw new Error(`check suite ${suite.id} not readable`);
+        page = next.node.checkRuns;
       }
     }
     if (!suites.pageInfo.hasNextPage) return runs;
-    if (!suites.pageInfo.endCursor) throw new Error(`check suites of ${commit.oid}: next page without a cursor`);
-    const data = await githubGraphql<{ repository: { object: { checkSuites?: GraphSuites } | null } | null }>(
-      ctx, companyId, config, HEAD_SUITES_QUERY, { o, r, oid: commit.oid, suites: suites.pageInfo.endCursor },
-    );
-    const next = data?.repository?.object?.checkSuites;
-    if (!next) throw new Error(`check suites of ${commit.oid} not readable`);
-    suites = next;
+    if (!suites.pageInfo.endCursor) throw new Error(`check suites of ${oid}: next page without a cursor`);
+    cursor = suites.pageInfo.endCursor;
   }
 }
 
@@ -199,22 +198,22 @@ async function headCheckRuns(ctx: PluginContext, companyId: string, config: Doer
  */
 async function currentPrState(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<PrCheck> {
   const [owner, name] = signal.repo.split("/");
-  let pr: GraphPr | null | undefined;
-  let checkRuns: CheckRunState[] | undefined;
+  let state: PrState | undefined;
   try {
     const data = await githubGraphql<{ repository: { pullRequest: GraphPr | null } | null }>(
-      ctx, companyId, config,
-      signal.state === "conflict" ? ONE_PR_QUERY : ONE_PR_WITH_CHECKS_QUERY,
-      { o: owner, r: name, n: signal.number },
+      ctx, companyId, config, ONE_PR_QUERY, { o: owner, r: name, n: signal.number },
     );
-    pr = data?.repository?.pullRequest;
-    const commit = pr && signal.state !== "conflict" ? headCommit(pr) : undefined;
-    if (commit) checkRuns = await headCheckRuns(ctx, companyId, config, signal.repo, commit);
+    const pr = data?.repository?.pullRequest;
+    state = pr ? prStateFromGraph(signal.repo, pr, config) : undefined;
+    // Check runs only matter (and are only read) once the PR could wake on this head.
+    if (state && signal.state !== "conflict" && state.open && state.head === signal.head && state.trusted && !state.draft) {
+      state = { ...state, checkRuns: await headCheckRuns(ctx, companyId, config, signal.repo, state.head) };
+    }
   } catch (error) {
     return { kind: "transient", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
   }
-  if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "PR not found" };
-  return evaluate(prStateFromGraph(signal.repo, pr, config, checkRuns), signal, config);
+  if (!state) return { kind: "skip", outcome: "skipped_closed", detail: "PR not found" };
+  return evaluate(state, signal, config);
 }
 
 type LedgerRow = {

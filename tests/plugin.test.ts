@@ -49,6 +49,11 @@ type Graph = {
   checks?: CheckRun[];
   /** GraphQL partial errors returned beside the data (for example a token without the Checks permission). */
   errors?: Array<Record<string, unknown>>;
+  /**
+   * What `commits(last:1)` would return: GitHub caps the PR commits connection at 250, so on a longer PR it is not
+   * the head. Default: the head.
+   */
+  lastCommit?: string;
 };
 const RUN_ID = "CR_kwDOrun100";
 const RUN_STARTED = "2026-10-27T04:00:00Z";
@@ -290,13 +295,18 @@ function setup(config: Record<string, unknown> = {}) {
       return { pageInfo, nodes: nodes.map((id) => ({ id, checkRuns: runsPage(id, null) })) };
     };
     if (query.includes("node(id:")) return new Response(JSON.stringify({ data: { node: { checkRuns: runsPage(variables.id, variables.runs) } } }), { status: 200 });
-    if (query.includes("object(oid:")) return new Response(JSON.stringify({ data: { repository: { object: { checkSuites: suitesPage(variables.suites) } } } }), { status: 200 });
+    if (query.includes("object(oid:")) {
+      // Suites exist only on the commit GitHub lists as the PR head.
+      const object = variables.oid === (graph?.head ?? HEAD) ? { checkSuites: suitesPage(variables.suites) } : { checkSuites: suitesPage("999") };
+      const data = { repository: { object } };
+      return new Response(JSON.stringify(graph?.errors ? { data, errors: graph.errors } : { data }), { status: 200 });
+    }
     const nodes = graph ? [{
       number: n, url: `https://github.com/TogetherWeOwn/two-web-next/pull/${n}`, state: graph.state ?? "OPEN", isDraft: graph.isDraft,
       isCrossRepository: graph.cross ?? false, authorAssociation: graph.association ?? "MEMBER", author: { login: graph.login ?? "doer" },
       headRefOid: graph.head ?? HEAD, headRefName: graph.ref ?? "feat/quality", baseRefName: "main", mergeable: graph.mergeable, updatedAt: graph.updatedAt ?? new Date().toISOString(),
       ...(query.includes("checkSuites")
-        ? { commits: { nodes: [{ commit: { oid: graph.head ?? HEAD, checkSuites: suitesPage(null) } }] } }
+        ? { commits: { nodes: [{ commit: { oid: graph.lastCommit ?? graph.head ?? HEAD, checkSuites: suitesPage(graph.lastCommit ? "999" : null) } }] } }
         : {}),
     }] : [];
     const data = { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes }, pullRequest: nodes[0] ?? null } };
@@ -777,7 +787,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     await deliver("check_run", ciFailed("build"));
     await deliver("check_run", ciFailed("test"));
     expect(wakes).toHaveLength(1);
-    expect(graphCalls).toBe(1);
+    expect(graphCalls).toBe(2); // the first delivery only: one PR read plus one read of the head suites
   });
 
   it("a retry posts the evidence comment that the first attempt never posted", async () => {
@@ -1246,10 +1256,16 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toHaveLength(1);
   });
 
+  it("a PR past GitHub's 250-commit cap still has its head checks read (by head oid, not commits(last:1))", async () => {
+    graph = { mergeable: "MERGEABLE", isDraft: false, lastCommit: "e".repeat(40) };
+    await deliver("check_run", ciFailed("build"));
+    expect(wakes).toHaveLength(1);
+  });
+
   it("a GitHub token without the Checks permission is reported as a config error and the signal is kept", async () => {
     graph = {
       mergeable: "MERGEABLE", isDraft: false,
-      errors: [{ type: "FORBIDDEN", path: ["repository", "pullRequest", "commits", "nodes", 0, "commit", "checkSuites"], message: "Resource not accessible by personal access token" }],
+      errors: [{ type: "FORBIDDEN", path: ["repository", "object", "checkSuites"], message: "Resource not accessible by personal access token" }],
     };
     await deliver("check_run", ciFailed("build"));
     expect(wakes).toEqual([]);
@@ -1609,6 +1625,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
         await deliver("check_run", ciFailed("build"));
         expect(row()!.outcome).toBe("error");
         harness.setConfig({ ...baseConfig, enabled: false });
+        for (const r of ledger.values()) r.aged = true; // 30 days later
         await harness.runJob(SWEEP_JOB_KEY); // compaction runs for every company
         expect(row()!.signal).not.toBe("{}");
         harness.setConfig(baseConfig);
@@ -1625,7 +1642,6 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       graphFail = false;
       row()!.signal = "{}";
       await deliver("check_run", ciFailed("build"));
-        for (const r of ledger.values()) r.aged = true; // 30 days later
       expect(wakes).toHaveLength(1);
     });
   });

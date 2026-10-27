@@ -356,7 +356,7 @@ export const OPEN_PRS_QUERY = `query($o:String!,$r:String!,$base:String,$cursor:
 pullRequests(states:OPEN,first:50,after:$cursor,baseRefName:$base){pageInfo{hasNextPage endCursor}
 nodes{${PR_FIELDS}}}}}`;
 
-/** One PR, for conflict signals (mergeability is in PR_FIELDS). */
+/** One PR, for every signal (mergeability is in PR_FIELDS; check signals then read HEAD_SUITES_QUERY on its head). */
 export const ONE_PR_QUERY = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
 pullRequest(number:$n){${PR_FIELDS}}}}`;
 
@@ -364,17 +364,13 @@ const RUNS = "checkRuns(first:100,after:$runs,filterBy:{checkType:LATEST}){pageI
 const SUITES = `checkSuites(first:100,after:$suites){pageInfo{hasNextPage endCursor} nodes{id ${RUNS}}}`;
 
 /**
- * One PR plus the first page of check suites and runs on its head commit, in the same read, for check signals
- * (checkVerdict filters the relevant names; plugin.ts headCheckRuns reads the remaining pages with the two queries
- * below). GitHub GraphQL: Commit.checkSuites, CheckSuite.checkRuns(filterBy: CheckRunFilter{checkType: LATEST}).
+ * The check suites and their first runs on the PR's head commit, read by the `headRefOid` ONE_PR_QUERY returned (never
+ * through `commits(last:1)`, which GitHub caps at 250 commits); `$suites` pages through the rest. checkVerdict filters
+ * the relevant names; plugin.ts headCheckRuns pages the runs of each suite with SUITE_RUNS_QUERY. GitHub GraphQL:
+ * Repository.object(oid:), Commit.checkSuites, CheckSuite.checkRuns(filterBy: CheckRunFilter{checkType: LATEST}).
  * Reading check suites needs the Checks read permission, which fine-grained personal access tokens cannot get
  * (README "GitHub token").
  */
-export const ONE_PR_WITH_CHECKS_QUERY = `query($o:String!,$r:String!,$n:Int!,$suites:String,$runs:String){repository(owner:$o,name:$r){
-pullRequest(number:$n){${PR_FIELDS}
-commits(last:1){nodes{commit{oid ${SUITES}}}}}}}`;
-
-/** The next page of check suites on a commit (the head the first read saw). */
 export const HEAD_SUITES_QUERY = `query($o:String!,$r:String!,$oid:GitObjectID!,$suites:String,$runs:String){repository(owner:$o,name:$r){
 object(oid:$oid){... on Commit{${SUITES}}}}}`;
 
@@ -398,14 +394,6 @@ export interface GraphPr {
   baseRefName: string;
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   updatedAt: string;
-  /** Only with ONE_PR_WITH_CHECKS_QUERY. */
-  commits?: { nodes: Array<{ commit: { oid: string; checkSuites: GraphSuites } }> };
-}
-
-/** The commit ONE_PR_WITH_CHECKS_QUERY read, if it is the PR's head; its check runs are then authoritative. */
-export function headCommit(pr: GraphPr): { oid: string; checkSuites: GraphSuites } | undefined {
-  const commit = pr.commits?.nodes?.[0]?.commit;
-  return commit && commit.oid === pr.headRefOid ? commit : undefined;
 }
 
 /** `checkRuns`: every run on the head commit (plugin.ts headCheckRuns); omitted when not read. */

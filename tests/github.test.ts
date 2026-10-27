@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../src/config.js";
-import { checkVerdict, evaluate, fingerprint, headCommit, isTrustedAuthor, mayAct, parseEvent, policySkip, prStateFromGraph, reviewScore, verifySignature, type Signal } from "../src/github.js";
+import { checkVerdict, evaluate, fingerprint, isTrustedAuthor, mayAct, parseEvent, policySkip, prStateFromGraph, reviewScore, verifySignature, type Signal } from "../src/github.js";
 
 const repository = { full_name: "TogetherWeOwn/two-web-next", default_branch: "main", owner: { login: "TogetherWeOwn" } };
 const config = parseConfig({ enabled: true, githubOrg: "TogetherWeOwn", webhookSecretRef: { type: "secret_ref", secretId: "x" }, githubTokenSecretRef: { type: "secret_ref", secretId: "y" } });
@@ -203,16 +203,12 @@ describe("checkVerdict (the failing checks are revalidated)", () => {
     (payload.check_run as any).started_at = "2026-10-27T04:00:00Z";
     expect(parseEvent("check_run", payload, config).signals[0]!.detail).toMatchObject({ checkRunId: "CR_100", checkStartedAt: "2026-10-27T04:00:00Z" });
   });
-  it("runs are read only from the PR's head commit", () => {
+  it("prStateFromGraph carries the head runs only when they were read", () => {
     const node = { number: 7, url: "u", state: "OPEN" as const, isDraft: false, isCrossRepository: false, authorAssociation: "MEMBER", author: { login: "doer" }, headRefOid: HEAD, headRefName: "x", baseRefName: "main", mergeable: "MERGEABLE" as const, updatedAt: "t" };
-    const none = { hasNextPage: false, endCursor: null };
-    const commits = (oid: string) => ({ nodes: [{ commit: { oid, checkSuites: { pageInfo: none, nodes: [{ id: "CS_1", checkRuns: { pageInfo: none, nodes: [run("CR_1", "FAILURE", null)] } }] } } }] });
-    expect(headCommit({ ...node, commits: commits(HEAD) })?.oid).toBe(HEAD);
-    expect(headCommit({ ...node, commits: commits("f".repeat(40)) })).toBeUndefined();
-    expect(headCommit(node)).toBeUndefined();
     expect(prStateFromGraph("o/r", node, config).checkRuns).toBeUndefined();
     expect(prStateFromGraph("o/r", node, config, [run("CR_1", "FAILURE", null)]).checkRuns?.map((r) => r.id)).toEqual(["CR_1"]);
   });
+
 });
 
 describe("policySkip", () => {
