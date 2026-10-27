@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-pr-doer-wake",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Wakes the Paperclip card that owns a GitHub pull request exactly once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a check really fails, a merge conflict appears or it merges. Uses ctx.issues.requestWakeup, so blockers, terminal status and budgets are honoured by the host.",
   "license": "MIT",
   "type": "module",
