@@ -168,4 +168,21 @@ describe("prUrlPatterns", () => {
     expect(owns("https://github.com/togetherweown/two-web-next/pull/19034")).toBe(false);
     expect(owns("https://github.com/xtogetherweown/two-web-next/pull/1903")).toBe(false);
   });
+  it("never counts a PR URL embedded in another host's URL, even behind '(' or '='", () => {
+    const pr = "https://github.com/TogetherWeOwn/two-web-next/pull/1903";
+    expect(owns(`https://example.org/?redirect=(${pr})`)).toBe(false);
+    expect(owns(`https://example.org/?redirect=${pr}`)).toBe(false);
+    expect(owns(`https://example.org/?a=1&b=${pr}`)).toBe(false);
+    expect(owns(`https://example.org/x(${pr})`)).toBe(false);
+    expect(owns(`see (${pr})`)).toBe(false); // a bare '(' is not a token start
+    expect(owns(`*${pr}*`)).toBe(false);
+    expect(owns(`"${pr}"`)).toBe(false);
+  });
+  it("still counts a PR URL that starts a token: line start, whitespace, '<' or a markdown link target", () => {
+    expect(owns("[x](https://github.com/TogetherWeOwn/two-web-next/pull/1903)")).toBe(true);
+    expect(owns("[PR](https://github.com/TogetherWeOwn/two-web-next/pull/1903 \"title\")")).toBe(true);
+    expect(owns("<https://github.com/TogetherWeOwn/two-web-next/pull/1903>")).toBe(true);
+    expect(owns("done\thttps://github.com/TogetherWeOwn/two-web-next/pull/1903")).toBe(true);
+    expect(owns("https://example.org/ https://github.com/TogetherWeOwn/two-web-next/pull/1903")).toBe(true);
+  });
 });

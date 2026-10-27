@@ -1625,6 +1625,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       graphFail = false;
       row()!.signal = "{}";
       await deliver("check_run", ciFailed("build"));
+        for (const r of ledger.values()) r.aged = true; // 30 days later
       expect(wakes).toHaveLength(1);
     });
   });

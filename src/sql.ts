@@ -188,18 +188,19 @@ export function escapeLike(value: string): string {
 }
 
 /**
- * Characters that may sit inside a URL right before `https://`: if one precedes it, the GitHub URL is embedded in
- * another URL (`https://evil.io/?u=https://github.com/...`) or glued to a word (`xhttps://`). Whitespace, line start
- * and markdown or angle-bracket delimiters (`(`, `[`, `<`, `*`) are boundaries. Valid in JS and Postgres ARE alike.
+ * Where a PR URL may start to count as ownership evidence: at the start of the text, after whitespace, after `<`
+ * (an autolink) or as a markdown link target `](`. Anything else (`=`, `?`, `&`, a bare `(`, `/`, a letter) can put the
+ * GitHub URL inside another host's URL (`https://evil.io/?u=(https://github.com/...)`), so it never counts: fail
+ * closed. An allow-list, not a deny-list of URL characters. Valid in JS and Postgres ARE alike.
  */
-const URL_PRECEDING_CHARS = "A-Za-z0-9/._~%+=?&#@:-";
+const URL_TOKEN_START = "(^|\\s|<|\\]\\()";
 
 /**
  * The PR URL as ownership evidence: an actual `https://github.com/<org>/<repo>/pull/<n>` link, case-insensitive,
- * that starts at a boundary (never inside another URL or on another host such as `notgithub.com`) and ends at a
+ * that starts a token (never inside another URL or on another host such as `notgithub.com`) and ends at a
  * non-digit (never `/pull/<n>3`). The LIKE pattern pins scheme and host; the regex adds both boundaries.
  */
 export function prUrlPatterns(repo: string, number: number): { like: string; regex: string } {
   const url = `https://github.com/${repo}/pull/${number}`;
-  return { like: `%${escapeLike(url)}%`, regex: `(^|[^${URL_PRECEDING_CHARS}])${escapeRegex(url)}([^0-9]|$)` };
+  return { like: `%${escapeLike(url)}%`, regex: `${URL_TOKEN_START}${escapeRegex(url)}([^0-9]|$)` };
 }
