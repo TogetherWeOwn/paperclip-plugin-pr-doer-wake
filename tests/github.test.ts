@@ -97,15 +97,20 @@ describe("pull_request and push", () => {
       user: { login: "doer" }, author_association: "MEMBER", updated_at: "2026-10-27T04:00:00Z", ...extra,
     },
   });
-  it("pull_request deliveries carry no wake decision: only a payload already reporting a conflict is a candidate", () => {
+  it("pull_request deliveries carry no wake decision: an open non-draft PR after a head/base change is a candidate", () => {
     for (const action of ["converted_to_draft", "closed", "labeled"]) {
       expect(mayAct("pull_request", pr({ mergeable_state: "dirty" }, action))).toBe(false);
       expect(parseEvent("pull_request", pr({ mergeable_state: "dirty" }, action), config).signals).toEqual([]);
     }
-    expect(mayAct("pull_request", pr({}))).toBe(false);
     expect(parseEvent("pull_request", pr({ state: "closed", merged: true }, "closed"), config).signals).toEqual([]);
-    const dirty = parseEvent("pull_request", pr({ mergeable_state: "dirty" }), config).signals;
-    expect(dirty).toEqual([expect.objectContaining({ state: "conflict", draft: null, trusted: null })]); // decided by the lookup
+    for (const action of ["opened", "reopened", "synchronize", "ready_for_review", "edited"]) {
+      // GitHub computes mergeability lazily: the payload's mergeable_state is never a prerequisite.
+      for (const extra of [{}, { mergeable_state: "unknown", mergeable: null }, { mergeable_state: "dirty", mergeable: false }]) {
+        expect(mayAct("pull_request", pr(extra, action))).toBe(true);
+        const signals = parseEvent("pull_request", pr(extra, action), config).signals;
+        expect(signals).toEqual([expect.objectContaining({ state: "conflict", draft: null, trusted: null })]); // decided by the lookup
+      }
+    }
   });
   it("marks fork PRs and outsider authors untrusted; trustedAuthors admits bots", () => {
     const node = { number: 7, url: "u", state: "OPEN" as const, isDraft: false, isCrossRepository: false, authorAssociation: "NONE", author: { login: "paperclip-agent[bot]" }, headRefOid: HEAD, headRefName: "TOG-1-x", baseRefName: "main", mergeable: "MERGEABLE" as const, updatedAt: "2026-10-27T04:00:00Z" };
@@ -139,8 +144,8 @@ describe("pull_request and push", () => {
     const { checkRuns: _unread, ...unread } = entry;
     expect(evaluate(unread, signal, config)).toMatchObject({ kind: "transient" }); // a check signal never wakes without its checks read
   });
-  it("signals a conflict when GitHub already reports mergeable_state dirty on a non-draft PR", () => {
-    expect(parseEvent("pull_request", pr({ mergeable_state: "dirty" }), config).signals.map((s) => s.state)).toEqual(["conflict"]);
+  it("never signals a draft PR from its payload (ready_for_review starts it again)", () => {
+    expect(mayAct("pull_request", pr({ draft: true }, "opened"))).toBe(false);
     expect(parseEvent("pull_request", pr({ mergeable_state: "dirty", draft: true }), config).signals).toEqual([]);
   });
   it("marks a repo for the conflict sweep only when its default branch moves", () => {

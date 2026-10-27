@@ -82,7 +82,12 @@ export const RED_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure
 /** The only Paperclip Review conclusion that is a finding (see parseEvent). */
 export const REVIEW_RED_CONCLUSIONS = new Set(["failure"]);
 
-/** pull_request actions whose payload may already report a merge conflict (`mergeable_state: dirty`). */
+/**
+ * pull_request actions after which the PR may conflict (new or reopened PR, new head, base changed by an edit). The
+ * payload's `mergeable_state` is not consulted: GitHub computes it lazily, so an opened or synchronize payload usually
+ * says `unknown` with `mergeable: null` even when the PR conflicts. The authoritative lookup (evaluate) decides, and
+ * UNKNOWN there is deferred and read again by the sweep.
+ */
 export const CONFLICT_PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "ready_for_review", "edited"]);
 
 /**
@@ -94,7 +99,7 @@ export const CONFLICT_PR_ACTIONS = new Set(["opened", "reopened", "synchronize",
 export function mayAct(eventName: string, payload: Json): boolean {
   switch (eventName) {
     case "pull_request":
-      return CONFLICT_PR_ACTIONS.has(String(payload?.action ?? "")) && isDirtyOpenPr(payload?.pull_request);
+      return CONFLICT_PR_ACTIONS.has(String(payload?.action ?? "")) && isOpenNonDraftPr(payload?.pull_request);
     case "check_run":
       return payload?.action === "completed" && RED_CONCLUSIONS.has(String(payload?.check_run?.conclusion ?? ""));
     case "push": {
@@ -121,8 +126,8 @@ function empty(): ParsedEvent {
   return { signals: [], sweepRepos: [] };
 }
 
-function isDirtyOpenPr(pr: Json | undefined): boolean {
-  return pr?.state === "open" && pr?.draft !== true && pr?.mergeable_state === "dirty";
+function isOpenNonDraftPr(pr: Json | undefined): boolean {
+  return pr?.state === "open" && pr?.draft !== true;
 }
 
 /** OWNER/MEMBER/COLLABORATOR, or a login listed in trustedAuthors (bots report NONE). */
@@ -271,9 +276,9 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
   if (!repo || config.stoppedRepos.includes(repo)) return out;
 
   if (eventName === "pull_request") {
-    // Only a payload that already reports a conflict is a candidate; the authoritative lookup decides the rest.
+    // A candidate only: the authoritative lookup decides open, draft, trust, head and mergeability.
     const pr = payload.pull_request as Json | undefined;
-    if (!pr || typeof pr.number !== "number" || !CONFLICT_PR_ACTIONS.has(String(payload.action)) || !isDirtyOpenPr(pr)) return out;
+    if (!pr || typeof pr.number !== "number" || !CONFLICT_PR_ACTIONS.has(String(payload.action)) || !isOpenNonDraftPr(pr)) return out;
     out.signals.push({
       repo,
       number: pr.number,

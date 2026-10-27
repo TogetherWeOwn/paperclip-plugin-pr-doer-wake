@@ -740,6 +740,38 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
   });
 
+  it("a newly opened conflicting PR wakes even though the payload's mergeability is not computed yet", async () => {
+    graph = { mergeable: "CONFLICTING", isDraft: false };
+    await deliver("pull_request", prEvent({ action: "opened", extra: { mergeable_state: "unknown", mergeable: null } }));
+    expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
+  });
+
+  it("a conflicting head update after a completed clean sweep wakes via the UNKNOWN retry path", async () => {
+    await deliver("push", { ref: "refs/heads/main" });
+    await harness.runJob(SWEEP_JOB_KEY); // clean read: the repo mark is cleared
+    const calls = graphCalls;
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(graphCalls).toBe(calls); // nothing left for the sweep to discover on its own
+    graph = { mergeable: "UNKNOWN", isDraft: false, head: HEAD2 };
+    await deliver("pull_request", prEvent({ head: HEAD2, extra: { mergeable_state: "unknown", mergeable: null } }));
+    expect(wakes).toEqual([]);
+    expect(row(1903, "conflict", HEAD2)!.outcome).toBe("error"); // deferred: GitHub still computing
+    graph = { mergeable: "CONFLICTING", isDraft: false, head: HEAD2 };
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
+    await deliver("pull_request", prEvent({ head: HEAD2, action: "edited" }));
+    expect(wakes).toHaveLength(1); // same head, same state: at most once
+  });
+
+  it("a pull_request event on a clean PR is skipped without burning the fingerprint", async () => {
+    await deliver("pull_request", prEvent({ extra: { mergeable_state: "unknown", mergeable: null } }));
+    expect(wakes).toEqual([]);
+    expect(row(1903, "conflict")).toBeUndefined(); // not_conflicting: nothing kept
+    graph = { mergeable: "CONFLICTING", isDraft: false };
+    await deliver("pull_request", prEvent({ action: "edited" }));
+    expect(wakes).toHaveLength(1);
+  });
+
   it("a redelivered red check costs no further GitHub lookup", async () => {
     await deliver("check_run", ciFailed("build"));
     await deliver("check_run", ciFailed("build"));
@@ -1577,7 +1609,6 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
         await deliver("check_run", ciFailed("build"));
         expect(row()!.outcome).toBe("error");
         harness.setConfig({ ...baseConfig, enabled: false });
-        for (const r of ledger.values()) r.aged = true;
         await harness.runJob(SWEEP_JOB_KEY); // compaction runs for every company
         expect(row()!.signal).not.toBe("{}");
         harness.setConfig(baseConfig);

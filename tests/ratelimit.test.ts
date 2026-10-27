@@ -286,8 +286,10 @@ describe("secret-resolution budget (host limit 30/min)", () => {
     expect(mayAct("check_run", run("completed", "action_required"))).toBe(false);
     expect(mayAct("status", { state: "pending" })).toBe(false);
     expect(mayAct("status", { state: "error" })).toBe(false); // status is not subscribed (README "Webhook events")
-    expect(mayAct("pull_request", { action: "synchronize", pull_request: { state: "open" } })).toBe(false); // decided by the lookup, not the payload
-    expect(mayAct("pull_request", { action: "synchronize", pull_request: { state: "open", draft: false, mergeable_state: "dirty" } })).toBe(true);
+    expect(mayAct("pull_request", { action: "labeled", pull_request: { state: "open", draft: false } })).toBe(false);
+    expect(mayAct("pull_request", { action: "synchronize", pull_request: { state: "open", draft: true } })).toBe(false);
+    // Mergeability is decided by the lookup, not the payload (GitHub reports `unknown` while computing it).
+    expect(mayAct("pull_request", { action: "synchronize", pull_request: { state: "open", draft: false, mergeable_state: "unknown", mergeable: null } })).toBe(true);
     expect(mayAct("push", { ref: "refs/heads/main", deleted: true, repository })).toBe(false);
   });
 });
