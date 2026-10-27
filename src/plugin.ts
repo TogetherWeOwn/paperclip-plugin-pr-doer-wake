@@ -64,14 +64,19 @@ async function companiesFor(ctx: PluginContext, owner: string | null): Promise<C
 }
 
 /**
- * The company whose webhook secret signed this body. Cached secrets first (no host call); only on a miss, one
- * re-resolution per company per backoff window, so forged deliveries cannot drain the 30/min resolution budget.
+ * The company whose webhook secret signed this body. Cached secrets first, even past their TTL (an HMAC match
+ * still proves authenticity; expiry only schedules one background re-resolution). Only on a miss, one
+ * re-resolution per company per backoff window, joined by concurrent deliveries, so forged deliveries cannot drain
+ * the 30/min resolution budget and genuine ones are never refused while it runs.
  */
 async function verifiedCompany(ctx: PluginContext, candidates: Company[], rawBody: string, signature: string): Promise<Company | null> {
   const ref = (c: Company) => c.config.webhookSecretRef as SecretRef;
   for (const c of candidates) {
-    const secret = secrets.peek(c.companyId, ref(c), "webhookSecretRef");
-    if (secret && verifySignature(secret, rawBody, signature)) return c;
+    const cached = secrets.cached(c.companyId, ref(c), "webhookSecretRef");
+    if (cached && verifySignature(cached.value, rawBody, signature)) {
+      if (cached.expired) secrets.revalidate(ctx, c.companyId, ref(c), "webhookSecretRef");
+      return c;
+    }
   }
   for (const c of candidates) {
     const secret = await secrets.refresh(ctx, c.companyId, ref(c), "webhookSecretRef");
@@ -88,7 +93,8 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "user-agent": "paperclip-pr-doer-wake" },
     body: JSON.stringify({ query, variables }),
   });
-  if (response.status === 401) secrets.invalidate(companyId, config.githubTokenSecretRef, "githubTokenSecretRef");
+  // A dead token (expired PAT) must not re-resolve on every lookup: the budget is shared with the webhook secret.
+  if (response.status === 401) secrets.reject(companyId, config.githubTokenSecretRef, "githubTokenSecretRef");
   if (!response.ok) throw new Error(`GitHub GraphQL HTTP ${response.status}`);
   const body = (await response.json()) as { data?: T; errors?: unknown };
   if (body.errors) throw new Error("GitHub GraphQL returned errors");

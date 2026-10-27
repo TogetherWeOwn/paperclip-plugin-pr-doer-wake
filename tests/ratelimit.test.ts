@@ -12,7 +12,14 @@ const SECRET = "whsec-test";
 let currentSecret = SECRET;
 const repository = { full_name: "TogetherWeOwn/two-web-next", default_branch: "main", owner: { login: "TogetherWeOwn" } };
 
-async function boot() {
+type Gate = { promise: Promise<void>; open: () => void };
+function gate(): Gate {
+  let open!: () => void;
+  const promise = new Promise<void>((r) => { open = r; });
+  return { promise, open };
+}
+
+async function boot(opts: { resolveGate?: () => Gate | null; fetchStatus?: number } = {}) {
   const harness = createTestHarness({
     manifest,
     config: {
@@ -23,9 +30,12 @@ async function boot() {
   });
   harness.seed({ companies: [{ id: CID, name: "TWO" } as any], issues: [] });
   const ctx = harness.ctx as any;
-  const calls = { resolves: 0, fetches: 0 };
+  const calls = { resolves: 0, fetches: 0, tokenResolves: 0 };
   ctx.secrets.resolve = async (ref: { secretId: string }) => {
     calls.resolves += 1;
+    if (ref.secretId.endsWith("2")) calls.tokenResolves += 1;
+    const g = opts.resolveGate?.();
+    if (g) await g.promise; // the host round trip is still in flight
     if (calls.resolves > 30) throw Object.assign(new Error("Rate limit exceeded for secret resolution"), { name: "RateLimitExceededError" });
     return ref.secretId.endsWith("1") ? currentSecret : "gh-token";
   };
@@ -34,6 +44,7 @@ async function boot() {
   ctx.db.query = async () => [];
   ctx.http.fetch = async () => {
     calls.fetches += 1;
+    if (opts.fetchStatus) return new Response("Bad credentials", { status: opts.fetchStatus });
     return new Response(JSON.stringify({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: calls.fetches % 3 !== 0, endCursor: "c" }, nodes: [] } } } }), { status: 200 });
   };
   await plugin.definition.setup(harness.ctx);
@@ -56,6 +67,10 @@ afterEach(() => {
 });
 
 const run = (action: string, conclusion: string | null) => ({ action, check_run: { name: "build", conclusion, head_sha: "a".repeat(40), pull_requests: [] } });
+const redOnPr = (n: number) => {
+  const head = n.toString(16).padStart(40, "0");
+  return { action: "completed", check_run: { name: "build", conclusion: "failure", head_sha: head, pull_requests: [{ number: n, head: { sha: head, ref: "x" } }] } };
+};
 
 describe("secret-resolution budget (host limit 30/min)", () => {
   it("a burst of 200 non-actionable org deliveries resolves no secret and never fails", async () => {
@@ -120,6 +135,62 @@ describe("secret-resolution budget (host limit 30/min)", () => {
     vi.setSystemTime(new Date("2026-10-27T05:11:00Z"));
     await deliver("check_run", run("completed", "failure"));
     expect(calls.resolves).toBe(2);
+  });
+
+  it("concurrent genuine deliveries at cold start share one in-flight resolution and all verify", async () => {
+    let g: Gate | null = gate();
+    const first = g;
+    const { calls } = await boot({ resolveGate: () => { const out = g; g = null; return out; } });
+    const pending = [1, 2, 3].map(() => deliver("check_run", run("completed", "failure")));
+    await new Promise((r) => setTimeout(r, 0));
+    first.open();
+    const settled = await Promise.allSettled(pending);
+    expect(settled.map((s) => s.status)).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
+    expect(calls.resolves).toBe(1);
+  });
+
+  it("after the TTL, concurrent genuine deliveries verify against the expired value while one re-resolution runs", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-27T05:00:00Z"));
+    let g: Gate | null = null;
+    const { calls } = await boot({ resolveGate: () => g });
+    await deliver("check_run", run("completed", "failure"));
+    expect(calls.resolves).toBe(1);
+    vi.setSystemTime(new Date("2026-10-27T05:11:00Z"));
+    g = gate();
+    const slow = g;
+    const settled = await Promise.allSettled([1, 2, 3].map(() => deliver("check_run", run("completed", "failure"))));
+    expect(settled.map((s) => s.status)).toEqual(["fulfilled", "fulfilled", "fulfilled"]);
+    expect(calls.resolves).toBe(2); // one background re-resolution, not one per delivery
+    slow.open();
+  });
+
+  it("a rotated webhook secret replaces the expired value once the TTL re-resolution lands", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-27T05:00:00Z"));
+    const { calls } = await boot();
+    await deliver("check_run", run("completed", "failure"));
+    currentSecret = "whsec-rotated";
+    vi.setSystemTime(new Date("2026-10-27T05:11:00Z"));
+    await deliver("check_run", run("completed", "failure")); // old value still proves authenticity; re-resolve scheduled
+    await new Promise((r) => setTimeout(r, 0));
+    expect(calls.resolves).toBe(2);
+    await expect(deliver("check_run", run("completed", "failure"))).rejects.toThrow(/signature/); // old secret now refused
+    await deliver("check_run", run("completed", "failure"), "whsec-rotated");
+  });
+
+  it("a GitHub token rejected with 401 is not re-resolved on every lookup (negative cache with backoff)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-27T05:00:00Z"));
+    const { calls } = await boot({ fetchStatus: 401 });
+    for (let n = 1; n <= 20; n += 1) await deliver("check_run", redOnPr(n));
+    await runSweep();
+    expect(calls.tokenResolves).toBe(1);
+    expect(calls.fetches).toBe(1);
+    vi.setSystemTime(new Date("2026-10-27T05:06:00Z")); // after the backoff: one more resolution picks up a fixed token
+    await deliver("check_run", redOnPr(21));
+    await deliver("check_run", redOnPr(22));
+    expect(calls.tokenResolves).toBe(2);
   });
 
   it("one sweep over many marked repos and pages resolves the token once", async () => {
