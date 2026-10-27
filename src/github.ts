@@ -2,21 +2,21 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { normalizeLogin, type DoerWakeConfig } from "./config.js";
 import type { WakeState } from "./constants.js";
 
-/** What the plugin remembers about an open PR (from pull_request webhooks or a GraphQL lookup). */
-export interface PrIndexEntry {
+/**
+ * The PR as GitHub reports it right now (GraphQL). The only authority for open/draft/head/trust: webhook payloads
+ * can arrive late, out of order or with tied updated_at values, so they never decide whether a PR may wake.
+ */
+export interface PrState {
   repo: string; // lowercase "org/repo"
   number: number;
   head: string;
   headRef: string | null;
-  base: string | null;
   draft: boolean;
   url: string;
-  /** False once closed or merged (kept as a tombstone so late deliveries cannot reopen it). */
   open: boolean;
   /** Head branch in the base repo and a trusted author; see isTrustedAuthor. */
   trusted: boolean;
-  /** pull_request.updated_at / GraphQL updatedAt. Older payloads never overwrite a newer entry. */
-  updatedAt: string | null;
+  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
 }
 
 export interface Signal {
@@ -26,9 +26,9 @@ export interface Signal {
   state: WakeState;
   url: string;
   headRef: string | null;
-  /** Known draft flag from the event itself; null means look it up in the index. */
+  /** Set from the authoritative PR state (evaluate); null until then, and a null never wakes. */
   draft: boolean | null;
-  /** Known trust from the event itself; null means look it up in the index. */
+  /** Set from the authoritative PR state (evaluate); null until then, and a null never wakes. */
   trusted: boolean | null;
   detail: {
     score?: number | null;
@@ -40,7 +40,6 @@ export interface Signal {
 
 export interface ParsedEvent {
   signals: Signal[];
-  upsertIndex: PrIndexEntry[];
   /** Repos whose default branch moved: open PRs may now conflict. */
   sweepRepos: string[];
 }
@@ -60,8 +59,8 @@ export const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"])
 /** Conclusions that mean the check really failed. cancelled/stale/skipped/neutral/action_required never wake. */
 export const RED_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure"]);
 
-/** pull_request actions that change what the index holds (head, branch, draft, base, open/closed). */
-export const INDEX_PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "closed", "edited"]);
+/** pull_request actions whose payload may already report a merge conflict (`mergeable_state: dirty`). */
+export const CONFLICT_PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "ready_for_review", "edited"]);
 
 /**
  * Cheap pre-filter run BEFORE signature verification. Most org deliveries (check_run created/success,
@@ -72,7 +71,7 @@ export const INDEX_PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "r
 export function mayAct(eventName: string, payload: Json): boolean {
   switch (eventName) {
     case "pull_request":
-      return INDEX_PR_ACTIONS.has(String(payload?.action ?? ""));
+      return CONFLICT_PR_ACTIONS.has(String(payload?.action ?? "")) && isDirtyOpenPr(payload?.pull_request);
     case "check_run":
       return payload?.action === "completed" && RED_CONCLUSIONS.has(String(payload?.check_run?.conclusion ?? ""));
     case "push": {
@@ -96,7 +95,11 @@ export function fingerprint(signal: Pick<Signal, "repo" | "number" | "head" | "s
 }
 
 function empty(): ParsedEvent {
-  return { signals: [], upsertIndex: [], sweepRepos: [] };
+  return { signals: [], sweepRepos: [] };
+}
+
+function isDirtyOpenPr(pr: Json | undefined): boolean {
+  return pr?.state === "open" && pr?.draft !== true && pr?.mergeable_state === "dirty";
 }
 
 /** OWNER/MEMBER/COLLABORATOR, or a login listed in trustedAuthors (bots report NONE). */
@@ -105,20 +108,24 @@ export function isTrustedAuthor(config: DoerWakeConfig, association: unknown, lo
   return typeof login === "string" && config.trustedAuthors.includes(normalizeLogin(login));
 }
 
-export type SkipOutcome = "skipped_closed" | "stale_head" | "untrusted" | "skipped_draft" | "draft_unknown";
+export type SkipOutcome = "skipped_closed" | "stale_head" | "untrusted" | "skipped_draft" | "draft_unknown" | "not_conflicting";
 
 export type PrCheck =
   | { kind: "ok"; signal: Signal }
   | { kind: "skip"; outcome: SkipOutcome; detail?: string }
   | { kind: "transient"; detail: string };
 
-/** Is the PR, as the index currently knows it, still one this signal may wake? */
-export function evaluate(entry: PrIndexEntry, signal: Signal): PrCheck {
-  if (!entry.open) return { kind: "skip", outcome: "skipped_closed" };
-  if (entry.head !== signal.head) return { kind: "skip", outcome: "stale_head", detail: entry.head };
-  if (!entry.trusted) return { kind: "skip", outcome: "untrusted" };
-  if (entry.draft) return { kind: "skip", outcome: "skipped_draft" };
-  return { kind: "ok", signal: { ...signal, draft: false, trusted: true, headRef: signal.headRef ?? entry.headRef } };
+/** May this signal wake, given the PR as GitHub reports it now? Closed, merged, re-pushed, untrusted and draft PRs never do. */
+export function evaluate(pr: PrState, signal: Signal): PrCheck {
+  if (!pr.open) return { kind: "skip", outcome: "skipped_closed" };
+  if (pr.head !== signal.head) return { kind: "skip", outcome: "stale_head", detail: pr.head };
+  if (!pr.trusted) return { kind: "skip", outcome: "untrusted" };
+  if (pr.draft) return { kind: "skip", outcome: "skipped_draft" };
+  if (signal.state === "conflict" && pr.mergeable !== "CONFLICTING") {
+    // GitHub computes mergeability lazily: UNKNOWN is read again by the sweep.
+    return pr.mergeable === "UNKNOWN" ? { kind: "transient", detail: "mergeability not computed yet" } : { kind: "skip", outcome: "not_conflicting" };
+  }
+  return { kind: "ok", signal: { ...signal, draft: false, trusted: true, headRef: pr.headRef ?? signal.headRef } };
 }
 
 type Json = Record<string, any>;
@@ -153,33 +160,20 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
   if (!repo || config.stoppedRepos.includes(repo)) return out;
 
   if (eventName === "pull_request") {
+    // Only a payload that already reports a conflict is a candidate; the authoritative lookup decides the rest.
     const pr = payload.pull_request as Json | undefined;
-    if (!pr || typeof pr.number !== "number") return out;
-    // Fork heads (head.repo differs or was deleted) and outsider authors can pick any branch name, so they must
-    // never name a card. check_run.pull_requests already omits fork PRs (GitHub docs), so the index carries trust.
-    const headRepo = pr.head?.repo?.full_name;
-    const baseRepo = pr.base?.repo?.full_name ?? payload.repository.full_name;
-    const sameRepo = typeof headRepo === "string" && headRepo.toLowerCase() === String(baseRepo).toLowerCase();
-    const closed = payload.action === "closed" || pr.state !== "open";
-    const entry: PrIndexEntry = {
+    if (!pr || typeof pr.number !== "number" || !CONFLICT_PR_ACTIONS.has(String(payload.action)) || !isDirtyOpenPr(pr)) return out;
+    out.signals.push({
       repo,
       number: pr.number,
       head: String(pr.head?.sha ?? ""),
-      headRef: typeof pr.head?.ref === "string" ? pr.head.ref : null,
-      base: typeof pr.base?.ref === "string" ? pr.base.ref : null,
-      draft: pr.draft === true,
+      state: "conflict",
       url: String(pr.html_url ?? `https://github.com/${payload.repository.full_name}/pull/${pr.number}`),
-      open: !closed,
-      trusted: sameRepo && isTrustedAuthor(config, pr.author_association, pr.user?.login),
-      updatedAt: typeof pr.updated_at === "string" ? pr.updated_at : null,
-    };
-    out.upsertIndex.push(entry);
-    const base = { repo, number: pr.number, head: entry.head, url: entry.url, headRef: entry.headRef, trusted: entry.trusted, detail: {} };
-    if (payload.action === "closed") {
-      if (pr.merged === true) out.signals.push({ ...base, state: "merged", draft: false });
-      return out;
-    }
-    if (!closed && !entry.draft && pr.mergeable_state === "dirty") out.signals.push({ ...base, state: "conflict", draft: false });
+      headRef: typeof pr.head?.ref === "string" ? pr.head.ref : null,
+      draft: null,
+      trusted: null,
+      detail: {},
+    });
     return out;
   }
 
@@ -234,7 +228,7 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
 
 const PR_FIELDS = "number url state isDraft isCrossRepository authorAssociation author{login} headRefOid headRefName baseRefName mergeable updatedAt";
 
-/** GraphQL used by the conflict sweep and by PR lookups; one call per repo page or per PR. */
+/** GraphQL used by the conflict sweep and by the per-signal PR lookup; one call per repo page or per PR. */
 export const OPEN_PRS_QUERY = `query($o:String!,$r:String!,$base:String,$cursor:String){repository(owner:$o,name:$r){
 pullRequests(states:OPEN,first:50,after:$cursor,baseRefName:$base){pageInfo{hasNextPage endCursor}
 nodes{${PR_FIELDS}}}}}`;
@@ -257,17 +251,16 @@ export interface GraphPr {
   updatedAt: string;
 }
 
-export function indexFromGraph(repo: string, pr: GraphPr, config: DoerWakeConfig): PrIndexEntry {
+export function prStateFromGraph(repo: string, pr: GraphPr, config: DoerWakeConfig): PrState {
   return {
     repo,
     number: pr.number,
     head: pr.headRefOid,
     headRef: pr.headRefName,
-    base: pr.baseRefName,
     draft: pr.isDraft,
     url: pr.url,
     open: pr.state === "OPEN",
     trusted: pr.isCrossRepository === false && isTrustedAuthor(config, pr.authorAssociation, pr.author?.login),
-    updatedAt: typeof pr.updatedAt === "string" ? pr.updatedAt : null,
+    mergeable: pr.mergeable,
   };
 }

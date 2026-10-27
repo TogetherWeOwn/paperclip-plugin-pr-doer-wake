@@ -94,8 +94,6 @@ export function evidenceComment(signal: Signal): string {
         "Open the log, fix the cause on this branch and push once.";
     case "conflict":
       return `${pr}: **merge conflict with its base** on head \`${head}\`. Update it from the base branch, resolve, run the tests and push once.`;
-    case "merged":
-      return `${pr} **was merged**. Close out this card (done if nothing else remains) or say what is left.`;
   }
 }
 

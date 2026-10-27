@@ -4,22 +4,21 @@ import { DB_NAMESPACE, SWEEP_JOB_KEY, WEBHOOK_KEY } from "./constants.js";
 import {
   evaluate,
   fingerprint,
-  indexFromGraph,
   ONE_PR_QUERY,
   OPEN_PRS_QUERY,
   mayAct,
   ownerOf,
   parseEvent,
+  prStateFromGraph,
   SIGNATURE_RE,
   SUBSCRIBED_EVENTS,
   verifySignature,
   type GraphPr,
   type PrCheck,
-  type PrIndexEntry,
   type Signal,
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
-import { pruneSql, retryableSql } from "./sql.js";
+import { pruneSql, retryableSql, seenSql } from "./sql.js";
 import { deferSignal, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
@@ -44,7 +43,6 @@ function requireCtx(): PluginContext {
   return ctxRef;
 }
 
-const indexKey = (repo: string, n: number) => ({ scopeKind: "instance" as const, namespace: "pr", stateKey: `${repo}#${n}` });
 const SWEEP_KEY = { scopeKind: "instance" as const, namespace: "sweep", stateKey: "repos" };
 
 function header(headers: PluginWebhookInput["headers"], name: string): string | undefined {
@@ -86,7 +84,7 @@ async function verifiedCompany(ctx: PluginContext, candidates: Company[], rawBod
 }
 
 async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: DoerWakeConfig, query: string, variables: Record<string, unknown>): Promise<T | null> {
-  if (!config.githubTokenSecretRef) return null;
+  if (!config.githubTokenSecretRef) throw new Error("githubTokenSecretRef is not configured");
   const token = await secrets.get(ctx, companyId, config.githubTokenSecretRef, "githubTokenSecretRef");
   const response = await ctx.http.fetch("https://api.github.com/graphql", {
     method: "POST",
@@ -101,53 +99,31 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
   return body.data ?? null;
 }
 
-/** Index entries written before 0.1.2 lack open/trusted: treat them as unknown so they are looked up again. */
-async function readIndex(ctx: PluginContext, repo: string, n: number): Promise<PrIndexEntry | null> {
-  const entry = (await ctx.state.get(indexKey(repo, n))) as PrIndexEntry | null;
-  return entry && typeof entry.open === "boolean" && typeof entry.trusted === "boolean" ? entry : null;
-}
-
-/** Write an index entry unless the stored one is newer (out-of-order or replayed deliveries). Returns what is stored. */
-function upsertIndex(ctx: PluginContext, entry: PrIndexEntry): Promise<PrIndexEntry> {
-  return serialized(async () => {
-    const existing = await readIndex(ctx, entry.repo, entry.number);
-    if (existing?.updatedAt && entry.updatedAt && Date.parse(entry.updatedAt) < Date.parse(existing.updatedAt)) return existing;
-    await ctx.state.set(indexKey(entry.repo, entry.number), entry);
-    return entry;
-  });
-}
-
 /**
- * Is this signal's PR still open, trusted, non-draft and on this head? `fresh` (sweep retries) always re-reads the
- * PR from GitHub when a token is configured; otherwise the index answers when it knows this head.
+ * Is this signal's PR open, trusted, non-draft and on this head right now? Always one GraphQL read: webhook
+ * payloads arrive late, out of order and with tied updated_at values, and draft conversion or closing does not
+ * change the head, so nothing cached can authorize a wake. Fails closed: unreadable is transient, missing is closed.
  */
-async function currentPrState(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal, fresh: boolean): Promise<PrCheck> {
-  if (signal.state === "merged") {
-    // Merged is terminal and carries its own trust from the closing payload.
-    return signal.trusted === false ? { kind: "skip", outcome: "untrusted" } : { kind: "ok", signal: { ...signal, draft: false } };
+async function currentPrState(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<PrCheck> {
+  const [owner, name] = signal.repo.split("/");
+  let pr: GraphPr | null | undefined;
+  try {
+    const data = await githubGraphql<{ repository: { pullRequest: GraphPr | null } | null }>(ctx, companyId, config, ONE_PR_QUERY, { o: owner, r: name, n: signal.number });
+    pr = data?.repository?.pullRequest;
+  } catch (error) {
+    return { kind: "transient", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
   }
-  let entry = await readIndex(ctx, signal.repo, signal.number);
-  const known = entry && (entry.head === signal.head || !entry.open);
-  if ((fresh || !known) && config.githubTokenSecretRef) {
-    const [owner, name] = signal.repo.split("/");
-    let pr: GraphPr | null | undefined;
-    try {
-      const data = await githubGraphql<{ repository: { pullRequest: GraphPr | null } | null }>(ctx, companyId, config, ONE_PR_QUERY, { o: owner, r: name, n: signal.number });
-      pr = data?.repository?.pullRequest;
-    } catch (error) {
-      return { kind: "transient", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
-    }
-    if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "PR not found" };
-    entry = await upsertIndex(ctx, indexFromGraph(signal.repo, pr, config));
-  }
-  if (!entry) return { kind: "skip", outcome: "draft_unknown" };
-  return evaluate(entry, signal);
+  if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "PR not found" };
+  return evaluate(prStateFromGraph(signal.repo, pr, config), signal);
+}
+
+async function alreadySeen(ctx: PluginContext, companyId: string, fp: string): Promise<boolean> {
+  return (await ctx.db.query(seenSql(ctx.db.namespace || DB_NAMESPACE), [companyId, fp])).length > 0;
 }
 
 export async function handleGithubEvent(eventName: string, payload: Record<string, any>, companyId: string, config: DoerWakeConfig): Promise<WakeResult[]> {
   const ctx = requireCtx();
   const parsed = parseEvent(eventName, payload, config);
-  for (const entry of parsed.upsertIndex) await upsertIndex(ctx, entry);
   if (parsed.sweepRepos.length > 0) {
     await serialized(async () => {
       const marks = ((await ctx.state.get(SWEEP_KEY)) as Record<string, SweepMark> | null) ?? {};
@@ -157,10 +133,19 @@ export async function handleGithubEvent(eventName: string, payload: Record<strin
   }
   const results: WakeResult[] = [];
   for (const raw of parsed.signals) {
-    const check = await currentPrState(ctx, companyId, config, raw, false);
+    const fp = fingerprint(raw);
+    if (!config.wakeStates.includes(raw.state)) {
+      results.push({ fingerprint: fp, outcome: "skipped_state" });
+      continue;
+    }
+    if (await alreadySeen(ctx, companyId, fp)) {
+      results.push({ fingerprint: fp, outcome: "duplicate" });
+      continue;
+    }
+    const check = await currentPrState(ctx, companyId, config, raw);
     if (check.kind === "ok") results.push(await wakeForSignal(ctx, companyId, config, check.signal));
     else if (check.kind === "transient") results.push(await deferSignal(ctx, companyId, config, raw, check.detail));
-    else results.push({ fingerprint: fingerprint(raw), outcome: check.outcome, detail: check.detail });
+    else results.push({ fingerprint: fp, outcome: check.outcome, detail: check.detail });
   }
   for (const r of results) {
     if (r.outcome !== "duplicate") ctx.logger.info("pr-doer-wake", { ...r });
@@ -174,7 +159,7 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
   for (const [key, mark] of Object.entries(marks)) {
     const [companyId, repo] = key.split("|") as [string, string];
     const config = configs.get(companyId);
-    if (!config || !config.githubTokenSecretRef || !config.wakeStates.includes("conflict")) {
+    if (!config || !config.wakeStates.includes("conflict")) {
       next.set(key, null);
       continue;
     }
@@ -192,13 +177,12 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
           break;
         }
         for (const pr of connection.nodes) {
-          const entry = await upsertIndex(ctx, indexFromGraph(repo, pr, config));
           if (pr.mergeable === "UNKNOWN") unknown = true;
           if (pr.mergeable !== "CONFLICTING") continue;
           const signal: Signal = {
-            repo, number: pr.number, head: pr.headRefOid, state: "conflict", url: pr.url, headRef: pr.headRefName, draft: pr.isDraft, trusted: entry.trusted, detail: {},
+            repo, number: pr.number, head: pr.headRefOid, state: "conflict", url: pr.url, headRef: pr.headRefName, draft: null, trusted: null, detail: {},
           };
-          const check = evaluate(entry, signal);
+          const check = evaluate(prStateFromGraph(repo, pr, config), signal); // this page is the authoritative read
           results.push(check.kind === "ok" ? await wakeForSignal(ctx, companyId, config, check.signal) : { fingerprint: fingerprint(signal), outcome: check.kind === "skip" ? check.outcome : "error" });
         }
         if (!connection.pageInfo.hasNextPage) {
@@ -237,7 +221,7 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
 
 type RetryRow = { fingerprint: string; signal: string; issue_id: string | null; comment_posted_at: string | null; wake_attempted_at: string | null };
 
-/** Finish failed and stuck wakes, re-reading the PR first so a now-draft, closed or re-pushed PR is never woken. */
+/** Finish failed and stuck wakes, re-reading the PR first so a now-draft, closed, merged or re-pushed PR is never woken. */
 async function retryWakes(ctx: PluginContext, configs: Map<string, DoerWakeConfig>, results: WakeResult[]): Promise<void> {
   const ns = ctx.db.namespace || DB_NAMESPACE;
   for (const [companyId, config] of configs) {
@@ -245,7 +229,7 @@ async function retryWakes(ctx: PluginContext, configs: Map<string, DoerWakeConfi
     for (const row of rows) {
       const signal = JSON.parse(row.signal) as Signal;
       const fp = row.fingerprint;
-      const check = await currentPrState(ctx, companyId, config, signal, true);
+      const check = await currentPrState(ctx, companyId, config, signal);
       if (check.kind === "transient") {
         await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
         results.push({ fingerprint: fp, outcome: "deferred", detail: check.detail });

@@ -208,7 +208,8 @@ describe("secret-resolution budget (host limit 30/min)", () => {
     expect(mayAct("check_run", run("completed", "action_required"))).toBe(false);
     expect(mayAct("status", { state: "pending" })).toBe(false);
     expect(mayAct("status", { state: "error" })).toBe(false); // status is not subscribed (README "Webhook events")
-    expect(mayAct("pull_request", { action: "synchronize" })).toBe(true);
+    expect(mayAct("pull_request", { action: "synchronize", pull_request: { state: "open" } })).toBe(false); // decided by the lookup, not the payload
+    expect(mayAct("pull_request", { action: "synchronize", pull_request: { state: "open", draft: false, mergeable_state: "dirty" } })).toBe(true);
     expect(mayAct("push", { ref: "refs/heads/main", deleted: true, repository })).toBe(false);
   });
 });

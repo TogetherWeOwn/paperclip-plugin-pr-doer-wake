@@ -1,17 +1,18 @@
 # togetherweown.pr-doer-wake
 
-Wakes the Paperclip card that owns a GitHub pull request, exactly once per (PR, head SHA, state):
+Wakes the Paperclip card that owns an open, non-draft GitHub pull request, once per (PR, head SHA, state):
 
 | state | trigger |
 |---|---|
 | `review_findings` | `check_run` completed, name `Paperclip Review`, conclusion `failure` (complete assessment below `ratingThreshold`, `githubReviewConclusion` in `server/src/services/chat-github-review-policy.ts:229`). `action_required` (admission refusal, incomplete) never wakes. |
 | `ci_red` | `check_run` completed with `failure`, `timed_out` or `startup_failure` on the PR's current head. `cancelled`, `stale`, `skipped` and `neutral` never wake. `requiredChecks` narrows to required names per repo. Commit `status` events are not consumed (see "Webhook events"). |
-| `conflict` | `push` to a repo's default branch marks it; the 5-minute job reads open-PR mergeability (`sweepMaxPages` pages of 50 per repo per tick, default 4; a bigger repo resumes from the saved cursor next tick and logs a warning) and wakes owners of `CONFLICTING` PRs. Also `pull_request` payloads that already say `mergeable_state: dirty`. |
-| `merged` | `pull_request` closed with `merged: true`. |
+| `conflict` | `push` to a repo's default branch marks it; the 5-minute job reads open-PR mergeability (`sweepMaxPages` pages of 50 per repo per tick, default 4; a bigger repo resumes from the saved cursor next tick and logs a warning) and wakes owners of `CONFLICTING` PRs. Also `pull_request` payloads that already say `mergeable_state: dirty`, if GitHub still reports `CONFLICTING`. |
 
-Drafts, closed PRs, superseded heads, fork PRs and outsider authors never wake. The PR index (plugin state) comes from `pull_request` webhooks and GraphQL lookups; for a PR the plugin has not seen, one GraphQL lookup (only when `githubTokenSecretRef` is set), otherwise the signal is skipped. The index stores `updated_at`, so an out-of-order or replayed delivery never overwrites newer data, and closed PRs stay as tombstones so a late delivery cannot reopen them.
+Drafts, closed and merged PRs, superseded heads, fork PRs and outsider authors never wake. There is no merged wake: a merged PR has nothing left to fix (an old config listing `merged` in `wakeStates` is ignored).
 
-Trust: a PR may name a card only if its head branch lives in the base repo (`head.repo` = `base.repo`, GraphQL `isCrossRepository: false`) and its author is `OWNER`, `MEMBER` or `COLLABORATOR`, or a login in `trustedAuthors` (bots report `NONE`; `[bot]` suffix and case are ignored). `check_run.pull_requests` already omits fork PRs.
+PR state: before any wake, the plugin reads the PR from GitHub GraphQL (`githubTokenSecretRef`, required when enabled) and wakes only if it is open, non-draft, trusted and still on the signal's head; for `conflict`, still `CONFLICTING`. Webhook payloads never authorize a wake: they arrive late, out of order and with tied `updated_at` values, and converting to draft or closing does not change the head. A failed or rate-limited lookup fails closed (claimed as `error`, re-read by the sweep). A redelivered red check that is already in the ledger costs no lookup.
+
+Trust: a PR may name a card only if its head branch lives in the base repo (GraphQL `isCrossRepository: false`) and its author is `OWNER`, `MEMBER` or `COLLABORATOR`, or a login in `trustedAuthors` (bots report `NONE`; `[bot]` suffix and case are ignored).
 
 ## Webhook events
 
@@ -27,7 +28,7 @@ Paperclip has no path from a PR result to the doer's card: `chat-github-checks.t
 ## Guarantees
 
 - Exactly once: atomic `INSERT ... ON CONFLICT DO NOTHING` on `(company_id, fingerprint)` in the plugin's own namespace table `wake_ledger`.
-- Retries: the sweep finishes rows at `error` (after 2 minutes) and rows stuck at `claimed` (after 10 minutes, the worker stopped mid-wake), up to 5 attempts. Before every retry it re-reads the PR (GraphQL when a token is set, else the index): draft, closed, merged, re-pushed or untrusted PRs end as `stale:<reason>` and are never woken. A PR lookup that fails transiently (GitHub 5xx, secret rate limit) is claimed as `error` and re-read by the sweep instead of dropped.
+- Retries: the sweep finishes rows at `error` (after 2 minutes) and rows stuck at `claimed` (after 10 minutes, the worker stopped mid-wake), up to 5 attempts. Before every retry it re-reads the PR from GitHub: draft, closed, merged, re-pushed or untrusted PRs end as `stale:<reason>` and are never woken. A PR lookup that fails transiently (GitHub 5xx, secret rate limit) is claimed as `error` and re-read by the sweep instead of dropped.
 - Phases: `comment_posted_at` and `wake_attempted_at` (migration 002) record what an attempt already did. A retry posts the evidence comment only if neither the phase nor an identical comment on the card exists. The host does not dedupe plugin wakes by `idempotencyKey` (it is stored, but `server/src/services/heartbeat/queue.ts` only checks it for `execution-reconciliation:` keys), so a retry after an ambiguous `requestWakeup` first looks in `heartbeat_runs` for a run on the card with this plugin's `contextSnapshot.source` and wake reason created since the attempt, and records that run instead of waking again.
 - Holds: cards in `backlog`/`done`/`cancelled`, with an unresolved `blockedBy`, or (with `skipBlockedStatus`) in `blocked` get no comment and no wake. `ctx.issues.requestWakeup` re-checks assignee, terminal status, blockers and budget hard-stops on the host (`server/src/services/plugin-host-services.ts:2354-2372`).
 - The evidence comment is plugin-authored; plugin comments never wake anyone (SDK `createComment` doc). The wake is `requestWakeup` with reason `github_pr_<state>`.
@@ -43,7 +44,11 @@ Measured against `issue_work_products` on 341 live PRs (2026-10-27): 302/326 lin
 
 ## Config (per company)
 
-`enabled`, `shadow`, `githubOrg`, `webhookSecretRef`, optional `githubTokenSecretRef`, `excludeAgentIds`, `requiredChecks`, `ignoreChecks`, `stoppedRepos`, `wakeStates`, `skipBlockedStatus`, `postEvidenceComment`, `branchIdentifierPattern`, `trustedAuthors`, `sweepMaxPages`. See `src/manifest.ts`.
+`enabled`, `shadow`, `githubOrg`, `webhookSecretRef`, `githubTokenSecretRef` (both required when enabled), `excludeAgentIds`, `requiredChecks`, `ignoreChecks`, `stoppedRepos`, `wakeStates`, `skipBlockedStatus`, `postEvidenceComment`, `branchIdentifierPattern`, `trustedAuthors`, `sweepMaxPages`. See `src/manifest.ts`.
+
+## Upgrading from 0.1.1
+
+Set `githubTokenSecretRef` before upgrading: an enabled company without it fails config validation and is ignored. The `pr` plugin-state entries 0.1.1 wrote (the webhook PR index) are no longer read and are inert.
 
 ## Develop
 

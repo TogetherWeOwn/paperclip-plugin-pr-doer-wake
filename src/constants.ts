@@ -7,5 +7,6 @@ export const WEBHOOK_KEY = "github";
 export const SWEEP_JOB_KEY = "pr-doer-wake-sweep";
 export const CONTEXT_SOURCE = "plugin.pr-doer-wake";
 
-export const WAKE_STATES = ["review_findings", "ci_red", "conflict", "merged"] as const;
+/** Merged and closed PRs never wake (a merged PR has nothing left to fix). */
+export const WAKE_STATES = ["review_findings", "ci_red", "conflict"] as const;
 export type WakeState = (typeof WAKE_STATES)[number];

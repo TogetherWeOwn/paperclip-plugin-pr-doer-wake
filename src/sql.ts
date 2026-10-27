@@ -9,6 +9,11 @@ export function claimSql(ns: string): string {
 values ($1, $2, $3, $4, $5, $6, $7::jsonb) on conflict do nothing`;
 }
 
+/** Cheap pre-check so a redelivered or repeated red check costs no GitHub lookup. The claim stays the atomic gate. */
+export function seenSql(ns: string): string {
+  return `select fingerprint from ${ns}.wake_ledger where company_id = $1 and fingerprint = $2`;
+}
+
 export function recordOutcomeSql(ns: string): string {
   return `update ${ns}.wake_ledger set outcome = $3, issue_id = $4, attempts = attempts + 1, updated_at = now()
 where company_id = $1 and fingerprint = $2`;

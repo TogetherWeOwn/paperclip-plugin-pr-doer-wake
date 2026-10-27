@@ -1,10 +1,10 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../src/config.js";
-import { evaluate, fingerprint, indexFromGraph, isTrustedAuthor, mayAct, parseEvent, reviewScore, verifySignature } from "../src/github.js";
+import { evaluate, fingerprint, isTrustedAuthor, mayAct, parseEvent, prStateFromGraph, reviewScore, verifySignature } from "../src/github.js";
 
 const repository = { full_name: "TogetherWeOwn/two-web-next", default_branch: "main", owner: { login: "TogetherWeOwn" } };
-const config = parseConfig({ enabled: true, githubOrg: "TogetherWeOwn", webhookSecretRef: { type: "secret_ref", secretId: "x" } });
+const config = parseConfig({ enabled: true, githubOrg: "TogetherWeOwn", webhookSecretRef: { type: "secret_ref", secretId: "x" }, githubTokenSecretRef: { type: "secret_ref", secretId: "y" } });
 const HEAD = "c05b0b5df0000000000000000000000000000000";
 
 function checkRun(name: string, conclusion: string, opts: { headSha?: string; prHead?: string; action?: string; title?: string } = {}) {
@@ -56,7 +56,7 @@ describe("CI checks", () => {
     for (const conclusion of ["failure", "timed_out", "startup_failure"]) {
       const parsed = parseEvent("check_run", checkRun("build", conclusion), config);
       expect(parsed.signals.map((s) => s.state)).toEqual(["ci_red"]);
-      expect(parsed.signals[0]!.draft).toBeNull(); // draft is resolved later from the index
+      expect(parsed.signals[0]!.draft).toBeNull(); // draft comes from the authoritative GitHub lookup
     }
   });
   it("ignores cancelled, stale, skipped, neutral and in-progress runs", () => {
@@ -97,46 +97,39 @@ describe("pull_request and push", () => {
       user: { login: "doer" }, author_association: "MEMBER", updated_at: "2026-10-27T04:00:00Z", ...extra,
     },
   });
-  it("indexes head, branch and draft flag", () => {
-    const parsed = parseEvent("pull_request", pr({ draft: true }, "converted_to_draft"), config);
-    expect(parsed.upsertIndex[0]).toMatchObject({ number: 1903, head: HEAD, headRef: "feat/x", draft: true, open: true, trusted: true, updatedAt: "2026-10-27T04:00:00Z" });
-    expect(parsed.signals).toEqual([]);
-  });
-  it("signals merged and tombstones the index entry as closed; a plain close only tombstones it", () => {
-    const merged = parseEvent("pull_request", pr({ state: "closed", merged: true }, "closed"), config);
-    expect(merged.signals.map((s) => s.state)).toEqual(["merged"]);
-    expect(merged.upsertIndex).toEqual([expect.objectContaining({ repo: "togetherweown/two-web-next", number: 1903, open: false })]);
-    const closed = parseEvent("pull_request", pr({ state: "closed", merged: false }, "closed"), config);
-    expect(closed.signals).toEqual([]);
-    expect(closed.upsertIndex[0]!.open).toBe(false);
+  it("pull_request deliveries carry no wake decision: only a payload already reporting a conflict is a candidate", () => {
+    for (const action of ["converted_to_draft", "closed", "labeled"]) {
+      expect(mayAct("pull_request", pr({ mergeable_state: "dirty" }, action))).toBe(false);
+      expect(parseEvent("pull_request", pr({ mergeable_state: "dirty" }, action), config).signals).toEqual([]);
+    }
+    expect(mayAct("pull_request", pr({}))).toBe(false);
+    expect(parseEvent("pull_request", pr({ state: "closed", merged: true }, "closed"), config).signals).toEqual([]);
+    const dirty = parseEvent("pull_request", pr({ mergeable_state: "dirty" }), config).signals;
+    expect(dirty).toEqual([expect.objectContaining({ state: "conflict", draft: null, trusted: null })]); // decided by the lookup
   });
   it("marks fork PRs and outsider authors untrusted; trustedAuthors admits bots", () => {
-    const fork = parseEvent("pull_request", pr({ head: { sha: HEAD, ref: "TOG-43084-x", repo: { full_name: "evil/two-web-next" } } }), config);
-    expect(fork.upsertIndex[0]!.trusted).toBe(false);
-    const deletedFork = parseEvent("pull_request", pr({ head: { sha: HEAD, ref: "TOG-43084-x", repo: null } }), config);
-    expect(deletedFork.upsertIndex[0]!.trusted).toBe(false);
-    const outsider = parseEvent("pull_request", pr({ author_association: "CONTRIBUTOR" }), config);
-    expect(outsider.upsertIndex[0]!.trusted).toBe(false);
-    const bot = pr({ author_association: "NONE", user: { login: "paperclip-agent[bot]" } });
-    expect(parseEvent("pull_request", bot, config).upsertIndex[0]!.trusted).toBe(false);
+    const node = { number: 7, url: "u", state: "OPEN" as const, isDraft: false, isCrossRepository: false, authorAssociation: "NONE", author: { login: "paperclip-agent[bot]" }, headRefOid: HEAD, headRefName: "TOG-1-x", baseRefName: "main", mergeable: "MERGEABLE" as const, updatedAt: "2026-10-27T04:00:00Z" };
+    expect(prStateFromGraph("o/r", node, config).trusted).toBe(false);
     const allow = parseConfig({ ...config, trustedAuthors: ["Paperclip-Agent"] });
-    expect(parseEvent("pull_request", bot, allow).upsertIndex[0]!.trusted).toBe(true);
+    expect(prStateFromGraph("o/r", node, allow).trusted).toBe(true);
+    expect(prStateFromGraph("o/r", { ...node, isCrossRepository: true }, allow).trusted).toBe(false);
     for (const association of ["OWNER", "MEMBER", "COLLABORATOR"]) expect(isTrustedAuthor(config, association, "x")).toBe(true);
-    // A merged fork PR carries trusted=false so the gate refuses it.
-    const mergedFork = parseEvent("pull_request", pr({ state: "closed", merged: true, author_association: "NONE" }, "closed"), config);
-    expect(mergedFork.signals[0]!.trusted).toBe(false);
   });
   it("graph lookups respect state, cross-repo heads and author association", () => {
     const node = { number: 7, url: "u", state: "OPEN" as const, isDraft: false, isCrossRepository: false, authorAssociation: "MEMBER", author: { login: "doer" }, headRefOid: HEAD, headRefName: "TOG-1-x", baseRefName: "main", mergeable: "MERGEABLE" as const, updatedAt: "2026-10-27T04:00:00Z" };
-    expect(indexFromGraph("o/r", node, config)).toMatchObject({ open: true, trusted: true, updatedAt: "2026-10-27T04:00:00Z" });
-    expect(indexFromGraph("o/r", { ...node, state: "CLOSED" as const }, config).open).toBe(false);
-    expect(indexFromGraph("o/r", { ...node, state: "MERGED" as const }, config).open).toBe(false);
-    expect(indexFromGraph("o/r", { ...node, isCrossRepository: true }, config).trusted).toBe(false);
-    expect(indexFromGraph("o/r", { ...node, authorAssociation: "FIRST_TIME_CONTRIBUTOR" }, config).trusted).toBe(false);
+    expect(prStateFromGraph("o/r", node, config)).toMatchObject({ open: true, trusted: true, mergeable: "MERGEABLE" });
+    expect(prStateFromGraph("o/r", { ...node, state: "CLOSED" as const }, config).open).toBe(false);
+    expect(prStateFromGraph("o/r", { ...node, state: "MERGED" as const }, config).open).toBe(false);
+    expect(prStateFromGraph("o/r", { ...node, isCrossRepository: true }, config).trusted).toBe(false);
+    expect(prStateFromGraph("o/r", { ...node, authorAssociation: "FIRST_TIME_CONTRIBUTOR" }, config).trusted).toBe(false);
   });
-  it("evaluate gates closed, superseded, untrusted and draft PRs", () => {
+  it("evaluate gates closed, superseded, untrusted, draft and no-longer-conflicting PRs", () => {
     const signal = { repo: "o/r", number: 7, head: HEAD, state: "ci_red" as const, url: "u", headRef: null, draft: null, trusted: null, detail: {} };
-    const entry = { repo: "o/r", number: 7, head: HEAD, headRef: "TOG-1-x", base: "main", draft: false, url: "u", open: true, trusted: true, updatedAt: null };
+    const entry = { repo: "o/r", number: 7, head: HEAD, headRef: "TOG-1-x", draft: false, url: "u", open: true, trusted: true, mergeable: "MERGEABLE" as const };
+    const conflict = { ...signal, state: "conflict" as const };
+    expect(evaluate({ ...entry, mergeable: "CONFLICTING" }, conflict)).toMatchObject({ kind: "ok" });
+    expect(evaluate(entry, conflict)).toMatchObject({ kind: "skip", outcome: "not_conflicting" });
+    expect(evaluate({ ...entry, mergeable: "UNKNOWN" }, conflict)).toMatchObject({ kind: "transient" });
     expect(evaluate(entry, signal)).toMatchObject({ kind: "ok", signal: { draft: false, trusted: true, headRef: "TOG-1-x" } });
     expect(evaluate({ ...entry, open: false }, signal)).toMatchObject({ kind: "skip", outcome: "skipped_closed" });
     expect(evaluate({ ...entry, head: "f".repeat(40) }, signal)).toMatchObject({ kind: "skip", outcome: "stale_head" });

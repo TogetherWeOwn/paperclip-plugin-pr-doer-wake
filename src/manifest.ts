@@ -14,7 +14,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "PR doer wake",
   description:
-    "Wakes the card that owns a GitHub pull request exactly once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails, a merge conflict appears or it merges. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
+    "Wakes the card that owns an open, non-draft GitHub pull request once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -64,7 +64,7 @@ const manifest: PaperclipPluginManifestV1 = {
       shadow: { type: "boolean", default: true, description: "Record and log what would be woken, but post nothing and wake nobody." },
       githubOrg: { type: "string", description: "GitHub organization login whose webhooks this company accepts, e.g. TogetherWeOwn." },
       webhookSecretRef: { ...secretRef, description: "Paperclip secret holding the GitHub webhook secret." },
-      githubTokenSecretRef: { ...secretRef, description: "Optional Paperclip secret with a read-only GitHub token (pull requests: read). Enables the conflict sweep and draft lookups." },
+      githubTokenSecretRef: { ...secretRef, description: "Required when enabled. Paperclip secret with a read-only GitHub token (pull requests: read). Every wake is revalidated against GitHub first, and the conflict sweep reads mergeability with it." },
       reviewCheckName: { type: "string", default: "Paperclip Review" },
       requiredChecks: {
         type: "object",

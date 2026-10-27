@@ -12,7 +12,7 @@ export interface DoerWakeConfig {
   shadow: boolean;
   githubOrg: string;
   webhookSecretRef: SecretRef | null;
-  /** Optional. Enables the conflict sweep and draft lookups for PRs the plugin has not seen yet. */
+  /** Required when enabled: every wake candidate is revalidated against GitHub (open, non-draft, head, trust). */
   githubTokenSecretRef: SecretRef | null;
   reviewCheckName: string;
   /** Lowercase "org/repo" -> required check names. Repos without an entry treat every check as a gate. */
@@ -113,6 +113,9 @@ export function validateConfig(config: DoerWakeConfig): string[] {
   if (!config.enabled) return errors;
   if (!config.githubOrg) errors.push("githubOrg is required when enabled");
   if (!config.webhookSecretRef) errors.push("webhookSecretRef (secret_ref) is required when enabled");
+  if (!config.githubTokenSecretRef) {
+    errors.push("githubTokenSecretRef (secret_ref) is required when enabled: every wake is revalidated against GitHub");
+  }
   try {
     new RegExp(config.branchIdentifierPattern);
   } catch {

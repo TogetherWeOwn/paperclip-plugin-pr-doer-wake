@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "../src/manifest.js";
+import { parseConfig, validateConfig } from "../src/config.js";
 import plugin from "../src/plugin.js";
 import { DB_NAMESPACE, SWEEP_JOB_KEY } from "../src/constants.js";
 import {
@@ -15,6 +16,7 @@ import {
   pruneSql,
   recordOutcomeSql,
   retryableSql,
+  seenSql,
 } from "../src/sql.js";
 
 const CID = "ef993a7e-5ea7-445f-ba88-27a6a2690c3a";
@@ -32,7 +34,7 @@ type LedgerRow = {
   outcome: string; issueId: string | null; attempts: number; signal: string;
   commentPostedAt: string | null; wakeAttemptedAt: string | null; stale?: boolean;
 };
-type Graph = { mergeable: string; isDraft: boolean; state?: string; head?: string; cross?: boolean; association?: string; updatedAt?: string };
+type Graph = { mergeable: string; isDraft: boolean; state?: string; head?: string; cross?: boolean; association?: string; login?: string; ref?: string; updatedAt?: string };
 
 let harness: TestHarness;
 let ledger: Map<string, LedgerRow>;
@@ -105,7 +107,7 @@ function setup(config: Record<string, unknown> = {}) {
   commentCards = new Map([["github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", CARD]]);
   wakes = [];
   comments = [];
-  graph = null;
+  graph = { mergeable: "MERGEABLE", isDraft: false }; // what GitHub currently says about PR 1903
   graphFail = false;
   graphCalls = 0;
   runs = [];
@@ -145,6 +147,7 @@ function setup(config: Record<string, unknown> = {}) {
     const live = rows.filter((r) => !["done", "cancelled"].includes(r.status) && !exclude.includes(r.assigneeAgentId));
     if (sql === CARD_BY_IDENTIFIER_SQL) return live.filter((r) => r.identifier === params[1]);
     if (sql === CARD_BY_COMMENT_SQL) return live.filter((r) => commentCards.get(String(params[2])) === r.id);
+    if (sql === seenSql(DB_NAMESPACE)) return ledger.has(`${params[0]}|${params[1]}`) ? [{ fingerprint: params[1] }] : [];
     if (sql === COMMENT_EXISTS_SQL) return comments.filter((c) => c.issueId === params[1] && c.body === params[2]).map(() => ({ id: "c" }));
     if (sql === RUN_SINCE_SQL) {
       return runs
@@ -163,8 +166,8 @@ function setup(config: Record<string, unknown> = {}) {
     if (graphFail) return new Response("bad gateway", { status: 502 });
     const nodes = graph ? [{
       number: 1903, url: "https://github.com/TogetherWeOwn/two-web-next/pull/1903", state: graph.state ?? "OPEN", isDraft: graph.isDraft,
-      isCrossRepository: graph.cross ?? false, authorAssociation: graph.association ?? "MEMBER", author: { login: "doer" },
-      headRefOid: graph.head ?? HEAD, headRefName: "feat/quality", baseRefName: "main", mergeable: graph.mergeable, updatedAt: graph.updatedAt ?? new Date().toISOString(),
+      isCrossRepository: graph.cross ?? false, authorAssociation: graph.association ?? "MEMBER", author: { login: graph.login ?? "doer" },
+      headRefOid: graph.head ?? HEAD, headRefName: graph.ref ?? "feat/quality", baseRefName: "main", mergeable: graph.mergeable, updatedAt: graph.updatedAt ?? new Date().toISOString(),
     }] : [];
     return new Response(JSON.stringify({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes }, pullRequest: nodes[0] ?? null } } }), { status: 200 });
   };
@@ -189,6 +192,62 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     await setup();
   });
 
+  it("requires githubTokenSecretRef when enabled: every wake is revalidated against GitHub", async () => {
+    const config = parseConfig({ enabled: true, githubOrg: "o", webhookSecretRef: { type: "secret_ref", secretId: "x" } });
+    expect(validateConfig(config)).toEqual([expect.stringMatching(/githubTokenSecretRef/)]);
+    expect(await plugin.definition.onValidateConfig!(config as any)).toMatchObject({ ok: false });
+  });
+
+  for (const [label, current] of [
+    ["is now a draft", { mergeable: "MERGEABLE", isDraft: true }],
+    ["is now closed", { mergeable: "MERGEABLE", isDraft: false, state: "CLOSED" }],
+  ] as const) {
+    it(`a webhook-known open PR that GitHub says ${label} (its pull_request delivery delayed) never wakes`, async () => {
+      await deliver("pull_request", prEvent()); // indexed open, non-draft, same head
+      graph = { ...current };
+      await deliver("check_run", ciFailed("build"));
+      await deliver("check_run", reviewFailed());
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+    });
+  }
+
+  it("a tied updated_at cannot undo a draft conversion or reopen a closed PR", async () => {
+    const t = "2026-10-27T04:00:10Z";
+    await deliver("pull_request", prEvent({ action: "converted_to_draft", draft: true, updatedAt: t }));
+    await deliver("pull_request", prEvent({ action: "synchronize", draft: false, updatedAt: t })); // older payload, same second
+    graph = { mergeable: "MERGEABLE", isDraft: true };
+    await deliver("check_run", ciFailed("build"));
+    expect(wakes).toEqual([]);
+    await setup();
+    await deliver("pull_request", prEvent({ action: "closed", updatedAt: t, extra: { state: "closed", merged: false } }));
+    await deliver("pull_request", prEvent({ action: "synchronize", updatedAt: t }));
+    graph = { mergeable: "MERGEABLE", isDraft: false, state: "CLOSED" };
+    await deliver("check_run", ciFailed("build"));
+    expect(wakes).toEqual([]);
+  });
+
+  it("a check on a new head that arrives before (or without) its synchronize delivery still wakes", async () => {
+    await deliver("pull_request", prEvent({ head: HEAD })); // the index still holds the old head
+    graph = { mergeable: "MERGEABLE", isDraft: false, head: HEAD2 };
+    await deliver("check_run", ciFailed("build", "failure", HEAD2));
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("merged PRs never wake, by default or when an old config still lists merged", async () => {
+    expect((manifest.instanceConfigSchema as any).properties.wakeStates).toMatchObject({ default: ["review_findings", "ci_red", "conflict"] });
+    expect(parseConfig({ wakeStates: ["merged", "ci_red"] }).wakeStates).toEqual(["ci_red"]);
+    for (const config of [{}, { wakeStates: ["merged", "review_findings", "ci_red", "conflict"] }] as Record<string, unknown>[]) {
+      await setup(config);
+      graph = { mergeable: "MERGEABLE", isDraft: false, state: "MERGED" };
+      await deliver("pull_request", prEvent({ action: "closed", extra: { state: "closed", merged: true } }));
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+      expect(ledger.size).toBe(0);
+    }
+  });
+
   it("wakes the owning card once with evidence when Paperclip Review fails", async () => {
     await deliver("pull_request", prEvent());
     await deliver("check_run", reviewFailed());
@@ -204,6 +263,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     await deliver("check_run", ciFailed("build"));
     await deliver("check_run", ciFailed("test"));
     expect(wakes).toHaveLength(1);
+    graph = { mergeable: "MERGEABLE", isDraft: false, head: HEAD2 };
     await deliver("pull_request", prEvent({ head: HEAD2 }));
     await deliver("check_run", ciFailed("build", "failure", HEAD2));
     expect(wakes).toHaveLength(2);
@@ -216,6 +276,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   });
 
   it("never wakes for drafts", async () => {
+    graph = { mergeable: "MERGEABLE", isDraft: true };
     await deliver("pull_request", prEvent({ draft: true, action: "opened" }));
     await deliver("check_run", ciFailed("build"));
     await deliver("check_run", reviewFailed());
@@ -223,7 +284,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(ledger.size).toBe(0);
   });
 
-  it("looks up an unseen PR once to learn its draft flag", async () => {
+  it("looks up a PR it has never seen a pull_request delivery for", async () => {
     graph = { mergeable: "MERGEABLE", isDraft: true };
     await deliver("check_run", ciFailed("build"));
     expect(graphCalls).toBe(1);
@@ -234,9 +295,9 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toHaveLength(1);
   });
 
-  it("skips unseen PRs when no token is configured (draft unknown)", async () => {
+  it("a company without githubTokenSecretRef is not enabled (invalid config): nothing is woken", async () => {
     await setup({ githubTokenSecretRef: undefined });
-    await deliver("check_run", ciFailed("build"));
+    await expect(deliver("check_run", ciFailed("build"))).rejects.toThrow(/signature/); // no enabled company to verify for
     expect(wakes).toEqual([]);
     expect(graphCalls).toBe(0);
   });
@@ -269,6 +330,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
 
   it("prefers the card named by the head branch and never picks an excluded agent's card", async () => {
     commentCards.clear();
+    graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
     await deliver("pull_request", prEvent({ ref: "TOG-43084-quality" }));
     await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
     expect(wakes).toHaveLength(1);
@@ -278,12 +340,6 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     await deliver("check_run", reviewFailed());
     expect(wakes).toEqual([]);
     expect([...ledger.values()][0]!.outcome).toBe("no_card");
-  });
-
-  it("wakes on merge", async () => {
-    await deliver("pull_request", prEvent({ action: "closed", extra: { state: "closed", merged: true } }));
-    expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_merged"]);
-    expect(comments[0]!.body).toContain("was merged");
   });
 
   it("shadow mode records and logs but posts and wakes nothing", async () => {
@@ -382,21 +438,18 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
 
   it("fork PRs and outsider authors never wake, even with a card-shaped head branch", async () => {
     commentCards.clear();
-    await deliver("pull_request", prEvent({ ref: "TOG-43084-x", extra: { head: { sha: HEAD, ref: "TOG-43084-x", repo: { full_name: "evil/two-web-next" } } } }));
-    await deliver("pull_request", prEvent({ ref: "TOG-43084-x", action: "closed", extra: { state: "closed", merged: true, head: { sha: HEAD, ref: "TOG-43084-x", repo: { full_name: "evil/two-web-next" } } } }));
+    graph = { mergeable: "MERGEABLE", isDraft: false, cross: true }; // GitHub: head lives in a fork
+    await deliver("pull_request", prEvent({ ref: "TOG-43084-x", extra: { mergeable_state: "dirty", head: { sha: HEAD, ref: "TOG-43084-x", repo: { full_name: "evil/two-web-next" } } } }));
+    await deliver("check_run", reviewFailed(HEAD, "TOG-43084-x"));
     expect(wakes).toEqual([]);
     await setup();
     commentCards.clear();
-    await deliver("pull_request", prEvent({ ref: "TOG-43084-x", extra: { author_association: "CONTRIBUTOR" } }));
+    graph = { mergeable: "MERGEABLE", isDraft: false, association: "CONTRIBUTOR" };
     await deliver("check_run", reviewFailed(HEAD, "TOG-43084-x"));
     expect(wakes).toEqual([]);
     expect(ledger.size).toBe(0);
-    await setup(); // unseen PR: the GraphQL lookup says cross-repository
-    graph = { mergeable: "MERGEABLE", isDraft: false, cross: true };
-    await deliver("check_run", reviewFailed(HEAD, "TOG-43084-x"));
-    expect(wakes).toEqual([]);
     await setup({ trustedAuthors: ["paperclip-agent"] });
-    await deliver("pull_request", prEvent({ extra: { author_association: "NONE", user: { login: "paperclip-agent[bot]" } } }));
+    graph = { mergeable: "MERGEABLE", isDraft: false, association: "NONE", login: "paperclip-agent[bot]" };
     await deliver("check_run", reviewFailed());
     expect(wakes).toHaveLength(1);
   });
@@ -444,22 +497,41 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toHaveLength(1);
   });
 
-  it("an older or replayed pull_request delivery never overwrites newer index data", async () => {
+  it("an older or replayed pull_request delivery never decides a wake; GitHub's current state does", async () => {
+    graph = { mergeable: "MERGEABLE", isDraft: true };
     await deliver("pull_request", prEvent({ action: "converted_to_draft", draft: true, updatedAt: "2026-10-27T04:00:10Z" }));
     await deliver("pull_request", prEvent({ action: "synchronize", draft: false, updatedAt: "2026-10-27T04:00:05Z" })); // late, stale
     await deliver("check_run", ciFailed("build"));
     expect(wakes).toEqual([]);
-    await deliver("pull_request", prEvent({ action: "ready_for_review", draft: false, updatedAt: "2026-10-27T04:00:20Z" }));
+    graph = { mergeable: "MERGEABLE", isDraft: false }; // marked ready; a check re-run fails again
     await deliver("check_run", ciFailed("build"));
     expect(wakes).toHaveLength(1);
   });
 
-  it("a late pull_request delivery cannot reopen a closed PR in the index", async () => {
+  it("a late pull_request delivery cannot reopen a closed PR", async () => {
+    graph = { mergeable: "MERGEABLE", isDraft: false, state: "CLOSED" };
     await deliver("pull_request", prEvent({ action: "closed", updatedAt: "2026-10-27T04:00:10Z", extra: { state: "closed", merged: false } }));
-    await deliver("pull_request", prEvent({ updatedAt: "2026-10-27T04:00:05Z" }));
+    await deliver("pull_request", prEvent({ updatedAt: "2026-10-27T04:00:05Z", extra: { mergeable_state: "dirty" } }));
     await deliver("check_run", ciFailed("build"));
     expect(wakes).toEqual([]);
-    expect(graphCalls).toBe(0);
+    expect(ledger.size).toBe(0);
+  });
+
+  it("a pull_request payload reporting a conflict wakes only if GitHub still says CONFLICTING", async () => {
+    await deliver("pull_request", prEvent({ extra: { mergeable_state: "dirty" } }));
+    expect(wakes).toEqual([]); // GitHub: MERGEABLE now
+    await setup();
+    graph = { mergeable: "CONFLICTING", isDraft: false };
+    await deliver("pull_request", prEvent({ extra: { mergeable_state: "dirty" } }));
+    expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
+  });
+
+  it("a redelivered red check costs no further GitHub lookup", async () => {
+    await deliver("check_run", ciFailed("build"));
+    await deliver("check_run", ciFailed("build"));
+    await deliver("check_run", ciFailed("test"));
+    expect(wakes).toHaveLength(1);
+    expect(graphCalls).toBe(1);
   });
 
   it("a retry posts the evidence comment that the first attempt never posted", async () => {
@@ -486,7 +558,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toHaveLength(1);
   });
 
-  it("a lookup of an unseen closed or merged PR never indexes it as open or wakes it", async () => {
+  it("a lookup of a closed or merged PR never wakes it", async () => {
     for (const state of ["CLOSED", "MERGED"]) {
       await setup();
       graph = { mergeable: "MERGEABLE", isDraft: false, state };
@@ -494,7 +566,6 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       await deliver("check_run", ciFailed("test"));
       expect(wakes).toEqual([]);
       expect(ledger.size).toBe(0);
-      expect(graphCalls).toBe(1); // the closed tombstone answers the second check without another lookup
     }
   });
 

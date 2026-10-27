@@ -15,6 +15,7 @@ import {
   pruneSql,
   recordOutcomeSql,
   retryableSql,
+  seenSql,
 } from "../src/sql.js";
 import {
   derivePluginDatabaseNamespace,
@@ -47,7 +48,7 @@ describe("host contract", () => {
     expect([...core].sort()).toEqual(["heartbeat_runs", "issue_comments", "issues"]);
   });
   it("runtime queries pass validatePluginRuntimeQuery with the declared core tables only", () => {
-    for (const q of [CARD_BY_IDENTIFIER_SQL, CARD_BY_COMMENT_SQL, COMMENT_EXISTS_SQL, RUN_SINCE_SQL, retryableSql(DB_NAMESPACE)]) {
+    for (const q of [CARD_BY_IDENTIFIER_SQL, CARD_BY_COMMENT_SQL, COMMENT_EXISTS_SQL, RUN_SINCE_SQL, retryableSql(DB_NAMESPACE), seenSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeQuery(q, DB_NAMESPACE, core)).not.toThrow();
     }
     expect(() => validatePluginRuntimeQuery(CARD_BY_COMMENT_SQL, DB_NAMESPACE, ["issues"])).toThrow(/issue_comments/);
