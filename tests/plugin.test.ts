@@ -9,7 +9,6 @@ import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
-  MAX_RETRIES,
   claimSql,
   compactSql,
   forgetSql,
@@ -60,7 +59,7 @@ let comments: Array<{ issueId: string; body: string }>;
 let graph: Graph | null;
 let graphFail: boolean;
 let graphCalls: number;
-let failNext: Set<string>; // one-shot injected failures: "comment", "markComment", "markWakeLostReply", "takenDuringComment"
+let failNext: Set<string>; // one-shot injected failures: "comment", "markComment", "markWakeLostReply", "takenDuringComment", "recordWoken"
 let hostWakeCalls: number; // requestWakeup calls that reached the host, whatever the reply
 let baseConfig: Record<string, unknown>;
 let tick: number; // monotonic stand-in for updated_at
@@ -158,6 +157,9 @@ function setup(config: Record<string, unknown> = {}) {
       return { rowCount: 1 };
     }
     if (sql === recordOutcomeSql(DB_NAMESPACE)) {
+      if (String(params[2]).startsWith("woken:") && failNext.delete("recordWoken")) {
+        throw Object.assign(new Error("Worker RPC host is shutting down (budget write paused)"), { code: -32000 });
+      }
       const row = ledger.get(key);
       if (!row) return { rowCount: 0 };
       Object.assign(row, { outcome: params[2], issueId: params[3], updatedAt: touch() });
@@ -200,15 +202,15 @@ function setup(config: Record<string, unknown> = {}) {
     const exclude = String(baseConfig.excludeAgentIds ?? "").split(",");
     const issues = [...[CARD, BLOCKER, OTHER].map((id) => harness.ctx.issues.get(id, CID))];
     const rows = (await Promise.all(issues)).filter(Boolean) as any[];
-    // Ownership is decided regardless of status or the card's current assignee: the comment path takes the oldest
-    // PR-link comment by any non-excluded agent (CARD_BY_COMMENT_SQL).
+    // Ownership is decided regardless of status or the card's current assignee: the comment path returns up to two
+    // distinct cards with a PR-link comment by any non-excluded agent (CARD_BY_COMMENT_SQL); two means ambiguous.
     if (sql === CARD_BY_IDENTIFIER_SQL) return rows.filter((r) => r.identifier === params[1]).map((r) => ({ ...r, assignee_agent_id: r.assigneeAgentId }));
     if (sql === CARD_BY_COMMENT_SQL) {
       const first = commentCards.get(String(params[2]));
       const mentions = [...(first ? [{ pattern: String(params[2]), cardId: first, author: DOER }] : []), ...laterMentions]
         .filter((m) => m.pattern === String(params[2]) && !exclude.includes(m.author));
-      const owner = rows.find((r) => r.id === mentions[0]?.cardId);
-      return owner ? [{ id: owner.id, identifier: owner.identifier, status: owner.status }] : [];
+      const ids = [...new Set(mentions.map((m) => m.cardId))];
+      return rows.filter((r) => ids.includes(r.id)).slice(0, 2).map((r) => ({ id: r.id, identifier: r.identifier, status: r.status }));
     }
     const asRow = ([k, r]: [string, LedgerRow]) => ({ fingerprint: k.split("|")[1], outcome: r.outcome, attempts: r.attempts, updated_at: r.updatedAt, signal: r.signal, issue_id: r.issueId, comment_posted_at: r.commentPostedAt, wake_attempted_at: r.wakeAttemptedAt });
     if (sql === seenSql(DB_NAMESPACE)) {
@@ -780,21 +782,24 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(graphCalls).toBe(calls); // no lookup either
     });
 
-    it("a row left at 'retrying' by a dead sweep is retried, bounded by the attempt budget", async () => {
+    it("a row left at 'retrying' by a dead sweep is retried, whatever its attempt count", async () => {
       await failFirstWake();
       const row0 = [...ledger.values()][0]!;
-      Object.assign(row0, { outcome: "retrying", stale: true, attempts: 1 });
+      Object.assign(row0, { outcome: "retrying", stale: true, attempts: 40 });
       await runSweep();
       expect(wakes).toHaveLength(1);
     });
 
-    it("a never-woken row whose retry budget is spent is forgotten, so a later signal can still wake", async () => {
-      await failFirstWake();
-      Object.assign([...ledger.values()][0]!, { outcome: "retrying", stale: true, attempts: MAX_RETRIES });
+    it("a never-woken row is never dropped for its retry count: it wakes once the outage ends", async () => {
+      graphFail = true;
+      await deliver("check_run", reviewFailed());
+      for (let i = 0; i < 20; i += 1) await runSweep(); // far past the old 12-retry cap
+      expect(row(1903, "review_findings")!).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+      expect(row(1903, "review_findings")!.attempts).toBe(20);
+      graphFail = false;
       await runSweep();
-      expect(wakes).toEqual([]); // budget spent: no wake from the sweep
-      expect(ledger.size).toBe(0);
-      await deliver("check_run", reviewFailed()); // GitHub redelivers
+      expect(wakes).toHaveLength(1);
+      await runSweep();
       expect(wakes).toHaveLength(1);
     });
   });
@@ -1013,10 +1018,10 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   });
 
   describe("a GitHub outage never strands a wake that was never attempted", () => {
-    it("a redelivery that meets a row with its retries spent starts over and wakes once", async () => {
+    it("a redelivery that meets a row with many retries behind it resumes it and wakes once", async () => {
       graphFail = true;
       await deliver("check_run", ciFailed("build"));
-      row()!.attempts = MAX_RETRIES;
+      row()!.attempts = 50;
       graphFail = false;
       await deliver("check_run", ciFailed("build"));
       expect(wakes).toHaveLength(1);
@@ -1114,8 +1119,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   });
 
   describe("comment ownership survives the owner's reassignment", () => {
-    it("an owning card handed to the excluded reviewer never passes the wake to a card that mentioned the PR later", async () => {
-      laterMentions.push({ pattern: "github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", cardId: OTHER, author: DOER });
+    it("an owning card handed to the excluded reviewer is still the owner: pending on it, never another card", async () => {
       harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review", { assigneeAgentId: REVIEWER })] });
       await deliver("check_run", reviewFailed());
       expect(wakes).toEqual([]);
@@ -1132,6 +1136,106 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       await deliver("check_run", reviewFailed());
       expect(wakes).toEqual([]);
       expect(row(1903, "review_findings")!.outcome).toBe("no_card");
+    });
+  });
+
+  // --- review round 4 ---------------------------------------------------------------------------------------------
+
+  describe("a wake that reached the host is never requested twice", () => {
+    it("a failed outcome write after requestWakeup succeeded (even -32000 or a 'budget'/'paused' message) never wakes again", async () => {
+      failNext.add("recordWoken");
+      await deliver("check_run", ciFailed("build"));
+      expect(hostWakeCalls).toBe(1);
+      expect(row()!.wakeAttemptedAt).not.toBeNull(); // the mark stays: the wake happened
+      expect(row()!.outcome).not.toMatch(/^refused/);
+      await harness.runJob(SWEEP_JOB_KEY);
+      await harness.runJob(SWEEP_JOB_KEY);
+      await deliver("check_run", ciFailed("build"));
+      expect(hostWakeCalls).toBe(1);
+      expect(wakes).toHaveLength(1);
+    });
+  });
+
+  it("the SDK's own -32000 on shutdown (the request may have been dispatched) is unconfirmed, never retried", async () => {
+    const ctx = harness.ctx as any;
+    const original = ctx.issues.requestWakeup;
+    ctx.issues.requestWakeup = vi.fn(async () => {
+      hostWakeCalls += 1; // sent; the host may have queued it...
+      throw Object.assign(new Error("Worker RPC host is shutting down"), { code: -32000 }); // ...cleanup() rejected the pending call
+    });
+    await deliver("check_run", ciFailed("build"));
+    ctx.issues.requestWakeup = original;
+    expect(row()!.outcome).toBe("wake_unconfirmed");
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(hostWakeCalls).toBe(1);
+  });
+
+  describe("ownership is ambiguous when PR-link comments name several cards", () => {
+    const PR = "github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)";
+    it("an unrelated card that linked the PR first never gets the wake: held as ambiguous_card", async () => {
+      commentCards.set(PR, OTHER); // card A mentioned the PR first
+      laterMentions.push({ pattern: PR, cardId: CARD, author: DOER }); // the real owner B links it afterwards
+      await deliver("check_run", reviewFailed()); // branch feat/quality names no card
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+      expect(row(1903, "review_findings")!.outcome).toMatch(/^ambiguous_card/);
+      await harness.runJob(SWEEP_JOB_KEY); // a hold, not retried
+      expect(wakes).toEqual([]);
+    });
+
+    it("comments on a second card make even a branch-named owner ambiguous", async () => {
+      laterMentions.push({ pattern: PR, cardId: OTHER, author: DOER });
+      graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
+      await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
+      expect(wakes).toEqual([]);
+      expect(row(1903, "review_findings")!.outcome).toMatch(/^ambiguous_card/);
+    });
+
+    it("a retry re-resolves ownership and holds when new evidence conflicts with the card it chose", async () => {
+      commentCards.clear(); // only the branch names the card
+      graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
+      failNext.add("comment");
+      await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
+      expect(row(1903, "review_findings")!).toMatchObject({ outcome: "error", issueId: CARD });
+      commentCards.set(PR, OTHER); // another card now carries a qualifying PR-link comment
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+      expect(row(1903, "review_findings")!.outcome).toMatch(/^ambiguous_card/);
+    });
+
+    it("a retry holds when the card it chose no longer resolves as the owner", async () => {
+      failNext.add("comment");
+      await deliver("check_run", reviewFailed());
+      expect(row(1903, "review_findings")!).toMatchObject({ outcome: "error", issueId: CARD });
+      commentCards.set(PR, OTHER); // the evidence now points at another card only
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toEqual([]);
+      expect(row(1903, "review_findings")!.outcome).toMatch(/^ambiguous_card/);
+    });
+  });
+
+  describe("pending conflict sweeps survive any outage", () => {
+    it("a GitHub outage longer than six sweep ticks does not drop the repo's pending sweep", async () => {
+      await deliver("push", { ref: "refs/heads/main" });
+      graphFail = true;
+      for (let i = 0; i < 10; i += 1) await harness.runJob(SWEEP_JOB_KEY);
+      graphFail = false;
+      graph = { mergeable: "CONFLICTING", isDraft: false };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
+      const calls = graphCalls;
+      await harness.runJob(SWEEP_JOB_KEY); // done: the mark is gone
+      expect(graphCalls).toBe(calls);
+    });
+
+    it("mergeability that stays UNKNOWN for more than six ticks keeps the repo marked", async () => {
+      await deliver("push", { ref: "refs/heads/main" });
+      graph = { mergeable: "UNKNOWN", isDraft: false };
+      for (let i = 0; i < 10; i += 1) await harness.runJob(SWEEP_JOB_KEY);
+      graph = { mergeable: "CONFLICTING", isDraft: false };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
     });
   });
 });

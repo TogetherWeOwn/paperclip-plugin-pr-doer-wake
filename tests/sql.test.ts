@@ -7,7 +7,6 @@ import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
-  MAX_RETRIES,
   claimSql,
   compactSql,
   forgetSql,
@@ -59,11 +58,11 @@ describe("host contract", () => {
   });
   it("retries failed and card-pending rows with exponential backoff (2..60 minutes) and rows stuck at claimed or retrying", () => {
     const sql = retryableSql(DB_NAMESPACE);
-    expect(sql).toMatch(/outcome in \('error', 'no_card'\) and updated_at < now\(\) - interval '1 minute' \* least\(power\(2, attempts \+ 1\), 60\)/);
+    // The exponent is capped too: retries never end, and power(2, attempts) overflows float8 past ~1023 attempts.
+    expect(sql).toMatch(/outcome in \('error', 'no_card'\) and updated_at < now\(\) - interval '1 minute' \* least\(power\(2, least\(attempts, 5\) \+ 1\), 60\)/);
     expect(sql).toMatch(/outcome in \('claimed', 'retrying'\) and updated_at < now\(\) - interval '10 minutes'/);
-    // No attempt cap in SQL: a row past MAX_RETRIES is selected once more and forgotten (plugin.ts), never stranded.
+    // No attempt cap: a pending row is retried hourly until GitHub answers, never dropped (plugin.ts retryRow).
     expect(sql).not.toMatch(/attempts </);
-    expect(MAX_RETRIES).toBeGreaterThanOrEqual(10); // ~8 hours of retries before giving up
     expect(sql).toMatch(/signal <> '\{\}'::jsonb/); // compacted tombstones are never retried
     expect(sql).toMatch(/updated_at::text as updated_at/);
   });
@@ -95,7 +94,9 @@ describe("host contract", () => {
     // The card's CURRENT assignee never decides ownership: reassigning the owner must not promote a later card.
     expect(CARD_BY_COMMENT_SQL).not.toMatch(/assignee_agent_id/);
     expect(CARD_BY_COMMENT_SQL).toMatch(/c\.author_agent_id is not null and not \(c\.author_agent_id::text = any\(string_to_array\(\$4, ','\)\)\)/);
-    expect(CARD_BY_COMMENT_SQL).toMatch(/order by first_mention asc/);
+    // Up to two distinct cards: a second one makes ownership ambiguous (waker.ts resolveCard), never "the first".
+    expect(CARD_BY_COMMENT_SQL).toMatch(/group by i\.id, i\.identifier, i\.status\s+order by i\.id\s+limit 2$/);
+    expect(CARD_BY_COMMENT_SQL).not.toMatch(/first_mention|min\(/);
   });
   it("runtime writes pass validatePluginRuntimeExecute", () => {
     for (const q of [claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), forgetSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {

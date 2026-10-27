@@ -20,7 +20,7 @@ import {
   type Signal,
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
-import { MAX_RETRIES, compactSql, reclaimSql, retryableSql, seenSql } from "./sql.js";
+import { compactSql, reclaimSql, retryableSql, seenSql } from "./sql.js";
 import { deferSignal, forget, markUnconfirmed, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
@@ -28,11 +28,14 @@ let lock: Promise<unknown> = Promise.resolve();
 /** The sweep running in this worker, if any (single flight; see runSweep). */
 let sweepInflight: Promise<WakeResult[]> | null = null;
 const secrets = new SecretCache();
-const MAX_SWEEP_ATTEMPTS = 6;
 type OpenPrsConnection = { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: GraphPr[] };
 type OpenPrsData = { repository: { pullRequests: OpenPrsConnection } | null };
-/** A repo whose default branch moved. `cursor` resumes a sweep that hit sweepMaxPages; `unknownSeen` carries UNKNOWN mergeability across those pages. */
-type SweepMark = { since: string; attempts: number; cursor?: string | null; unknownSeen?: boolean };
+/**
+ * A repo whose default branch moved, kept until one full read of its open PRs succeeds with no UNKNOWN mergeability
+ * (at most one per repo, so an outage keeps it rather than losing the conflicts it would find). `cursor` resumes a
+ * sweep that hit sweepMaxPages; `unknownSeen` carries UNKNOWN mergeability across those pages.
+ */
+type SweepMark = { since: string; cursor?: string | null; unknownSeen?: boolean };
 type Company = { companyId: string; config: DoerWakeConfig };
 
 /** Serialize read-modify-write of plugin state inside this single worker. Never nest. */
@@ -171,7 +174,8 @@ function resumable(row: LedgerRow): boolean {
  * re-read the PR from GitHub, then wake, keep it for another retry, or forget it. Shared by the sweep and by an
  * authenticated redelivery (`fresh`, the newly delivered signal for the same fingerprint, whose run identity tells
  * GitHub read lag from a recovered check). A row whose wake may have reached the host is closed as
- * wake_unconfirmed and never requested again; a row past MAX_RETRIES is forgotten so a later signal starts over.
+ * wake_unconfirmed and never requested again. There is no retry cap: a pending row is kept (hourly at most, see
+ * retryableSql) until GitHub answers, then woken, held or forgotten.
  */
 async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeConfig, row: LedgerRow, fresh?: Signal): Promise<WakeResult> {
   const ns = ctx.db.namespace || DB_NAMESPACE;
@@ -181,11 +185,6 @@ async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeC
   if (row.wake_attempted_at) {
     // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
     return markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake");
-  }
-  if (Number(row.attempts) >= MAX_RETRIES) {
-    await forget(ctx, companyId, fp);
-    ctx.logger.warn("pr-doer-wake: retries spent; the row is forgotten and a later signal starts over", { fingerprint: fp, lastOutcome: row.outcome });
-    return { fingerprint: fp, outcome: "gave_up", detail: row.outcome };
   }
   const signal = fresh ?? (JSON.parse(row.signal) as Signal);
   const policy = policySkip(config, signal);
@@ -214,7 +213,7 @@ export async function handleGithubEvent(eventName: string, payload: Record<strin
   if (parsed.sweepRepos.length > 0) {
     await serialized(async () => {
       const marks = ((await ctx.state.get(SWEEP_KEY)) as Record<string, SweepMark> | null) ?? {};
-      for (const repo of parsed.sweepRepos) marks[`${companyId}|${repo}`] = { since: new Date().toISOString(), attempts: 0 };
+      for (const repo of parsed.sweepRepos) marks[`${companyId}|${repo}`] = { since: new Date().toISOString() };
       await ctx.state.set(SWEEP_KEY, marks);
     });
   }
@@ -228,13 +227,9 @@ export async function handleGithubEvent(eventName: string, payload: Record<strin
     const [existing] = await ctx.db.query<LedgerRow>(seenSql(ctx.db.namespace || DB_NAMESPACE), [companyId, fp]);
     if (existing) {
       // A row whose wake was never attempted (GitHub was down, no owning card yet) is resumed now instead of
-      // waiting for its backoff; any other row is a duplicate and costs no GitHub lookup. A row whose retries are
-      // spent is forgotten, and this signal then starts over below.
-      const resumed = resumable(existing) ? await retryRow(ctx, companyId, config, existing, raw) : { fingerprint: fp, outcome: "duplicate" as const };
-      if (resumed.outcome !== "gave_up") {
-        results.push(resumed);
-        continue;
-      }
+      // waiting for its backoff; any other row is a duplicate and costs no GitHub lookup.
+      results.push(resumable(existing) ? await retryRow(ctx, companyId, config, existing, raw) : { fingerprint: fp, outcome: "duplicate" });
+      continue;
     }
     const check = await currentPrState(ctx, companyId, config, raw);
     if (check.kind === "ok") results.push(await wakeForSignal(ctx, companyId, config, check.signal));
@@ -290,15 +285,14 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
       ctx.logger.warn("pr-doer-wake: conflict sweep failed", { repo, error: String(error) });
       failed = true;
     }
-    const attempts = mark.attempts ?? 0;
     if (failed) {
-      next.set(key, attempts + 1 < MAX_SWEEP_ATTEMPTS ? { ...mark, attempts: attempts + 1 } : null);
+      next.set(key, mark); // kept as it was: transient failures never count against the sweep
     } else if (!finished) {
       ctx.logger.warn("pr-doer-wake: conflict sweep reached sweepMaxPages; continuing from the cursor next tick", { repo, pages: config.sweepMaxPages });
       next.set(key, { ...mark, cursor, unknownSeen: unknown });
     } else if (unknown) {
       // GitHub computes mergeability lazily; UNKNOWN heads are read again from the first page next tick.
-      next.set(key, attempts + 1 < MAX_SWEEP_ATTEMPTS ? { since: mark.since, attempts: attempts + 1 } : null);
+      next.set(key, { since: mark.since });
     } else {
       next.set(key, null);
     }
