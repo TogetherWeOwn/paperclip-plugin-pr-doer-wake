@@ -3,6 +3,11 @@ import type { SecretRef } from "./config.js";
 
 /** A resolved secret is reused for this long before the next host resolution is scheduled. */
 export const SECRET_TTL_MS = 10 * 60_000;
+/**
+ * Hard limit on verifying with a value past its TTL. Only a rate-limited re-resolution keeps an expired value at all
+ * (every other failure evicts it); past this age it is refused even then.
+ */
+export const SECRET_MAX_STALE_MS = 30 * 60_000;
 /** After a verification miss, at most one re-resolution per key in this window. */
 export const SECRET_MISS_BACKOFF_MS = 60_000;
 /** After GitHub rejects the token (HTTP 401), no re-resolution of it for this long. */
@@ -13,6 +18,15 @@ type Entry = { value: string | null; fetchedAt: number; attemptedAt: number; rej
 /** Thrown by `get` while a rejected secret backs off. Callers treat it as transient. */
 export class SecretBackoffError extends Error {
   override name = "SecretBackoffError";
+}
+
+/**
+ * The host's 30/min refusal (plugin-secrets-handler.ts:233-236). Only the message crosses the worker RPC bridge
+ * (JsonRpcCallError), so match it as well as the host-side error name.
+ */
+export function isRateLimited(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return error.name === "RateLimitExceededError" || /rate limit exceeded for secret resolution/i.test(error.message);
 }
 
 /**
@@ -27,6 +41,11 @@ export class SecretBackoffError extends Error {
  * await handleHostRequest), so concurrent callers await the in-flight promise instead of failing.
  *
  * Values live only in this process: never in plugin state, config, logs or error messages (PLUGIN_SPEC.md section 22).
+ *
+ * Fails closed: the SDK says resolved values must not be cached (types.ts, secrets.resolve), so this cache exists only
+ * for the budget above. A re-resolution that fails for any reason other than the rate limit (secret deactivated,
+ * binding removed, secret deleted) evicts the value at once, and an expired value is never used past
+ * SECRET_MAX_STALE_MS.
  */
 export class SecretCache {
   private readonly entries = new Map<string, Entry>();
@@ -45,13 +64,16 @@ export class SecretCache {
   }
 
   /**
-   * The cached value even past the TTL. An HMAC match with it still proves a delivery is authentic, so expiry only
-   * schedules a re-resolution (`revalidate`); a rotated value replaces it when that lands.
+   * The cached value even past the TTL, up to SECRET_MAX_STALE_MS. An HMAC match with it still proves a delivery is
+   * authentic, so expiry only schedules a re-resolution (`revalidate`); a rotated value replaces it when that lands,
+   * and a failed one (other than the rate limit) evicts it.
    */
   cached(companyId: string, ref: SecretRef, configPath: string): { value: string; expired: boolean } | null {
     const entry = this.entries.get(this.key(companyId, ref, configPath));
     if (!entry?.value) return null;
-    return { value: entry.value, expired: this.now() - entry.fetchedAt >= SECRET_TTL_MS };
+    const age = this.now() - entry.fetchedAt;
+    if (age >= SECRET_MAX_STALE_MS) return null;
+    return { value: entry.value, expired: age >= SECRET_TTL_MS };
   }
 
   /**
@@ -113,10 +135,17 @@ export class SecretCache {
     } catch (error) {
       request = Promise.reject(error);
     }
-    const promise = request.then((value) => {
-      this.entries.set(key, { value, fetchedAt: now, attemptedAt: now, rejectedUntil: 0 });
-      return value;
-    });
+    const promise = request.then(
+      (value) => {
+        this.entries.set(key, { value, fetchedAt: now, attemptedAt: now, rejectedUntil: 0 });
+        return value;
+      },
+      (error: unknown) => {
+        // Fail closed: keep the old value only when the host merely rate-limited this resolution.
+        if (!isRateLimited(error)) this.entries.set(key, { value: null, fetchedAt: 0, attemptedAt: now, rejectedUntil: 0 });
+        throw error;
+      },
+    );
     this.inflight.set(key, promise);
     const settle = () => {
       if (this.inflight.get(key) === promise) this.inflight.delete(key);

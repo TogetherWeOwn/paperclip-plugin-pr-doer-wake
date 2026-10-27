@@ -19,6 +19,8 @@ function gate(): Gate {
   return { promise, open };
 }
 
+let resolveError: (() => Error | null) | null = null;
+
 async function boot(opts: { resolveGate?: () => Gate | null; fetchStatus?: number } = {}) {
   const harness = createTestHarness({
     manifest,
@@ -37,6 +39,8 @@ async function boot(opts: { resolveGate?: () => Gate | null; fetchStatus?: numbe
     const g = opts.resolveGate?.();
     if (g) await g.promise; // the host round trip is still in flight
     if (calls.resolves > 30) throw Object.assign(new Error("Rate limit exceeded for secret resolution"), { name: "RateLimitExceededError" });
+    const injected = resolveError?.();
+    if (injected) throw injected;
     return ref.secretId.endsWith("1") ? currentSecret : "gh-token";
   };
   ctx.db.namespace = DB_NAMESPACE;
@@ -64,7 +68,11 @@ async function deliver(event: string, payload: Record<string, unknown>, secret =
 afterEach(() => {
   vi.useRealTimers();
   currentSecret = SECRET;
+  resolveError = null;
 });
+
+// What the worker sees for a host refusal: only the message crosses the JSON-RPC bridge (JsonRpcCallError).
+const rpcError = (message: string) => Object.assign(new Error(message), { name: "JsonRpcCallError", code: -32603 });
 
 const run = (action: string, conclusion: string | null) => ({ action, check_run: { name: "build", conclusion, head_sha: "a".repeat(40), pull_requests: [] } });
 const redOnPr = (n: number) => {
@@ -200,6 +208,52 @@ describe("secret-resolution budget (host limit 30/min)", () => {
     await runSweep();
     expect(calls.fetches).toBeGreaterThan(12);
     expect(calls.resolves - before).toBe(1);
+  });
+
+  it("a deactivated webhook secret stops verifying once its re-resolution fails (fails closed)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-27T05:00:00Z"));
+    await boot();
+    await deliver("check_run", run("completed", "failure"));
+    resolveError = () => rpcError("Secret is not active"); // operator deactivated the leaked secret (secret_inactive)
+    vi.setSystemTime(new Date("2026-10-27T05:11:00Z"));
+    await deliver("check_run", run("completed", "failure")); // expired value; schedules the re-resolution
+    await new Promise((r) => setTimeout(r, 0));
+    vi.setSystemTime(new Date("2026-10-27T05:13:00Z"));
+    await expect(deliver("check_run", run("completed", "failure"))).rejects.toThrow(/signature/);
+    vi.setSystemTime(new Date("2026-10-27T06:00:00Z"));
+    await expect(deliver("check_run", run("completed", "failure"))).rejects.toThrow(/signature/);
+  });
+
+  it("an unbound or missing secret evicts the cached value too", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-27T05:00:00Z"));
+    await boot();
+    await deliver("check_run", run("completed", "failure"));
+    resolveError = () => rpcError("Secret is not bound to plugin:x at webhookSecretRef");
+    vi.setSystemTime(new Date("2026-10-27T05:11:00Z"));
+    await deliver("check_run", run("completed", "failure"));
+    await new Promise((r) => setTimeout(r, 0));
+    await expect(deliver("check_run", run("completed", "failure"))).rejects.toThrow(/signature/);
+  });
+
+  it("a rate-limited re-resolution keeps the expired value, but only up to a hard maximum age", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-27T05:00:00Z"));
+    await boot();
+    await deliver("check_run", run("completed", "failure"));
+    resolveError = () => rpcError("Rate limit exceeded for secret resolution");
+    vi.setSystemTime(new Date("2026-10-27T05:11:00Z"));
+    await deliver("check_run", run("completed", "failure"));
+    await new Promise((r) => setTimeout(r, 0));
+    vi.setSystemTime(new Date("2026-10-27T05:20:00Z"));
+    await deliver("check_run", run("completed", "failure")); // still within the hard maximum: accepted
+    await new Promise((r) => setTimeout(r, 0));
+    vi.setSystemTime(new Date("2026-10-27T05:31:00Z"));
+    await expect(deliver("check_run", run("completed", "failure"))).rejects.toThrow(/signature/);
+    resolveError = null;
+    vi.setSystemTime(new Date("2026-10-27T05:33:00Z"));
+    await deliver("check_run", run("completed", "failure")); // the host resolves again: accepted
   });
 
   it("mayAct classification", () => {
