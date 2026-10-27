@@ -1,0 +1,29 @@
+{
+  "name": "@togetherweown/paperclip-plugin-pr-doer-wake",
+  "version": "0.1.1",
+  "description": "Wakes the Paperclip card that owns a GitHub pull request exactly once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a check really fails, a merge conflict appears or it merges. Uses ctx.issues.requestWakeup, so blockers, terminal status and budgets are honoured by the host.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "repository": { "type": "git", "url": "https://github.com/TogetherWeOwn/paperclip-plugin-pr-doer-wake" },
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "migrations", "README.md"],
+  "paperclipPlugin": { "manifest": "./dist/manifest.js", "worker": "./dist/worker.js" },
+  "keywords": ["paperclip", "plugin", "github", "pull-request", "wakeup"],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": { "@paperclipai/plugin-sdk": "*" },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12",
+    "zod": "4.4.3"
+  },
+  "engines": { "node": ">=24" }
+}
