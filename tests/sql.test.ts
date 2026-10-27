@@ -18,6 +18,7 @@ import {
   releaseWakeAttemptSql,
   retryableSql,
   seenSql,
+  SETTLED_OUTCOMES,
   touchSql,
 } from "../src/sql.js";
 import {
@@ -68,7 +69,7 @@ describe("host contract", () => {
     expect(sql).toMatch(/updated_at::text as updated_at/);
   });
   it("the wake mark is the atomic gate before requestWakeup, and a release undoes only its own mark", () => {
-    expect(markWakeAttemptedSql(DB_NAMESPACE)).toMatch(/set wake_attempted_at = \$4::timestamptz, issue_id = \$3, updated_at = now\(\)\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null$/);
+    expect(markWakeAttemptedSql(DB_NAMESPACE)).toMatch(/set wake_attempted_at = \$4::timestamptz, issue_id = \$3, updated_at = now\(\)\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null and created_at = \$5::timestamptz and attempts = \$6$/);
     expect(releaseWakeAttemptSql(DB_NAMESPACE)).toMatch(/where company_id = \$1 and fingerprint = \$2 and wake_attempted_at = \$3::timestamptz$/);
   });
   it("forgetting a row never touches one whose wake may have reached the host, or one changed since this attempt's claim", () => {
@@ -80,7 +81,7 @@ describe("host contract", () => {
     expect(sql).toMatch(/where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null and outcome in \('claimed', 'retrying'\)$/);
   });
   it("the dedupe pre-check returns what a redelivery needs to resume a never-attempted row", () => {
-    expect(seenSql(DB_NAMESPACE)).toMatch(/outcome, attempts, updated_at::text as updated_at, signal::text as signal/);
+    expect(seenSql(DB_NAMESPACE)).toMatch(/outcome, attempts, created_at::text as created_at, updated_at::text as updated_at, signal::text as signal/);
     expect(seenSql(DB_NAMESPACE)).toMatch(/wake_attempted_at::text as wake_attempted_at/);
   });
   it("a retry re-claims its row with a conditional UPDATE on the selected outcome and updated_at", () => {
@@ -88,11 +89,20 @@ describe("host contract", () => {
     expect(sql).toMatch(/set outcome = 'retrying', attempts = attempts \+ 1, updated_at = \$5::timestamptz/); // the claim token
     expect(sql).toMatch(/where company_id = \$1 and fingerprint = \$2 and outcome = \$3 and updated_at::text = \$4/);
   });
-  it("retention compacts aged rows into dedupe tombstones and never deletes them", () => {
+  it("retention compacts aged settled rows into dedupe tombstones, never a pending row, and never deletes them", () => {
     const sql = compactSql(DB_NAMESPACE);
     expect(sql).not.toMatch(/delete/i);
     expect(sql).toMatch(/set signal = '\{\}'::jsonb/);
     expect(sql).toMatch(/updated_at < now\(\) - interval '30 days'/);
+    expect(sql).toMatch(/and split_part\(outcome, ':', 1\) in \('woken', 'wake_unconfirmed', 'refused', 'held_status', 'held_blockers', 'ambiguous_card', 'shadow'\)$/);
+    for (const pending of ["claimed", "retrying", "error", "no_card", "stale"]) expect(SETTLED_OUTCOMES as readonly string[]).not.toContain(pending);
+  });
+  it("every write of an attempt is fenced on its claim incarnation (created_at, attempts)", () => {
+    expect(claimSql(DB_NAMESPACE)).toMatch(/\(company_id, fingerprint, repo, pull_number, head_sha, state, signal, created_at\)\s+values \(\$1, \$2, \$3, \$4, \$5, \$6, \$7::jsonb, \$8::timestamptz\) on conflict do nothing$/);
+    expect(recordOutcomeSql(DB_NAMESPACE)).toMatch(/where company_id = \$1 and fingerprint = \$2 and created_at = \$5::timestamptz and attempts = \$6$/);
+    expect(markCommentPostedSql(DB_NAMESPACE)).toMatch(/where company_id = \$1 and fingerprint = \$2 and created_at = \$4::timestamptz and attempts = \$5$/);
+    // A signal folded into the attempt (touchSql) changes neither column, so it never stops the attempt.
+    expect(touchSql(DB_NAMESPACE)).not.toMatch(/created_at|attempts/);
   });
   it("ownership lookups do not filter on status or the card's eligibility", () => {
     expect(CARD_BY_IDENTIFIER_SQL).not.toMatch(/status not in|assignee_agent_id is not null|string_to_array/);

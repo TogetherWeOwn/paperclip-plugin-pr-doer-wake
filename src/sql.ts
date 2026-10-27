@@ -4,14 +4,30 @@
  * Core reads use only manifest coreReadTables `issues` and `issue_comments`
  * (PLUGIN_DATABASE_CORE_READ_TABLES in packages/shared/src/constants.ts:1442).
  */
+/**
+ * $8 is this attempt's claim token, written as created_at: with `attempts` it names the claim incarnation that every
+ * later write of the attempt is fenced on (CLAIM_FENCE). A row forgotten and claimed again gets a new created_at, so
+ * an attempt that stalled on the old row can never write to the new one.
+ */
 export function claimSql(ns: string): string {
-  return `insert into ${ns}.wake_ledger (company_id, fingerprint, repo, pull_number, head_sha, state, signal)
-values ($1, $2, $3, $4, $5, $6, $7::jsonb) on conflict do nothing`;
+  return `insert into ${ns}.wake_ledger (company_id, fingerprint, repo, pull_number, head_sha, state, signal, created_at)
+values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::timestamptz) on conflict do nothing`;
+}
+
+/**
+ * The claim incarnation an attempt holds: the row's created_at (set at claim) and its `attempts` (bumped by every
+ * re-claim, reclaimSql). An attempt that stalled while the sweep re-claimed its row, or forgot it and a new signal
+ * claimed it again, matches nothing and changes nothing: it can neither post a phase, record an outcome over a newer
+ * decision (a hold such as ambiguous_card), nor mark the wake. touchSql changes neither column, so a signal folded
+ * into an attempt does not stop it. Appended to every write of an attempt as the last two parameters.
+ */
+function claimFence(first: number): string {
+  return `created_at = $${first}::timestamptz and attempts = $${first + 1}`;
 }
 
 /** What a retry needs from a ledger row (sweep and redelivery alike). */
-const ROW_COLUMNS = `fingerprint, outcome, attempts, updated_at::text as updated_at, signal::text as signal, issue_id::text as issue_id,
-comment_posted_at::text as comment_posted_at, wake_attempted_at::text as wake_attempted_at`;
+const ROW_COLUMNS = `fingerprint, outcome, attempts, created_at::text as created_at, updated_at::text as updated_at, signal::text as signal,
+issue_id::text as issue_id, comment_posted_at::text as comment_posted_at, wake_attempted_at::text as wake_attempted_at`;
 
 /**
  * Pre-check before any GitHub lookup: a row that already woke (or may have) makes the signal a duplicate at no
@@ -22,10 +38,10 @@ export function seenSql(ns: string): string {
   return `select ${ROW_COLUMNS} from ${ns}.wake_ledger where company_id = $1 and fingerprint = $2`;
 }
 
-/** Outcome of the attempt that holds the row. `attempts` counts sweep retries and is bumped only by reclaimSql. */
+/** Outcome of the attempt that holds the row ($5, $6: its claim, claimFence). rowCount 0: superseded. */
 export function recordOutcomeSql(ns: string): string {
   return `update ${ns}.wake_ledger set outcome = $3, issue_id = $4, updated_at = now()
-where company_id = $1 and fingerprint = $2`;
+where company_id = $1 and fingerprint = $2 and ${claimFence(5)}`;
 }
 
 /**
@@ -50,20 +66,21 @@ export function touchSql(ns: string): string {
 where company_id = $1 and fingerprint = $2 and wake_attempted_at is null and outcome in ('claimed', 'retrying')`;
 }
 
-/** Phase marks: what a retry must not repeat (migrations/002_wake_phases.sql). */
+/** Phase marks: what a retry must not repeat (migrations/002_wake_phases.sql). $4, $5: the claim (claimFence). */
 export function markCommentPostedSql(ns: string): string {
   return `update ${ns}.wake_ledger set comment_posted_at = now(), issue_id = $3, updated_at = now()
-where company_id = $1 and fingerprint = $2`;
+where company_id = $1 and fingerprint = $2 and ${claimFence(4)}`;
 }
 
 /**
- * The atomic gate right before requestWakeup: rowCount 1 only for the first attempt that marks the row. An attempt
- * that stalled past the 10-minute stuck window while another one took its row (and woke, or forgot the row after a
- * skip) gets 0 and never requests the wake. $4 is this attempt's own mark value.
+ * The atomic gate right before requestWakeup: rowCount 1 only for the attempt that still holds the row's current
+ * claim ($5, $6, claimFence) and only if no wake was marked yet. An attempt that stalled past the 10-minute stuck
+ * window while another one took its row (and woke, held it, or forgot it after a skip) gets 0 and never requests the
+ * wake. $4 is this attempt's own mark value.
  */
 export function markWakeAttemptedSql(ns: string): string {
   return `update ${ns}.wake_ledger set wake_attempted_at = $4::timestamptz, issue_id = $3, updated_at = now()
-where company_id = $1 and fingerprint = $2 and wake_attempted_at is null`;
+where company_id = $1 and fingerprint = $2 and wake_attempted_at is null and ${claimFence(5)}`;
 }
 
 /**
@@ -82,8 +99,9 @@ where company_id = $1 and fingerprint = $2 and wake_attempted_at = $3::timestamp
  * with an exponential backoff of 2, 4, 8, 16, 32, then 60 minutes; and rows still at 'claimed' or 'retrying' after
  * 10 minutes (the worker stopped mid-attempt). There is no attempt cap: a pending row ends only when a retry decides
  * it (woken, held, or forgotten because GitHub says the PR no longer qualifies), so an outage never loses a signal.
- * The exponent is capped as well, since power(2, n) overflows float8 past n ~ 1023. Compacted tombstones
- * (compactSql) are never retried. Each row is then taken with reclaimSql.
+ * The exponent is capped as well, since power(2, n) overflows float8 past n ~ 1023. A row without a signal (a
+ * settled tombstone, or a pending row an earlier build compacted, which only a redelivery can resume) is skipped.
+ * Each row is then taken with reclaimSql.
  */
 export function retryableSql(ns: string): string {
   return `select ${ROW_COLUMNS}
@@ -106,13 +124,21 @@ where company_id = $1 and fingerprint = $2 and wake_attempted_at is null and upd
 }
 
 /**
- * Retention: after 30 days a row keeps only its dedupe key and outcome (a tombstone of a few hundred bytes); the
- * signal payload is dropped. Rows are never deleted: a still-open PR on the same head in the same state would
- * otherwise wake again (for example a later default-branch push re-sweeping a conflict).
+ * Outcomes that settle a row for good (the part before any `:`). Every other row is pending (claimed, retrying,
+ * error, no_card, an earlier build's stale:<reason>) and still needs its signal.
+ */
+export const SETTLED_OUTCOMES = ["woken", "wake_unconfirmed", "refused", "held_status", "held_blockers", "ambiguous_card", "shadow"] as const;
+
+/**
+ * Retention: 30 days after a row was settled it keeps only its dedupe key and outcome (a tombstone of a few hundred
+ * bytes); the signal payload is dropped. A pending row is never compacted, however old (for example of a company
+ * disabled for a month): its signal is what a retry wakes with. Rows are never deleted: a still-open PR on the same
+ * head in the same state would otherwise wake again (for example a later default-branch push re-sweeping a conflict).
  */
 export function compactSql(ns: string): string {
   return `update ${ns}.wake_ledger set signal = '{}'::jsonb
-where updated_at < now() - interval '30 days' and signal <> '{}'::jsonb`;
+where updated_at < now() - interval '30 days' and signal <> '{}'::jsonb
+and split_part(outcome, ':', 1) in (${SETTLED_OUTCOMES.map((o) => `'${o}'`).join(", ")})`;
 }
 
 /**

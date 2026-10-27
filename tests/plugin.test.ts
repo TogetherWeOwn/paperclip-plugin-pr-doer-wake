@@ -19,6 +19,7 @@ import {
   releaseWakeAttemptSql,
   retryableSql,
   seenSql,
+  SETTLED_OUTCOMES,
   touchSql,
 } from "../src/sql.js";
 
@@ -37,6 +38,8 @@ const organization = { login: "TogetherWeOwn" };
 type LedgerRow = {
   outcome: string; issueId: string | null; attempts: number; signal: string;
   commentPostedAt: string | null; wakeAttemptedAt: string | null; stale?: boolean; aged?: boolean; updatedAt?: string;
+  /** created_at: with attempts, the claim incarnation every write of an attempt is fenced on (sql.ts claimFence). */
+  createdAt?: string;
 };
 /** A check run as GitHub GraphQL reports it on the PR's head commit. */
 type CheckRun = { id: string; name: string; status: string; conclusion: string | null; startedAt: string | null; url?: string };
@@ -67,6 +70,7 @@ let tick: number; // monotonic stand-in for updated_at
 let onRetrySelect: (() => void) | null; // runs after the retry select returned its snapshot (another sweep racing)
 let fetchGate: Promise<void> | null; // holds every GitHub call until opened
 let onSeenSelect: (() => Promise<void>) | null; // runs once after a delivery's pre-check read its ledger row
+let githubBody: unknown; // when set, GitHub GraphQL answers exactly this body (HTTP 200)
 
 /** The doer's PR-link comment body for PR `n`. */
 const link = (n = 1903) => `PR: https://github.com/TogetherWeOwn/two-web-next/pull/${n}`;
@@ -157,7 +161,10 @@ function setup(config: Record<string, unknown> = {}) {
   onRetrySelect = null;
   fetchGate = null;
   onSeenSelect = null;
+  githubBody = undefined;
   const touch = () => `2026-10-27 05:00:00.${String(++tick).padStart(6, "0")}+00`;
+  /** claimFence: the row still carries the attempt's claim (created_at, attempts). */
+  const holds = (row: LedgerRow, createdAt: unknown, attempts: unknown) => row.createdAt === createdAt && row.attempts === attempts;
   const ctx = harness.ctx as any;
   ctx.secrets.resolve = async (ref: { secretId: string }) => (ref.secretId.endsWith("1") ? SECRET : "gh-token");
   // In-memory stand-in for the plugin namespace + the whitelisted core reads.
@@ -166,7 +173,7 @@ function setup(config: Record<string, unknown> = {}) {
     const key = `${params[0]}|${params[1]}`;
     if (sql === claimSql(DB_NAMESPACE)) {
       if (ledger.has(key)) return { rowCount: 0 };
-      ledger.set(key, { outcome: "claimed", issueId: null, attempts: 0, signal: String(params[6]), commentPostedAt: null, wakeAttemptedAt: null, updatedAt: touch() });
+      ledger.set(key, { outcome: "claimed", issueId: null, attempts: 0, signal: String(params[6]), commentPostedAt: null, wakeAttemptedAt: null, updatedAt: touch(), createdAt: String(params[7]) });
       return { rowCount: 1 };
     }
     if (sql === reclaimSql(DB_NAMESPACE)) {
@@ -186,20 +193,20 @@ function setup(config: Record<string, unknown> = {}) {
         throw Object.assign(new Error("Worker RPC host is shutting down (budget write paused)"), { code: -32000 });
       }
       const row = ledger.get(key);
-      if (!row) return { rowCount: 0 };
+      if (!row || !holds(row, params[4], params[5])) return { rowCount: 0 };
       Object.assign(row, { outcome: params[2], issueId: params[3], updatedAt: touch() });
       return { rowCount: 1 };
     }
     if (sql === markCommentPostedSql(DB_NAMESPACE)) {
       if (failNext.delete("markComment")) throw new Error("db connection reset");
       const row = ledger.get(key);
-      if (!row) return { rowCount: 0 };
+      if (!row || !holds(row, params[3], params[4])) return { rowCount: 0 };
       Object.assign(row, { commentPostedAt: new Date().toISOString(), issueId: params[2], updatedAt: touch() });
       return { rowCount: 1 };
     }
     if (sql === markWakeAttemptedSql(DB_NAMESPACE)) {
       const row = ledger.get(key);
-      if (!row || row.wakeAttemptedAt) return { rowCount: 0 }; // only the first attempt may mark
+      if (!row || row.wakeAttemptedAt || !holds(row, params[4], params[5])) return { rowCount: 0 }; // only the claim holder, only once
       Object.assign(row, { wakeAttemptedAt: String(params[3]), issueId: params[2], updatedAt: touch() });
       if (failNext.delete("markWakeLostReply")) throw new Error("db connection reset"); // committed, reply lost
       return { rowCount: 1 };
@@ -218,7 +225,9 @@ function setup(config: Record<string, unknown> = {}) {
     }
     if (sql === compactSql(DB_NAMESPACE)) {
       let n = 0;
-      for (const r of ledger.values()) if (r.aged && r.signal !== "{}") { r.signal = "{}"; n += 1; }
+      for (const r of ledger.values()) {
+        if (r.aged && r.signal !== "{}" && (SETTLED_OUTCOMES as readonly string[]).includes(r.outcome.split(":")[0]!)) { r.signal = "{}"; n += 1; }
+      }
       return { rowCount: n };
     }
     throw new Error(`unexpected execute ${sql}`);
@@ -237,7 +246,7 @@ function setup(config: Record<string, unknown> = {}) {
       const ids = [...new Set(mentions.map((m) => m.cardId))];
       return rows.filter((r) => ids.includes(r.id)).slice(0, 2).map((r) => ({ id: r.id, identifier: r.identifier, status: r.status }));
     }
-    const asRow = ([k, r]: [string, LedgerRow]) => ({ fingerprint: k.split("|")[1], outcome: r.outcome, attempts: r.attempts, updated_at: r.updatedAt, signal: r.signal, issue_id: r.issueId, comment_posted_at: r.commentPostedAt, wake_attempted_at: r.wakeAttemptedAt });
+    const asRow = ([k, r]: [string, LedgerRow]) => ({ fingerprint: k.split("|")[1], outcome: r.outcome, attempts: r.attempts, created_at: r.createdAt, updated_at: r.updatedAt, signal: r.signal, issue_id: r.issueId, comment_posted_at: r.commentPostedAt, wake_attempted_at: r.wakeAttemptedAt });
     if (sql === seenSql(DB_NAMESPACE)) {
       const key = `${params[0]}|${params[1]}`;
       const snapshot = ledger.has(key) ? [asRow([key, ledger.get(key)!])] : [];
@@ -260,6 +269,7 @@ function setup(config: Record<string, unknown> = {}) {
     graphCalls += 1;
     if (fetchGate) await fetchGate;
     if (graphFail) return new Response("bad gateway", { status: 502 });
+    if (githubBody !== undefined) return new Response(JSON.stringify(githubBody), { status: 200 });
     const variables = JSON.parse(init?.body ?? "{}").variables ?? {};
     const n = Number(variables.n ?? 1903);
     const runs = graph?.checks ?? [redRun(), redRun("FAILURE", "Paperclip Review")];
@@ -1340,6 +1350,205 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       for (let i = 0; i < 10; i += 1) await harness.runJob(SWEEP_JOB_KEY);
       graph = { mergeable: "CONFLICTING", isDraft: false };
       await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+  });
+
+  // --- review round 5 ---------------------------------------------------------------------------------------------
+
+  describe("host refusals are recognised by the host's exact pre-queue messages", () => {
+    /** What the SDK rejects with when the host handler threw (JsonRpcCallError, INTERNAL_ERROR -32603). */
+    const hostError = (message: string) => Object.assign(new Error(message), { name: "JsonRpcCallError", code: -32603 });
+    async function refuseOnce(message: string) {
+      const ctx = harness.ctx as any;
+      const original = ctx.issues.requestWakeup;
+      ctx.issues.requestWakeup = vi.fn(async () => {
+        hostWakeCalls += 1;
+        ctx.issues.requestWakeup = original;
+        throw hostError(message);
+      });
+    }
+    const unconfirmedLogs = () => harness.logs.filter((l) => l.message === "pr-doer-wake: wake_unconfirmed (request sent, result unknown; not repeated)");
+
+    for (const message of [
+      "Agent is not invokable in its current state", // paused, terminated or pending agent (agent-invokability.ts)
+      "Agent is not invokable because its reporting chain is invalid",
+      "Agent no longer exists",
+      "Agent not found",
+      "Issue has no assigned agent to wake",
+      "Issue is not wakeable in status: done",
+      "Issue is blocked by unresolved blockers",
+      "Agent cannot start work because recorded usage has no reliable price.",
+      "Project cannot start work because its budget hard-stop is still exceeded.",
+      "Company is paused because its budget hard-stop was reached.",
+      "Project is paused and cannot start new work.",
+      "Budget pause requires a policy or an explicit operator resume.",
+    ]) {
+      it(`"${message}" is a refusal, never a wake_unconfirmed`, async () => {
+        await refuseOnce(message);
+        await deliver("check_run", ciFailed("build"));
+        expect(row()!.outcome).toBe(`refused:${message}`.slice(0, 129));
+        expect(unconfirmedLogs()).toHaveLength(0);
+        await harness.runJob(SWEEP_JOB_KEY);
+        expect(hostWakeCalls).toBe(1); // a refusal is a decision: not retried
+      });
+    }
+
+    for (const message of [
+      "Company cannot start work while completed runs await accounting.",
+      "Agent cannot start work while completed runs await accounting.",
+      "New work must wait while a native run recovers its unfinished accounting.",
+    ]) {
+      it(`"${message}" (temporary, nothing queued) releases the mark and the sweep wakes once`, async () => {
+        await refuseOnce(message);
+        await deliver("check_run", ciFailed("build"));
+        expect(row()!).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+        expect(unconfirmedLogs()).toHaveLength(0);
+        await harness.runJob(SWEEP_JOB_KEY);
+        expect(wakes).toHaveLength(1);
+        expect(row()!.outcome).toMatch(/^woken:/);
+        await harness.runJob(SWEEP_JOB_KEY);
+        expect(hostWakeCalls).toBe(2);
+      });
+    }
+
+    it("a message that merely mentions budget or paused is not a refusal (no substring guessing)", async () => {
+      await refuseOnce("worker RPC timeout while the budget write was paused");
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!.outcome).toBe("wake_unconfirmed");
+      expect(unconfirmedLogs()).toHaveLength(1);
+    });
+  });
+
+  describe("GitHub NOT_FOUND means the repository or PR is gone (missing is closed)", () => {
+    const repoGone = {
+      data: { repository: null },
+      errors: [{ type: "NOT_FOUND", path: ["repository"], locations: [{ line: 1, column: 63 }], message: "Could not resolve to a Repository with the name 'TogetherWeOwn/two-web-next'." }],
+    };
+    const prGone = {
+      data: { repository: { pullRequest: null } },
+      errors: [{ type: "NOT_FOUND", path: ["repository", "pullRequest"], locations: [{ line: 2, column: 1 }], message: "Could not resolve to a PullRequest with the number of 1903." }],
+    };
+
+    for (const [label, body] of [["repository", repoGone], ["pull request", prGone]] as const) {
+      it(`a pending row whose ${label} no longer exists is forgotten, not re-read forever`, async () => {
+        graphFail = true;
+        await deliver("check_run", ciFailed("build"));
+        expect(row()!.outcome).toBe("error");
+        graphFail = false;
+        githubBody = body;
+        await harness.runJob(SWEEP_JOB_KEY);
+        expect(ledger.size).toBe(0);
+        const calls = graphCalls;
+        await harness.runJob(SWEEP_JOB_KEY);
+        expect(graphCalls).toBe(calls);
+        expect(wakes).toEqual([]);
+      });
+
+      it(`a delivery for a ${label} GitHub cannot find writes no row and wakes nobody`, async () => {
+        githubBody = body;
+        await deliver("check_run", ciFailed("build"));
+        expect(ledger.size).toBe(0);
+        expect(wakes).toEqual([]);
+      });
+    }
+
+    it("a conflict sweep mark for a deleted repository is dropped after one read", async () => {
+      await deliver("push", { ref: "refs/heads/main" });
+      githubBody = repoGone;
+      await harness.runJob(SWEEP_JOB_KEY);
+      const calls = graphCalls;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(graphCalls).toBe(calls);
+      expect(harness.logs.filter((l) => l.message === "pr-doer-wake: conflict sweep failed")).toHaveLength(0);
+    });
+
+    it("any other GraphQL error stays transient: the signal is kept", async () => {
+      githubBody = { data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded for installation." }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!.outcome).toBe("error");
+      githubBody = { data: { repository: null }, errors: [{ type: "NOT_FOUND", path: ["viewer"], message: "x" }, { type: "INTERNAL", path: ["repository"], message: "y" }] };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(row()!.outcome).toBe("error");
+      githubBody = undefined;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+  });
+
+  describe("a superseded attempt never overrides the attempt that took its row", () => {
+    /** Deliver a red check and stall its attempt inside createComment; returns the delivery and the resume handle. */
+    async function stallInComment(): Promise<{ delivery: Promise<void>; resume: () => void }> {
+      const ctx = harness.ctx as any;
+      const realComment = ctx.issues.createComment;
+      let resume!: () => void;
+      const gate = new Promise<void>((r) => { resume = r; });
+      let entered!: () => void;
+      const inside = new Promise<void>((r) => { entered = r; });
+      ctx.issues.createComment = async (...args: unknown[]) => {
+        ctx.issues.createComment = realComment;
+        entered();
+        await gate;
+        return realComment(...args);
+      };
+      const delivery = deliver("check_run", ciFailed("build"));
+      await inside;
+      row()!.stale = true; // ten minutes later the sweep may take the stuck claim
+      return { delivery, resume };
+    }
+
+    it("a stalled attempt resumed after the sweep held the row as ambiguous_card never wakes", async () => {
+      const { delivery, resume } = await stallInComment();
+      laterMentions.push({ body: link(1903), cardId: OTHER, author: DOER }); // ownership becomes ambiguous
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(row()!.outcome).toMatch(/^ambiguous_card/);
+      resume();
+      await delivery;
+      expect(hostWakeCalls).toBe(0);
+      expect(row()!).toMatchObject({ wakeAttemptedAt: null, commentPostedAt: null });
+      expect(row()!.outcome).toMatch(/^ambiguous_card/);
+    });
+
+    it("a stalled attempt never acts on a newer row for the same fingerprint (forgotten, then claimed again)", async () => {
+      const { delivery, resume } = await stallInComment();
+      graph = { mergeable: "MERGEABLE", isDraft: true };
+      await harness.runJob(SWEEP_JOB_KEY); // the sweep finds a draft and forgets the never-woken row
+      expect(row()).toBeUndefined();
+      graph = { mergeable: "MERGEABLE", isDraft: false };
+      laterMentions.push({ body: link(1903), cardId: OTHER, author: DOER });
+      await deliver("check_run", ciFailed("build")); // a new attempt claims the fingerprint and holds it
+      expect(row()!.outcome).toMatch(/^ambiguous_card/);
+      resume();
+      await delivery;
+      expect(hostWakeCalls).toBe(0);
+      expect(row()!.outcome).toMatch(/^ambiguous_card/);
+    });
+  });
+
+  describe("retention never compacts a pending row", () => {
+    for (const via of ["the sweep", "a redelivery"] as const) {
+      it(`a pending row of a company disabled for 30 days still wakes once via ${via} after re-enabling`, async () => {
+        graphFail = true;
+        await deliver("check_run", ciFailed("build"));
+        expect(row()!.outcome).toBe("error");
+        harness.setConfig({ ...baseConfig, enabled: false });
+        for (const r of ledger.values()) r.aged = true;
+        await harness.runJob(SWEEP_JOB_KEY); // compaction runs for every company
+        expect(row()!.signal).not.toBe("{}");
+        harness.setConfig(baseConfig);
+        graphFail = false;
+        if (via === "the sweep") await harness.runJob(SWEEP_JOB_KEY);
+        else await deliver("check_run", ciFailed("build"));
+        expect(wakes).toHaveLength(1);
+      });
+    }
+
+    it("a pending row an earlier build compacted is resumed by a genuine redelivery", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      graphFail = false;
+      row()!.signal = "{}";
+      await deliver("check_run", ciFailed("build"));
       expect(wakes).toHaveLength(1);
     });
   });

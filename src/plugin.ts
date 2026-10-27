@@ -1,4 +1,3 @@
-import { randomInt } from "node:crypto";
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { parseConfig, validateConfig, type DoerWakeConfig, type SecretRef } from "./config.js";
 import { DB_NAMESPACE, SWEEP_JOB_KEY, WEBHOOK_KEY } from "./constants.js";
@@ -22,7 +21,7 @@ import {
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
 import { compactSql, reclaimSql, retryableSql, seenSql, touchSql } from "./sql.js";
-import { CLAIM_TAKEN, deferSignal, forget, markUnconfirmed, recordOutcome, wakeForSignal, type Outcome, type WakeResult } from "./waker.js";
+import { CLAIM_TAKEN, claimToken, deferSignal, forget, markUnconfirmed, recordOutcome, SUPERSEDED, wakeForSignal, type Claim, type Outcome, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
 let lock: Promise<unknown> = Promise.resolve();
@@ -97,6 +96,16 @@ export const TOKEN_PERMISSIONS =
 
 type GraphqlError = { type?: string; message?: string; path?: unknown[] };
 
+/**
+ * GitHub's answer for a repository or PR that does not exist (deleted, transferred, or invisible to the token):
+ * `data.repository: null` or `pullRequest: null` beside a NOT_FOUND error on exactly that path. That is data, not a
+ * failure: the caller's null branch closes it (missing is closed), instead of re-reading it forever.
+ */
+function isMissing(e: GraphqlError): boolean {
+  const path = Array.isArray(e?.path) ? e.path.join(".") : "";
+  return e?.type === "NOT_FOUND" && (path === "repository" || path === "repository.pullRequest");
+}
+
 async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: DoerWakeConfig, query: string, variables: Record<string, unknown>): Promise<T | null> {
   if (!config.githubTokenSecretRef) throw new Error("githubTokenSecretRef is not configured");
   const token = await secrets.get(ctx, companyId, config.githubTokenSecretRef, "githubTokenSecretRef");
@@ -122,6 +131,13 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
       });
       throw new Error(`GitHub token lacks a permission for ${paths.join(", ")}`);
     }
+    const errors = Array.isArray(body.errors) ? body.errors : [];
+    if (errors.length > 0 && errors.every(isMissing)) {
+      ctx.logger.warn("pr-doer-wake: GitHub says the repository or pull request does not exist (or the token cannot see it); treated as closed", {
+        companyId, repo: `${variables.o}/${variables.r}`, number: variables.n ?? null,
+      });
+      return body.data ?? null;
+    }
     throw new Error("GitHub GraphQL returned errors");
   }
   return body.data ?? null;
@@ -146,7 +162,7 @@ async function currentPrState(ctx: PluginContext, companyId: string, config: Doe
   } catch (error) {
     return { kind: "transient", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
   }
-  if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "PR not found" };
+  if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "repository or PR not found" };
   return evaluate(prStateFromGraph(signal.repo, pr, config), signal, config);
 }
 
@@ -154,6 +170,7 @@ type LedgerRow = {
   fingerprint: string;
   outcome: string;
   attempts: number;
+  created_at: string;
   updated_at: string;
   signal: string;
   issue_id: string | null;
@@ -162,17 +179,13 @@ type LedgerRow = {
 };
 
 /**
- * A row whose wake was never requested and that no attempt holds right now: a signal may resume it at once.
- * `stale:<reason>` rows were written by builds before 0.1.2 final for skips that did not burn anything.
+ * A row whose wake was never requested and that no attempt holds right now: a signal may resume it at once, with its
+ * own payload (so even a pending row an earlier build compacted to `{}` resumes). `stale:<reason>` rows were written
+ * by builds before 0.1.2 final for skips that did not burn anything.
  */
 function resumable(row: LedgerRow): boolean {
   const pending = row.outcome === "error" || row.outcome === "no_card" || row.outcome.startsWith("stale:");
-  return pending && !row.wake_attempted_at && row.signal !== "{}";
-}
-
-/** This attempt's claim token: written as the row's updated_at by reclaimSql, checked by forgetSql (microseconds). */
-function claimToken(): string {
-  return new Date().toISOString().replace("Z", `${String(randomInt(1000)).padStart(3, "0")}Z`);
+  return pending && !row.wake_attempted_at;
 }
 
 /**
@@ -186,12 +199,14 @@ function claimToken(): string {
 async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeConfig, row: LedgerRow, fresh?: Signal): Promise<WakeResult> {
   const ns = ctx.db.namespace || DB_NAMESPACE;
   const fp = row.fingerprint;
+  // This attempt's tokens: updated_at for forgetSql (any later change voids it), and the claim every write is fenced on.
   const token = claimToken();
-  const claimed = await ctx.db.execute(reclaimSql(ns), [companyId, fp, row.outcome, row.updated_at, token]);
-  if (claimed.rowCount !== 1) return { fingerprint: fp, outcome: "duplicate", detail: CLAIM_TAKEN };
+  const reclaimed = await ctx.db.execute(reclaimSql(ns), [companyId, fp, row.outcome, row.updated_at, token]);
+  if (reclaimed.rowCount !== 1) return { fingerprint: fp, outcome: "duplicate", detail: CLAIM_TAKEN };
+  const claim: Claim = { createdAt: row.created_at, attempts: row.attempts + 1 };
   if (row.wake_attempted_at) {
     // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
-    return markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake");
+    return markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake", claim);
   }
   const signal = fresh ?? (JSON.parse(row.signal) as Signal);
   let skipped: { outcome: Outcome; detail?: string } | null = null;
@@ -201,12 +216,12 @@ async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeC
   } else {
     const check = await currentPrState(ctx, companyId, config, signal);
     if (check.kind === "transient") {
-      await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
+      if (!(await recordOutcome(ctx, companyId, fp, "error", row.issue_id, claim))) return { fingerprint: fp, outcome: "duplicate", detail: SUPERSEDED };
       return { fingerprint: fp, outcome: "deferred", detail: check.detail };
     }
     if (check.kind === "ok") {
       return wakeForSignal(ctx, companyId, config, check.signal, {
-        retry: { issueId: row.issue_id, commentPostedAt: row.comment_posted_at, wakeAttemptedAt: row.wake_attempted_at },
+        retry: { claim, issueId: row.issue_id, commentPostedAt: row.comment_posted_at, wakeAttemptedAt: row.wake_attempted_at },
       });
     }
     skipped = { outcome: check.outcome, detail: check.detail };
@@ -215,7 +230,7 @@ async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeC
   // was folded into the row while this attempt held it (touchSql): this snapshot may predate that signal's evidence,
   // so the row stays pending and the sweep re-reads GitHub.
   if (await forget(ctx, companyId, fp, token)) return { fingerprint: fp, ...skipped };
-  await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
+  if (!(await recordOutcome(ctx, companyId, fp, "error", row.issue_id, claim))) return { fingerprint: fp, outcome: "duplicate", detail: SUPERSEDED };
   return { fingerprint: fp, outcome: "deferred", detail: `${skipped.outcome} on a read older than a newer signal; the sweep re-reads it` };
 }
 
