@@ -142,8 +142,19 @@ export function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
-/** `github.com/org/repo/pull/12` matched case-insensitively, never `/pull/123`. */
+/**
+ * Characters that may sit inside a URL right before `https://`: if one precedes it, the GitHub URL is embedded in
+ * another URL (`https://evil.io/?u=https://github.com/...`) or glued to a word (`xhttps://`). Whitespace, line start
+ * and markdown or angle-bracket delimiters (`(`, `[`, `<`, `*`) are boundaries. Valid in JS and Postgres ARE alike.
+ */
+const URL_PRECEDING_CHARS = "A-Za-z0-9/._~%+=?&#@:-";
+
+/**
+ * The PR URL as ownership evidence: an actual `https://github.com/<org>/<repo>/pull/<n>` link, case-insensitive,
+ * that starts at a boundary (never inside another URL or on another host such as `notgithub.com`) and ends at a
+ * non-digit (never `/pull/<n>3`). The LIKE pattern pins scheme and host; the regex adds both boundaries.
+ */
 export function prUrlPatterns(repo: string, number: number): { like: string; regex: string } {
-  const tail = `github.com/${repo}/pull/${number}`;
-  return { like: `%${escapeLike(tail)}%`, regex: `${escapeRegex(tail)}([^0-9]|$)` };
+  const url = `https://github.com/${repo}/pull/${number}`;
+  return { like: `%${escapeLike(url)}%`, regex: `(^|[^${URL_PRECEDING_CHARS}])${escapeRegex(url)}([^0-9]|$)` };
 }

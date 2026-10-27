@@ -52,8 +52,8 @@ const redRun = (conclusion = "FAILURE", name = "build"): CheckRun => ({ id: RUN_
 
 let harness: TestHarness;
 let ledger: Map<string, LedgerRow>;
-let commentCards: Map<string, string>; // PR regex -> card whose assignee (DOER) posted the PR link first
-let laterMentions: Array<{ pattern: string; cardId: string; author: string }>; // later PR-link comments, oldest first
+let commentCards: Map<string, string>; // PR-link comment body -> card on which the DOER posted it (the first mention)
+let laterMentions: Array<{ body: string; cardId: string; author: string }>; // later comments, oldest first
 let wakes: string[];
 let comments: Array<{ issueId: string; body: string }>;
 let graph: Graph | null;
@@ -65,6 +65,22 @@ let baseConfig: Record<string, unknown>;
 let tick: number; // monotonic stand-in for updated_at
 let onRetrySelect: (() => void) | null; // runs after the retry select returned its snapshot (another sweep racing)
 let fetchGate: Promise<void> | null; // holds every GitHub call until opened
+
+/** The doer's PR-link comment body for PR `n`. */
+const link = (n = 1903) => `PR: https://github.com/TogetherWeOwn/two-web-next/pull/${n}`;
+
+/** Postgres ILIKE with the default escape character (backslash), for the mocked core reads. */
+function ilike(value: string, pattern: string): boolean {
+  let re = "";
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i]!;
+    if (ch === "\\") re += pattern[++i]!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    else if (ch === "%") re += "[\\s\\S]*";
+    else if (ch === "_") re += "[\\s\\S]";
+    else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${re}$`, "i").test(value);
+}
 
 function issue(id: string, identifier: string, status: string, extra: Record<string, unknown> = {}) {
   return { id, companyId: CID, identifier, title: identifier, status, assigneeAgentId: DOER, ...extra } as any;
@@ -126,7 +142,7 @@ function setup(config: Record<string, unknown> = {}) {
     issues: [issue(CARD, "TOG-43084", "in_review"), issue(BLOCKER, "TOG-1", "in_progress"), issue(OTHER, "TOG-777", "in_progress")],
   });
   ledger = new Map();
-  commentCards = new Map([["github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", CARD]]);
+  commentCards = new Map([[link(1903), CARD]]);
   laterMentions = [];
   wakes = [];
   comments = [];
@@ -206,9 +222,9 @@ function setup(config: Record<string, unknown> = {}) {
     // distinct cards with a PR-link comment by any non-excluded agent (CARD_BY_COMMENT_SQL); two means ambiguous.
     if (sql === CARD_BY_IDENTIFIER_SQL) return rows.filter((r) => r.identifier === params[1]).map((r) => ({ ...r, assignee_agent_id: r.assigneeAgentId }));
     if (sql === CARD_BY_COMMENT_SQL) {
-      const first = commentCards.get(String(params[2]));
-      const mentions = [...(first ? [{ pattern: String(params[2]), cardId: first, author: DOER }] : []), ...laterMentions]
-        .filter((m) => m.pattern === String(params[2]) && !exclude.includes(m.author));
+      // The statement's own predicates: c.body ilike $2 and c.body ~* $3.
+      const mentions = [...[...commentCards].map(([body, cardId]) => ({ body, cardId, author: DOER })), ...laterMentions]
+        .filter((m) => ilike(m.body, String(params[1])) && new RegExp(String(params[2]), "i").test(m.body) && !exclude.includes(m.author));
       const ids = [...new Set(mentions.map((m) => m.cardId))];
       return rows.filter((r) => ids.includes(r.id)).slice(0, 2).map((r) => ({ id: r.id, identifier: r.identifier, status: r.status }));
     }
@@ -290,7 +306,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   });
 
   it("a retry is never credited with another fingerprint's wake on the same card", async () => {
-    commentCards.set("github\\.com/togetherweown/two-web-next/pull/1904([^0-9]|$)", CARD);
+    commentCards.set(link(1904), CARD);
     const ctx = harness.ctx as any;
     const original = ctx.issues.requestWakeup;
     ctx.issues.requestWakeup = vi.fn(async () => { throw new Error("worker RPC timeout"); });
@@ -322,7 +338,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     commentCards.clear();
     await deliver("check_run", ciFailed("build"));
     expect(row()!.outcome).toBe("no_card");
-    commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", CARD); // the doer posts the PR URL
+    commentCards.set(link(1903), CARD); // the doer posts the PR URL
     await deliver("check_run", ciFailed("build")); // redelivery: already claimed
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
@@ -330,7 +346,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   });
 
   it("holds the wake when the branch and the PR-link comment name different cards", async () => {
-    commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", OTHER);
+    commentCards.set(link(1903), OTHER);
     graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
     await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
     expect(wakes).toEqual([]);
@@ -469,7 +485,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     for (const status of ["done", "blocked", "backlog"]) {
       await setup();
       harness.seed({ issues: [issue(CARD, "TOG-43084", status)] });
-      commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", CARD);
+      commentCards.set(link(1903), CARD);
       await deliver("pull_request", prEvent());
       await deliver("check_run", reviewFailed());
       expect(wakes).toEqual([]);
@@ -854,7 +870,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   describe("ownership is resolved before eligibility", () => {
     it("a branch naming a done card never hands the wake to an unrelated live card that mentioned the PR", async () => {
       harness.seed({ issues: [issue(CARD, "TOG-43084", "done")] });
-      commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", OTHER);
+      commentCards.set(link(1903), OTHER);
       graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
       await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
       expect(wakes).toEqual([]);
@@ -873,7 +889,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
 
     it("a branch naming a card now assigned to an excluded reviewer never wakes another card", async () => {
       harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review", { assigneeAgentId: REVIEWER })] });
-      commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", OTHER);
+      commentCards.set(link(1903), OTHER);
       graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
       await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
       expect(wakes).toEqual([]);
@@ -1132,7 +1148,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
 
     it("PR-link comments by an excluded agent never establish ownership", async () => {
       commentCards.clear();
-      laterMentions.push({ pattern: "github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", cardId: OTHER, author: REVIEWER });
+      laterMentions.push({ body: link(1903), cardId: OTHER, author: REVIEWER });
       await deliver("check_run", reviewFailed());
       expect(wakes).toEqual([]);
       expect(row(1903, "review_findings")!.outcome).toBe("no_card");
@@ -1170,11 +1186,20 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(hostWakeCalls).toBe(1);
   });
 
+  it("a comment linking the same path on another host never makes an unrelated card the owner", async () => {
+    commentCards.clear();
+    laterMentions.push({ body: "see https://notgithub.com/togetherweown/two-web-next/pull/1903", cardId: OTHER, author: DOER });
+    await deliver("check_run", ciFailed("build")); // branch feat/quality names no card
+    expect(wakes).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(row()!.outcome).toBe("no_card");
+  });
+
   describe("ownership is ambiguous when PR-link comments name several cards", () => {
-    const PR = "github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)";
+    const PR = link(1903);
     it("an unrelated card that linked the PR first never gets the wake: held as ambiguous_card", async () => {
       commentCards.set(PR, OTHER); // card A mentioned the PR first
-      laterMentions.push({ pattern: PR, cardId: CARD, author: DOER }); // the real owner B links it afterwards
+      laterMentions.push({ body: PR, cardId: CARD, author: DOER }); // the real owner B links it afterwards
       await deliver("check_run", reviewFailed()); // branch feat/quality names no card
       expect(wakes).toEqual([]);
       expect(comments).toEqual([]);
@@ -1184,7 +1209,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     });
 
     it("comments on a second card make even a branch-named owner ambiguous", async () => {
-      laterMentions.push({ pattern: PR, cardId: OTHER, author: DOER });
+      laterMentions.push({ body: PR, cardId: OTHER, author: DOER });
       graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
       await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
       expect(wakes).toEqual([]);

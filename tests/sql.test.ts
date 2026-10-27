@@ -128,4 +128,27 @@ describe("prUrlPatterns", () => {
     expect(re.test("https://github.com/TogetherWeOwn/two-web-next/pull/1081")).toBe(false);
     expect(re.test("https://github.com/TogetherWeOwn/two-webXnext/pull/108")).toBe(false);
   });
+
+  // Both predicates of CARD_BY_COMMENT_SQL (c.body ilike $2 and c.body ~* $3) together, as Postgres applies them.
+  const owns = (body: string) => {
+    const { like, regex } = prUrlPatterns("togetherweown/two-web-next", 1903);
+    const likeRe = new RegExp(`^${like.split("%").map((part) => part.replace(/\\(.)/g, "$1").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s\\S]*")}$`, "i");
+    return likeRe.test(body) && new RegExp(regex, "i").test(body);
+  };
+  it("requires a real https://github.com URL: another host or an embedded URL is never ownership evidence", () => {
+    expect(owns("PR: https://github.com/TogetherWeOwn/two-web-next/pull/1903")).toBe(true);
+    expect(owns("https://github.com/TogetherWeOwn/two-web-next/pull/1903/files")).toBe(true);
+    expect(owns("[#1903](https://github.com/TogetherWeOwn/two-web-next/pull/1903)")).toBe(true);
+    expect(owns("<https://github.com/TogetherWeOwn/two-web-next/pull/1903>")).toBe(true);
+    expect(owns("PR:\nhttps://github.com/TogetherWeOwn/two-web-next/pull/1903.")).toBe(true);
+    expect(owns("https://notgithub.com/togetherweown/two-web-next/pull/1903")).toBe(false);
+    expect(owns("https://evil.github.com/togetherweown/two-web-next/pull/1903")).toBe(false);
+    expect(owns("https://github.com.evil.io/togetherweown/two-web-next/pull/1903")).toBe(false);
+    expect(owns("https://evil.io/https://github.com/togetherweown/two-web-next/pull/1903")).toBe(false);
+    expect(owns("https://evil.io/?u=https://github.com/togetherweown/two-web-next/pull/1903")).toBe(false);
+    expect(owns("xhttps://github.com/togetherweown/two-web-next/pull/1903")).toBe(false);
+    expect(owns("github.com/togetherweown/two-web-next/pull/1903")).toBe(false); // no scheme: not a URL
+    expect(owns("https://github.com/togetherweown/two-web-next/pull/19034")).toBe(false);
+    expect(owns("https://github.com/xtogetherweown/two-web-next/pull/1903")).toBe(false);
+  });
 });
