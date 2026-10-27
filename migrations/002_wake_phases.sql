@@ -1,0 +1,2 @@
+ALTER TABLE plugin_pr_doer_wake_2a97cdbae1.wake_ledger ADD COLUMN comment_posted_at timestamptz;
+ALTER TABLE plugin_pr_doer_wake_2a97cdbae1.wake_ledger ADD COLUMN wake_attempted_at timestamptz;

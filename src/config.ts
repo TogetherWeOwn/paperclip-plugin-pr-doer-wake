@@ -29,6 +29,17 @@ export interface DoerWakeConfig {
   postEvidenceComment: boolean;
   /** Head-branch prefix that names the owning card, e.g. `TOG-123-slug`. */
   branchIdentifierPattern: string;
+  /**
+   * Extra PR author logins trusted besides OWNER/MEMBER/COLLABORATOR (for example the agents' GitHub App bot).
+   * Stored normalized: lowercase, without a trailing `[bot]`.
+   */
+  trustedAuthors: string[];
+  /** GraphQL pages (50 PRs each) the conflict sweep reads per repo per tick; it resumes from the cursor next tick. */
+  sweepMaxPages: number;
+}
+
+export function normalizeLogin(login: string): string {
+  return login.toLowerCase().replace(/\[bot\]$/, "");
 }
 
 export const DEFAULT_CONFIG: DoerWakeConfig = {
@@ -46,6 +57,8 @@ export const DEFAULT_CONFIG: DoerWakeConfig = {
   skipBlockedStatus: true,
   postEvidenceComment: true,
   branchIdentifierPattern: "^([A-Z][A-Z0-9]*-[0-9]+)-",
+  trustedAuthors: [],
+  sweepMaxPages: 4,
 };
 
 function asSecretRef(value: unknown): SecretRef | null {
@@ -87,6 +100,11 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Do
       typeof value.branchIdentifierPattern === "string" && value.branchIdentifierPattern
         ? value.branchIdentifierPattern
         : DEFAULT_CONFIG.branchIdentifierPattern,
+    trustedAuthors: stringList(value.trustedAuthors).map(normalizeLogin),
+    sweepMaxPages:
+      typeof value.sweepMaxPages === "number" && Number.isInteger(value.sweepMaxPages)
+        ? Math.min(20, Math.max(1, value.sweepMaxPages))
+        : DEFAULT_CONFIG.sweepMaxPages,
   };
 }
 

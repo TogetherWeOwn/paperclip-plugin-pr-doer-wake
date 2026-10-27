@@ -37,14 +37,15 @@ const manifest: PaperclipPluginManifestV1 = {
   database: {
     namespaceSlug: NAMESPACE_SLUG,
     migrationsDir: "migrations",
-    coreReadTables: ["issues", "issue_comments"],
+    // heartbeat_runs: a retry checks whether the earlier, ambiguous requestWakeup already created a run.
+    coreReadTables: ["issues", "issue_comments", "heartbeat_runs"],
   },
   webhooks: [
     {
       endpointKey: WEBHOOK_KEY,
       displayName: "GitHub organization webhook",
       description:
-        "GitHub org webhook (content type application/json) for pull_request, check_run, status and push events, signed with the configured webhook secret.",
+        "GitHub org webhook (content type application/json), events pull_request, check_run and push only, signed with the configured webhook secret. The host stores every delivery, so subscribe to nothing else.",
     },
   ],
   jobs: [
@@ -52,7 +53,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SWEEP_JOB_KEY,
       displayName: "Conflict sweep and wake retries",
       description:
-        "For repos whose default branch moved, reads open PR mergeability (one GraphQL page per repo) and wakes owners of newly conflicting non-draft PRs; retries wakes that failed transiently; prunes the ledger after 30 days.",
+        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR and finishes wakes that failed or stalled; prunes the ledger after 30 days.",
       schedule: "*/5 * * * *",
     },
   ],
@@ -78,6 +79,13 @@ const manifest: PaperclipPluginManifestV1 = {
       skipBlockedStatus: { type: "boolean", default: true },
       postEvidenceComment: { type: "boolean", default: true },
       branchIdentifierPattern: { type: "string", default: "^([A-Z][A-Z0-9]*-[0-9]+)-" },
+      trustedAuthors: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description: "PR author logins trusted besides OWNER/MEMBER/COLLABORATOR, e.g. the agents' GitHub App bot. Fork PRs are never trusted.",
+      },
+      sweepMaxPages: { type: "integer", minimum: 1, maximum: 20, default: 4, description: "Open-PR pages (50 each) the conflict sweep reads per repo per tick." },
     },
   },
 };

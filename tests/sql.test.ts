@@ -6,7 +6,11 @@ import { DB_NAMESPACE, NAMESPACE_SLUG, PLUGIN_ID } from "../src/constants.js";
 import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
+  COMMENT_EXISTS_SQL,
+  RUN_SINCE_SQL,
   claimSql,
+  markCommentPostedSql,
+  markWakeAttemptedSql,
   prUrlPatterns,
   pruneSql,
   recordOutcomeSql,
@@ -31,20 +35,31 @@ describe("host contract", () => {
   it("namespace constant equals the host derivation", () => {
     expect(derivePluginDatabaseNamespace(PLUGIN_ID, NAMESPACE_SLUG)).toBe(DB_NAMESPACE);
   });
-  it("migration passes the host migration validator", () => {
-    const sql = readFileSync(new URL("../migrations/001_wake_ledger.sql", import.meta.url), "utf8");
-    const statements = splitSqlStatements(sql);
-    expect(statements.length).toBe(2);
-    for (const s of statements) expect(() => validatePluginMigrationStatement(s, DB_NAMESPACE, core)).not.toThrow();
+  it("migrations pass the host migration validator", () => {
+    for (const [file, count] of [["001_wake_ledger.sql", 2], ["002_wake_phases.sql", 2]] as const) {
+      const sql = readFileSync(new URL(`../migrations/${file}`, import.meta.url), "utf8");
+      const statements = splitSqlStatements(sql);
+      expect(statements.length).toBe(count);
+      for (const s of statements) expect(() => validatePluginMigrationStatement(s, DB_NAMESPACE, core)).not.toThrow();
+    }
   });
-  it("runtime queries pass validatePluginRuntimeQuery with only issues + issue_comments", () => {
-    for (const q of [CARD_BY_IDENTIFIER_SQL, CARD_BY_COMMENT_SQL, retryableSql(DB_NAMESPACE)]) {
+  it("reads only issues, issue_comments and heartbeat_runs from core", () => {
+    expect([...core].sort()).toEqual(["heartbeat_runs", "issue_comments", "issues"]);
+  });
+  it("runtime queries pass validatePluginRuntimeQuery with the declared core tables only", () => {
+    for (const q of [CARD_BY_IDENTIFIER_SQL, CARD_BY_COMMENT_SQL, COMMENT_EXISTS_SQL, RUN_SINCE_SQL, retryableSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeQuery(q, DB_NAMESPACE, core)).not.toThrow();
     }
     expect(() => validatePluginRuntimeQuery(CARD_BY_COMMENT_SQL, DB_NAMESPACE, ["issues"])).toThrow(/issue_comments/);
+    expect(() => validatePluginRuntimeQuery(RUN_SINCE_SQL, DB_NAMESPACE, ["issues", "issue_comments"])).toThrow(/heartbeat_runs/);
+  });
+  it("retries both failed rows and rows stuck at claimed", () => {
+    const sql = retryableSql(DB_NAMESPACE);
+    expect(sql).toMatch(/outcome = 'error'/);
+    expect(sql).toMatch(/outcome = 'claimed' and updated_at < now\(\) - interval '10 minutes'/);
   });
   it("runtime writes pass validatePluginRuntimeExecute", () => {
-    for (const q of [claimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), pruneSql(DB_NAMESPACE)]) {
+    for (const q of [claimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), pruneSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeExecute(q, DB_NAMESPACE)).not.toThrow();
     }
   });

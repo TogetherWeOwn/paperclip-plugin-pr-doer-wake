@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "togetherweown.pr-doer-wake";
-export const PLUGIN_VERSION = "0.1.1";
+export const PLUGIN_VERSION = "0.1.2";
 export const NAMESPACE_SLUG = "pr_doer_wake";
 /** derivePluginDatabaseNamespace(PLUGIN_ID, NAMESPACE_SLUG) in /app/server/src/services/plugin-database.ts:31. */
 export const DB_NAMESPACE = "plugin_pr_doer_wake_2a97cdbae1";

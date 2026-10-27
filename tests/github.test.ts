@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../src/config.js";
-import { fingerprint, parseEvent, reviewScore, verifySignature } from "../src/github.js";
+import { evaluate, fingerprint, indexFromGraph, isTrustedAuthor, mayAct, parseEvent, reviewScore, verifySignature } from "../src/github.js";
 
 const repository = { full_name: "TogetherWeOwn/two-web-next", default_branch: "main", owner: { login: "TogetherWeOwn" } };
 const config = parseConfig({ enabled: true, githubOrg: "TogetherWeOwn", webhookSecretRef: { type: "secret_ref", secretId: "x" } });
@@ -79,9 +79,10 @@ describe("CI checks", () => {
     const stopped = parseConfig({ ...config, stoppedRepos: ["togetherweown/two-web-next"] });
     expect(parseEvent("check_run", checkRun("build", "failure"), stopped).signals).toEqual([]);
   });
-  it("records failed commit statuses for head matching", () => {
-    const parsed = parseEvent("status", { repository, sha: HEAD, state: "failure", context: "ci/legacy", target_url: "https://ci/1", branches: [{ name: "TOG-1-x" }] }, config);
-    expect(parsed.statusFailures).toEqual([{ repo: "togetherweown/two-web-next", sha: HEAD, context: "ci/legacy", url: "https://ci/1" }]);
+  it("does not consume commit status events (not subscribed: every status delivery is stored by the host)", () => {
+    const status = { repository, sha: HEAD, state: "failure", context: "ci/legacy", target_url: "https://ci/1", branches: [{ name: "TOG-1-x" }] };
+    expect(mayAct("status", status)).toBe(false);
+    expect(parseEvent("status", status, config).signals).toEqual([]);
   });
 });
 
@@ -89,19 +90,58 @@ describe("pull_request and push", () => {
   const pr = (extra: Record<string, unknown>, action = "synchronize") => ({
     action,
     repository,
-    pull_request: { number: 1903, state: "open", draft: false, html_url: "https://github.com/TogetherWeOwn/two-web-next/pull/1903", head: { sha: HEAD, ref: "feat/x" }, base: { ref: "main" }, ...extra },
+    pull_request: {
+      number: 1903, state: "open", draft: false, html_url: "https://github.com/TogetherWeOwn/two-web-next/pull/1903",
+      head: { sha: HEAD, ref: "feat/x", repo: { full_name: "TogetherWeOwn/two-web-next" } },
+      base: { ref: "main", repo: { full_name: "TogetherWeOwn/two-web-next" } },
+      user: { login: "doer" }, author_association: "MEMBER", updated_at: "2026-10-27T04:00:00Z", ...extra,
+    },
   });
   it("indexes head, branch and draft flag", () => {
     const parsed = parseEvent("pull_request", pr({ draft: true }, "converted_to_draft"), config);
-    expect(parsed.upsertIndex[0]).toMatchObject({ number: 1903, head: HEAD, headRef: "feat/x", draft: true });
+    expect(parsed.upsertIndex[0]).toMatchObject({ number: 1903, head: HEAD, headRef: "feat/x", draft: true, open: true, trusted: true, updatedAt: "2026-10-27T04:00:00Z" });
     expect(parsed.signals).toEqual([]);
   });
-  it("signals merged and drops the index entry; a plain close only drops it", () => {
+  it("signals merged and tombstones the index entry as closed; a plain close only tombstones it", () => {
     const merged = parseEvent("pull_request", pr({ state: "closed", merged: true }, "closed"), config);
     expect(merged.signals.map((s) => s.state)).toEqual(["merged"]);
-    expect(merged.removeIndex).toEqual([{ repo: "togetherweown/two-web-next", number: 1903 }]);
+    expect(merged.upsertIndex).toEqual([expect.objectContaining({ repo: "togetherweown/two-web-next", number: 1903, open: false })]);
     const closed = parseEvent("pull_request", pr({ state: "closed", merged: false }, "closed"), config);
     expect(closed.signals).toEqual([]);
+    expect(closed.upsertIndex[0]!.open).toBe(false);
+  });
+  it("marks fork PRs and outsider authors untrusted; trustedAuthors admits bots", () => {
+    const fork = parseEvent("pull_request", pr({ head: { sha: HEAD, ref: "TOG-43084-x", repo: { full_name: "evil/two-web-next" } } }), config);
+    expect(fork.upsertIndex[0]!.trusted).toBe(false);
+    const deletedFork = parseEvent("pull_request", pr({ head: { sha: HEAD, ref: "TOG-43084-x", repo: null } }), config);
+    expect(deletedFork.upsertIndex[0]!.trusted).toBe(false);
+    const outsider = parseEvent("pull_request", pr({ author_association: "CONTRIBUTOR" }), config);
+    expect(outsider.upsertIndex[0]!.trusted).toBe(false);
+    const bot = pr({ author_association: "NONE", user: { login: "paperclip-agent[bot]" } });
+    expect(parseEvent("pull_request", bot, config).upsertIndex[0]!.trusted).toBe(false);
+    const allow = parseConfig({ ...config, trustedAuthors: ["Paperclip-Agent"] });
+    expect(parseEvent("pull_request", bot, allow).upsertIndex[0]!.trusted).toBe(true);
+    for (const association of ["OWNER", "MEMBER", "COLLABORATOR"]) expect(isTrustedAuthor(config, association, "x")).toBe(true);
+    // A merged fork PR carries trusted=false so the gate refuses it.
+    const mergedFork = parseEvent("pull_request", pr({ state: "closed", merged: true, author_association: "NONE" }, "closed"), config);
+    expect(mergedFork.signals[0]!.trusted).toBe(false);
+  });
+  it("graph lookups respect state, cross-repo heads and author association", () => {
+    const node = { number: 7, url: "u", state: "OPEN" as const, isDraft: false, isCrossRepository: false, authorAssociation: "MEMBER", author: { login: "doer" }, headRefOid: HEAD, headRefName: "TOG-1-x", baseRefName: "main", mergeable: "MERGEABLE" as const, updatedAt: "2026-10-27T04:00:00Z" };
+    expect(indexFromGraph("o/r", node, config)).toMatchObject({ open: true, trusted: true, updatedAt: "2026-10-27T04:00:00Z" });
+    expect(indexFromGraph("o/r", { ...node, state: "CLOSED" as const }, config).open).toBe(false);
+    expect(indexFromGraph("o/r", { ...node, state: "MERGED" as const }, config).open).toBe(false);
+    expect(indexFromGraph("o/r", { ...node, isCrossRepository: true }, config).trusted).toBe(false);
+    expect(indexFromGraph("o/r", { ...node, authorAssociation: "FIRST_TIME_CONTRIBUTOR" }, config).trusted).toBe(false);
+  });
+  it("evaluate gates closed, superseded, untrusted and draft PRs", () => {
+    const signal = { repo: "o/r", number: 7, head: HEAD, state: "ci_red" as const, url: "u", headRef: null, draft: null, trusted: null, detail: {} };
+    const entry = { repo: "o/r", number: 7, head: HEAD, headRef: "TOG-1-x", base: "main", draft: false, url: "u", open: true, trusted: true, updatedAt: null };
+    expect(evaluate(entry, signal)).toMatchObject({ kind: "ok", signal: { draft: false, trusted: true, headRef: "TOG-1-x" } });
+    expect(evaluate({ ...entry, open: false }, signal)).toMatchObject({ kind: "skip", outcome: "skipped_closed" });
+    expect(evaluate({ ...entry, head: "f".repeat(40) }, signal)).toMatchObject({ kind: "skip", outcome: "stale_head" });
+    expect(evaluate({ ...entry, trusted: false }, signal)).toMatchObject({ kind: "skip", outcome: "untrusted" });
+    expect(evaluate({ ...entry, draft: true }, signal)).toMatchObject({ kind: "skip", outcome: "skipped_draft" });
   });
   it("signals a conflict when GitHub already reports mergeable_state dirty on a non-draft PR", () => {
     expect(parseEvent("pull_request", pr({ mergeable_state: "dirty" }), config).signals.map((s) => s.state)).toEqual(["conflict"]);
