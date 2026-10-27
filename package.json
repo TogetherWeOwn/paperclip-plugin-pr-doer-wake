@@ -1,7 +1,7 @@
 {
   "name": "@togetherweown/paperclip-plugin-pr-doer-wake",
   "version": "0.1.2",
-  "description": "Wakes the Paperclip card that owns a GitHub pull request at most once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears. Never wakes drafts, closed or merged PRs, forks or outsiders. Uses ctx.issues.requestWakeup, so blockers, terminal status and budgets are honoured by the host.",
+  "description": "Wakes the Paperclip card that owns a GitHub pull request at most once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears. Never wakes drafts, closed or merged PRs, forks, outsiders, stopped repos or a card whose ownership is ambiguous. Uses ctx.issues.requestWakeup, so blockers, terminal status and budgets are honoured by the host.",
   "license": "MIT",
   "type": "module",
   "private": true,
