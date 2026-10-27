@@ -108,8 +108,19 @@ describe("pull_request and push", () => {
       for (const extra of [{}, { mergeable_state: "unknown", mergeable: null }, { mergeable_state: "dirty", mergeable: false }]) {
         expect(mayAct("pull_request", pr(extra, action))).toBe(true);
         const signals = parseEvent("pull_request", pr(extra, action), config).signals;
-        expect(signals).toEqual([expect.objectContaining({ state: "conflict", draft: null, trusted: null })]); // decided by the lookup
+        expect(signals[0]).toEqual(expect.objectContaining({ state: "conflict", draft: null, trusted: null })); // decided by the lookup
       }
+    }
+  });
+  it("ready_for_review and reopened also re-evaluate the head's checks (a check that failed while draft or closed)", () => {
+    for (const action of ["ready_for_review", "reopened"]) {
+      const signals = parseEvent("pull_request", pr({}, action), config).signals;
+      expect(signals.map((s) => s.state)).toEqual(["conflict", "ci_red", "review_findings"]);
+      for (const s of signals) expect(s).toMatchObject({ head: HEAD, number: 1903, draft: null, trusted: null, detail: {} }); // no delivered run: head-level
+    }
+    for (const action of ["opened", "synchronize", "edited"]) {
+      // A new head has no completed checks yet (their own deliveries come); an edit does not change the head.
+      expect(parseEvent("pull_request", pr({}, action), config).signals.map((s) => s.state)).toEqual(["conflict"]);
     }
   });
   it("marks fork PRs and outsider authors untrusted; trustedAuthors admits bots", () => {
@@ -196,6 +207,16 @@ describe("checkVerdict (the failing checks are revalidated)", () => {
     expect(checkVerdict([], signal(mine), config)).toMatchObject({ kind: "transient" });
     expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal(mine), config)).toMatchObject({ kind: "transient" });
     expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal({}), config)).toMatchObject({ kind: "skip" }); // old ledger row: no identity
+  });
+  it("a head-level re-evaluation (no delivered run) judges every gating check and is never transient", () => {
+    const head = (state: Signal["state"] = "ci_red"): Signal => ({ repo: "o/r", number: 7, head: HEAD, state, url: "u", headRef: null, draft: null, trusted: null, detail: {} });
+    expect(checkVerdict([run("CR_300", "FAILURE", "2026-10-27T04:00:00Z", "COMPLETED", "test")], head(), config)).toMatchObject({ kind: "red", run: { id: "CR_300" } });
+    expect(checkVerdict([], head(), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_1", "SUCCESS", "2026-10-27T04:00:00Z"), run("CR_2", null, null, "IN_PROGRESS", "test")], head(), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([review("CR_9", "FAILURE")], head(), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" }); // the review is not CI
+    expect(checkVerdict([review("CR_9", "FAILURE")], head("review_findings"), config)).toMatchObject({ kind: "red", run: { id: "CR_9" } });
+    expect(checkVerdict([], head("review_findings"), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([review("CR_9", "ACTION_REQUIRED")], head("review_findings"), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
   });
   it("parseEvent carries the delivered run's identity", () => {
     const payload = checkRun("build", "failure");

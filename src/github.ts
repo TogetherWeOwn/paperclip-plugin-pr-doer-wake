@@ -91,6 +91,15 @@ export const REVIEW_RED_CONCLUSIONS = new Set(["failure"]);
 export const CONFLICT_PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "ready_for_review", "edited"]);
 
 /**
+ * pull_request actions after which a head that was not eligible may now wake for its checks: a check that failed while
+ * the PR was a draft or closed was skipped (skipped_draft, skipped_closed) and left no ledger row, and GitHub sends no
+ * new check_run for it. These also emit head-level ci_red and review_findings signals (no delivered run), which
+ * checkVerdict judges against every relevant check on the head. A new head (opened, synchronize) gets its own check
+ * deliveries; an edit does not change the head.
+ */
+export const RECHECK_PR_ACTIONS = new Set(["reopened", "ready_for_review"]);
+
+/**
  * Cheap pre-filter run BEFORE signature verification. Most org deliveries (check_run created/success,
  * pull_request labeled/assigned, feature-branch pushes) can never act, so they are acknowledged without loading
  * company config or touching a secret. Skipping an unverified event is safe: it performs no work. Deliveries that
@@ -180,6 +189,8 @@ export type CheckVerdict = { kind: "red"; run: CheckRunState } | Exclude<PrCheck
  */
 export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal, config: DoerWakeConfig): CheckVerdict {
   if (!runs) return { kind: "transient", detail: "check runs not read" };
+  // A head-level re-evaluation (RECHECK_PR_ACTIONS) names no check and no run: it judges every relevant check, and
+  // there is no delivered run whose absence could mean read lag, so not red now is check_not_red at once.
   const review = signal.state === "review_findings";
   const own = signal.detail.checkName ?? (review ? config.reviewCheckName : undefined);
   const relevant = (name: string) => (review ? name === own : name !== config.reviewCheckName && isGatingCheck(config, signal.repo, name));
@@ -196,14 +207,18 @@ export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal, 
     .sort((a, b) => (a.name === own ? -1 : b.name === own ? 1 : a.name.localeCompare(b.name)));
   if (redNow[0]) return { kind: "red", run: redNow[0] };
   const ownRuns = runs.filter((r) => r.name === own);
-  const delivered = signal.detail.checkRunId ? ownRuns.find((r) => r.id === signal.detail.checkRunId) : undefined;
-  if (delivered && delivered.status !== "COMPLETED") {
-    return { kind: "transient", detail: `GitHub still lists the delivered run as ${delivered.status.toLowerCase()}` };
-  }
-  const deliveredStart = signal.detail.checkStartedAt ? Date.parse(signal.detail.checkStartedAt) : Number.NaN;
-  const newestOwn = ownRuns.reduce((max, r) => Math.max(max, startedMs(r)), Number.NEGATIVE_INFINITY);
-  if (!delivered && (ownRuns.length === 0 || (!Number.isNaN(deliveredStart) && newestOwn < deliveredStart))) {
-    return { kind: "transient", detail: `GitHub does not list the failing ${own ?? "check"} run yet` };
+  // Read lag can only be told from a delivered run's identity; without one (head-level, or an old ledger row) not red
+  // now is final, never transient forever.
+  if (signal.detail.checkRunId) {
+    const delivered = ownRuns.find((r) => r.id === signal.detail.checkRunId);
+    if (delivered && delivered.status !== "COMPLETED") {
+      return { kind: "transient", detail: `GitHub still lists the delivered run as ${delivered.status.toLowerCase()}` };
+    }
+    const deliveredStart = signal.detail.checkStartedAt ? Date.parse(signal.detail.checkStartedAt) : Number.NaN;
+    const newestOwn = ownRuns.reduce((max, r) => Math.max(max, startedMs(r)), Number.NEGATIVE_INFINITY);
+    if (!delivered && (ownRuns.length === 0 || (!Number.isNaN(deliveredStart) && newestOwn < deliveredStart))) {
+      return { kind: "transient", detail: `GitHub does not list the failing ${own} run yet` };
+    }
   }
   const mine = [...latest.values()].filter((r) => r.name === own).sort((a, b) => startedMs(b) - startedMs(a))[0];
   const detail = mine ? `latest ${own} run ${(mine.status === "COMPLETED" ? String(mine.conclusion) : mine.status).toLowerCase()}` : "no gating check red";
@@ -279,17 +294,20 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
     // A candidate only: the authoritative lookup decides open, draft, trust, head and mergeability.
     const pr = payload.pull_request as Json | undefined;
     if (!pr || typeof pr.number !== "number" || !CONFLICT_PR_ACTIONS.has(String(payload.action)) || !isOpenNonDraftPr(pr)) return out;
-    out.signals.push({
-      repo,
-      number: pr.number,
-      head: String(pr.head?.sha ?? ""),
-      state: "conflict",
-      url: String(pr.html_url ?? `https://github.com/${payload.repository.full_name}/pull/${pr.number}`),
-      headRef: typeof pr.head?.ref === "string" ? pr.head.ref : null,
-      draft: null,
-      trusted: null,
-      detail: {},
-    });
+    const states: WakeState[] = RECHECK_PR_ACTIONS.has(String(payload.action)) ? ["conflict", "ci_red", "review_findings"] : ["conflict"];
+    for (const state of states) {
+      out.signals.push({
+        repo,
+        number: pr.number,
+        head: String(pr.head?.sha ?? ""),
+        state,
+        url: String(pr.html_url ?? `https://github.com/${payload.repository.full_name}/pull/${pr.number}`),
+        headRef: typeof pr.head?.ref === "string" ? pr.head.ref : null,
+        draft: null,
+        trusted: null,
+        detail: {},
+      });
+    }
     return out;
   }
 

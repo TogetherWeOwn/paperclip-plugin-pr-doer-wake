@@ -503,9 +503,10 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     await deliver("check_run", ciFailed("build"));
     expect(graphCalls).toBe(1);
     expect(wakes).toEqual([]);
-    graph = { mergeable: "MERGEABLE", isDraft: false };
-    await deliver("pull_request", prEvent({ action: "ready_for_review" }));
-    await deliver("check_run", ciFailed("build"));
+    graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun()] };
+    await deliver("pull_request", prEvent({ action: "ready_for_review" })); // the head's build is still red: wakes now
+    expect(wakes).toHaveLength(1);
+    await deliver("check_run", ciFailed("build")); // redelivery: same (PR, head, state)
     expect(wakes).toHaveLength(1);
   });
 
@@ -1230,6 +1231,24 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(wakes).toHaveLength(1);
     });
 
+    it("a head-level ready_for_review folded into an attempt keeps the delivered run's identity", async () => {
+      await setup({ wakeStates: ["ci_red"] });
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      graphFail = false;
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [] }; // GitHub does not list the delivered run yet
+      const { sweep, open } = await sweepHeldOnGithub();
+      await deliver("pull_request", prEvent({ action: "ready_for_review" })); // folded: no GitHub read of its own
+      open();
+      await sweep;
+      expect(JSON.parse(row()!.signal).detail).toMatchObject({ checkName: "build", checkRunId: RUN_ID });
+      await harness.runJob(SWEEP_JOB_KEY); // still lagging: kept, not forgotten as check_not_red
+      expect(row()!.outcome).toBe("error");
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun()] };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+
     it("a signal folded into an attempt that then wakes is never woken a second time", async () => {
       graphFail = true;
       await deliver("check_run", ciFailed("build"));
@@ -1709,6 +1728,83 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(wakes).toHaveLength(1);
       expect(hostWakeCalls).toBe(2);
       expect(comments).toHaveLength(1); // the evidence comment of the refused attempt is not repeated
+    });
+  });
+
+  describe("ready_for_review and reopened re-evaluate the head's checks", () => {
+    const reasons = () => wakes.map((w) => w.split(":")[1]).sort();
+
+    for (const action of ["ready_for_review", "reopened"]) {
+      it(`a check that failed while the PR was ${action === "reopened" ? "closed" : "a draft"} wakes on ${action} while the head is still red`, async () => {
+        graph = action === "reopened" ? { mergeable: "MERGEABLE", isDraft: false, state: "CLOSED" } : { mergeable: "MERGEABLE", isDraft: true };
+        await deliver("check_run", ciFailed("build"));
+        await deliver("check_run", reviewFailed());
+        expect(wakes).toEqual([]);
+        expect(ledger.size).toBe(0); // the skip burned nothing
+        graph = { mergeable: "MERGEABLE", isDraft: false }; // GitHub still lists the failed build and review on this head
+        await deliver("pull_request", prEvent({ action }));
+        expect(reasons()).toEqual(["github_pr_ci_red", "github_pr_review_findings"]);
+        expect(row(1903, "ci_red")!.outcome).toMatch(/^woken:/);
+        expect(comments.some((c) => c.body.includes("`build` failure"))).toBe(true); // GitHub's red run is the evidence
+        await deliver("pull_request", prEvent({ action })); // redelivered
+        await deliver("check_run", ciFailed("build"));
+        await harness.runJob(SWEEP_JOB_KEY);
+        expect(wakes).toHaveLength(2); // at most once per (PR, head, state)
+      });
+    }
+
+    it("judges every gating check on the head, not only one delivered name", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [{ id: "CR_t", name: "test", status: "COMPLETED", conclusion: "TIMED_OUT", startedAt: RUN_STARTED }] };
+      await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+      expect(reasons()).toEqual(["github_pr_ci_red"]);
+    });
+
+    it("a head with nothing red ends at once without a ledger row (never deferred forever)", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [{ id: "CR_g", name: "build", status: "COMPLETED", conclusion: "SUCCESS", startedAt: RUN_STARTED }] };
+      await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [] };
+      await deliver("pull_request", prEvent({ action: "reopened" }));
+      expect(wakes).toEqual([]);
+      expect(ledger.size).toBe(0);
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toEqual([]);
+    });
+
+    it("honours wakeStates and stoppedRepos", async () => {
+      await setup({ wakeStates: ["conflict"] });
+      await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+      expect(wakes).toEqual([]);
+      await setup({ stoppedRepos: ["togetherweown/two-web-next"] });
+      await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+      expect(wakes).toEqual([]);
+      expect(graphCalls).toBe(0);
+    });
+
+    it("never wakes a draft, fork or outsider PR, and never after a newer push", async () => {
+      for (const current of [
+        { mergeable: "MERGEABLE", isDraft: true },
+        { mergeable: "MERGEABLE", isDraft: false, cross: true },
+        { mergeable: "MERGEABLE", isDraft: false, association: "NONE" },
+        { mergeable: "MERGEABLE", isDraft: false, head: HEAD2 },
+      ]) {
+        graph = current;
+        await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+      }
+      expect(wakes).toEqual([]);
+      expect(ledger.size).toBe(0);
+    });
+
+    it("resuming a pending row keeps the delivered run's identity, so GitHub read lag defers instead of forgetting", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!.outcome).toBe("error");
+      graphFail = false;
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [] }; // GitHub does not list the delivered run yet
+      await deliver("pull_request", prEvent({ action: "reopened" }));
+      expect(row()!.outcome).toBe("error"); // kept: the read lags the delivered run
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun()] };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(reasons()).toEqual(["github_pr_ci_red"]);
     });
   });
 

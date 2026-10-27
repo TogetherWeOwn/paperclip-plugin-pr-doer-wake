@@ -228,6 +228,18 @@ type LedgerRow = {
   wake_attempted_at: string | null;
 };
 
+/**
+ * The signal an attempt acts on: the newly delivered one, except that a head-level re-evaluation (ready_for_review or
+ * reopened, no delivered run) keeps the stored signal's delivered run identity, which tells GitHub read lag from a
+ * recovered check (checkVerdict). Without it, a lagging read would forget a row whose failure GitHub has not listed yet.
+ */
+function signalFor(fresh: Signal | undefined, stored: string): Signal {
+  const kept = JSON.parse(stored) as Partial<Signal>;
+  if (!fresh) return kept as Signal;
+  if (fresh.state !== "conflict" && fresh.detail.checkName === undefined && kept.detail?.checkRunId) return { ...fresh, detail: kept.detail };
+  return fresh;
+}
+
 /** Never-woken outcomes a genuine signal resumes (the part before any `:`); see resumable. */
 const RESUMABLE = new Set(["error", "no_card", "stale", "held_status", "held_blockers", "refused"]);
 
@@ -263,7 +275,7 @@ async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeC
     // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
     return markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake", claim);
   }
-  const signal = fresh ?? (JSON.parse(row.signal) as Signal);
+  const signal = signalFor(fresh, row.signal);
   let skipped: { outcome: Outcome; detail?: string } | null = null;
   const policy = policySkip(config, signal);
   if (policy) {
@@ -315,7 +327,7 @@ async function processSignal(ctx: PluginContext, companyId: string, config: Doer
     } else if (resumable(existing)) {
       result = await retryRow(ctx, companyId, config, existing, raw);
     } else if (!existing.wake_attempted_at && (existing.outcome === "claimed" || existing.outcome === "retrying")) {
-      const touched = await ctx.db.execute(touchSql(ns), [companyId, fp, JSON.stringify(raw)]);
+      const touched = await ctx.db.execute(touchSql(ns), [companyId, fp, JSON.stringify(signalFor(raw, existing.signal))]);
       if (touched.rowCount === 1) return { fingerprint: fp, outcome: "duplicate", detail: "folded into the attempt in flight" };
       continue;
     } else {
