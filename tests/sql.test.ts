@@ -18,6 +18,7 @@ import {
   releaseWakeAttemptSql,
   retryableSql,
   seenSql,
+  touchSql,
 } from "../src/sql.js";
 import {
   derivePluginDatabaseNamespace,
@@ -70,8 +71,13 @@ describe("host contract", () => {
     expect(markWakeAttemptedSql(DB_NAMESPACE)).toMatch(/set wake_attempted_at = \$4::timestamptz, issue_id = \$3, updated_at = now\(\)\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null$/);
     expect(releaseWakeAttemptSql(DB_NAMESPACE)).toMatch(/where company_id = \$1 and fingerprint = \$2 and wake_attempted_at = \$3::timestamptz$/);
   });
-  it("forgetting a row never touches one whose wake may have reached the host", () => {
-    expect(forgetSql(DB_NAMESPACE)).toMatch(/^delete from \S+\.wake_ledger\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null$/);
+  it("forgetting a row never touches one whose wake may have reached the host, or one changed since this attempt's claim", () => {
+    expect(forgetSql(DB_NAMESPACE)).toMatch(/^delete from \S+\.wake_ledger\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null and updated_at = \$3::timestamptz$/);
+  });
+  it("a signal is folded only into an attempt in flight whose wake was not requested, voiding its claim token", () => {
+    const sql = touchSql(DB_NAMESPACE);
+    expect(sql).toMatch(/set signal = \$3::jsonb, updated_at = updated_at \+ interval '1 microsecond'/);
+    expect(sql).toMatch(/where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null and outcome in \('claimed', 'retrying'\)$/);
   });
   it("the dedupe pre-check returns what a redelivery needs to resume a never-attempted row", () => {
     expect(seenSql(DB_NAMESPACE)).toMatch(/outcome, attempts, updated_at::text as updated_at, signal::text as signal/);
@@ -79,7 +85,7 @@ describe("host contract", () => {
   });
   it("a retry re-claims its row with a conditional UPDATE on the selected outcome and updated_at", () => {
     const sql = reclaimSql(DB_NAMESPACE);
-    expect(sql).toMatch(/set outcome = 'retrying', attempts = attempts \+ 1/);
+    expect(sql).toMatch(/set outcome = 'retrying', attempts = attempts \+ 1, updated_at = \$5::timestamptz/); // the claim token
     expect(sql).toMatch(/where company_id = \$1 and fingerprint = \$2 and outcome = \$3 and updated_at::text = \$4/);
   });
   it("retention compacts aged rows into dedupe tombstones and never deletes them", () => {
@@ -99,7 +105,7 @@ describe("host contract", () => {
     expect(CARD_BY_COMMENT_SQL).not.toMatch(/first_mention|min\(/);
   });
   it("runtime writes pass validatePluginRuntimeExecute", () => {
-    for (const q of [claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), forgetSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {
+    for (const q of [claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), forgetSql(DB_NAMESPACE), touchSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeExecute(q, DB_NAMESPACE)).not.toThrow();
     }
   });

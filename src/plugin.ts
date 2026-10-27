@@ -1,3 +1,4 @@
+import { randomInt } from "node:crypto";
 import { definePlugin, type PluginContext, type PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { parseConfig, validateConfig, type DoerWakeConfig, type SecretRef } from "./config.js";
 import { DB_NAMESPACE, SWEEP_JOB_KEY, WEBHOOK_KEY } from "./constants.js";
@@ -20,8 +21,8 @@ import {
   type Signal,
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
-import { compactSql, reclaimSql, retryableSql, seenSql } from "./sql.js";
-import { deferSignal, forget, markUnconfirmed, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
+import { compactSql, reclaimSql, retryableSql, seenSql, touchSql } from "./sql.js";
+import { CLAIM_TAKEN, deferSignal, forget, markUnconfirmed, recordOutcome, wakeForSignal, type Outcome, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
 let lock: Promise<unknown> = Promise.resolve();
@@ -169,6 +170,11 @@ function resumable(row: LedgerRow): boolean {
   return pending && !row.wake_attempted_at && row.signal !== "{}";
 }
 
+/** This attempt's claim token: written as the row's updated_at by reclaimSql, checked by forgetSql (microseconds). */
+function claimToken(): string {
+  return new Date().toISOString().replace("Z", `${String(randomInt(1000)).padStart(3, "0")}Z`);
+}
+
 /**
  * Take one ledger row (conditional UPDATE, rowCount 1 = this attempt owns it) and finish it: re-apply policy and
  * re-read the PR from GitHub, then wake, keep it for another retry, or forget it. Shared by the sweep and by an
@@ -180,31 +186,75 @@ function resumable(row: LedgerRow): boolean {
 async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeConfig, row: LedgerRow, fresh?: Signal): Promise<WakeResult> {
   const ns = ctx.db.namespace || DB_NAMESPACE;
   const fp = row.fingerprint;
-  const claimed = await ctx.db.execute(reclaimSql(ns), [companyId, fp, row.outcome, row.updated_at]);
-  if (claimed.rowCount !== 1) return { fingerprint: fp, outcome: "duplicate", detail: "taken by another attempt" };
+  const token = claimToken();
+  const claimed = await ctx.db.execute(reclaimSql(ns), [companyId, fp, row.outcome, row.updated_at, token]);
+  if (claimed.rowCount !== 1) return { fingerprint: fp, outcome: "duplicate", detail: CLAIM_TAKEN };
   if (row.wake_attempted_at) {
     // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
     return markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake");
   }
   const signal = fresh ?? (JSON.parse(row.signal) as Signal);
+  let skipped: { outcome: Outcome; detail?: string } | null = null;
   const policy = policySkip(config, signal);
   if (policy) {
-    await forget(ctx, companyId, fp);
-    return { fingerprint: fp, outcome: policy };
+    skipped = { outcome: policy };
+  } else {
+    const check = await currentPrState(ctx, companyId, config, signal);
+    if (check.kind === "transient") {
+      await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
+      return { fingerprint: fp, outcome: "deferred", detail: check.detail };
+    }
+    if (check.kind === "ok") {
+      return wakeForSignal(ctx, companyId, config, check.signal, {
+        retry: { issueId: row.issue_id, commentPostedAt: row.comment_posted_at, wakeAttemptedAt: row.wake_attempted_at },
+      });
+    }
+    skipped = { outcome: check.outcome, detail: check.detail };
   }
-  const check = await currentPrState(ctx, companyId, config, signal);
-  if (check.kind === "transient") {
-    await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
-    return { fingerprint: fp, outcome: "deferred", detail: check.detail };
+  // Not woken: forgotten, so a later genuine signal on the same head and state can still wake. Unless a newer signal
+  // was folded into the row while this attempt held it (touchSql): this snapshot may predate that signal's evidence,
+  // so the row stays pending and the sweep re-reads GitHub.
+  if (await forget(ctx, companyId, fp, token)) return { fingerprint: fp, ...skipped };
+  await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
+  return { fingerprint: fp, outcome: "deferred", detail: `${skipped.outcome} on a read older than a newer signal; the sweep re-reads it` };
+}
+
+/** Rounds a signal may spend meeting rows other attempts change under it before it is reported as an error. */
+const SIGNAL_ROUNDS = 4;
+
+/**
+ * Act on one genuine signal whatever the ledger already holds for its fingerprint, never acknowledging it as settled
+ * while an attempt that may still forget the row is in flight:
+ * - no row: read GitHub (or use `known`, a read the caller already made) and wake, defer or skip;
+ * - a pending row whose wake was never attempted: resume it at once with this signal (retryRow);
+ * - a row in flight (claimed or retrying, wake not requested): fold this signal into it (touchSql);
+ * - any other row (woken, unconfirmed, held, refused, shadow): a duplicate, at no GitHub cost.
+ * When another attempt changes the row between these steps, the row is looked at again.
+ */
+async function processSignal(ctx: PluginContext, companyId: string, config: DoerWakeConfig, raw: Signal, known?: PrCheck): Promise<WakeResult> {
+  const ns = ctx.db.namespace || DB_NAMESPACE;
+  const fp = fingerprint(raw);
+  for (let round = 0; round < SIGNAL_ROUNDS; round += 1) {
+    const [existing] = await ctx.db.query<LedgerRow>(seenSql(ns), [companyId, fp]);
+    let result: WakeResult;
+    if (!existing) {
+      const check = known ?? (await currentPrState(ctx, companyId, config, raw));
+      known = undefined; // a later round reads GitHub again
+      if (check.kind === "skip") return { fingerprint: fp, outcome: check.outcome, detail: check.detail };
+      result = check.kind === "ok" ? await wakeForSignal(ctx, companyId, config, check.signal) : await deferSignal(ctx, companyId, config, raw, check.detail);
+    } else if (resumable(existing)) {
+      result = await retryRow(ctx, companyId, config, existing, raw);
+    } else if (!existing.wake_attempted_at && (existing.outcome === "claimed" || existing.outcome === "retrying")) {
+      const touched = await ctx.db.execute(touchSql(ns), [companyId, fp, JSON.stringify(raw)]);
+      if (touched.rowCount === 1) return { fingerprint: fp, outcome: "duplicate", detail: "folded into the attempt in flight" };
+      continue;
+    } else {
+      return { fingerprint: fp, outcome: "duplicate" };
+    }
+    if (result.outcome !== "duplicate" || result.detail !== CLAIM_TAKEN) return result;
   }
-  if (check.kind === "skip") {
-    // Not woken: forgotten, so a later genuine signal on the same head and state can still wake.
-    await forget(ctx, companyId, fp);
-    return { fingerprint: fp, outcome: check.outcome, detail: check.detail };
-  }
-  return wakeForSignal(ctx, companyId, config, check.signal, {
-    retry: { issueId: row.issue_id, commentPostedAt: row.comment_posted_at, wakeAttemptedAt: row.wake_attempted_at },
-  });
+  ctx.logger.warn("pr-doer-wake: the ledger row kept changing under this signal; not acted on", { fingerprint: fp });
+  return { fingerprint: fp, outcome: "error", detail: "ledger row kept changing" };
 }
 
 export async function handleGithubEvent(eventName: string, payload: Record<string, any>, companyId: string, config: DoerWakeConfig): Promise<WakeResult[]> {
@@ -219,25 +269,14 @@ export async function handleGithubEvent(eventName: string, payload: Record<strin
   }
   const results: WakeResult[] = [];
   for (const raw of parsed.signals) {
-    const fp = fingerprint(raw);
     if (!config.wakeStates.includes(raw.state)) {
-      results.push({ fingerprint: fp, outcome: "skipped_state" });
+      results.push({ fingerprint: fingerprint(raw), outcome: "skipped_state" });
       continue;
     }
-    const [existing] = await ctx.db.query<LedgerRow>(seenSql(ctx.db.namespace || DB_NAMESPACE), [companyId, fp]);
-    if (existing) {
-      // A row whose wake was never attempted (GitHub was down, no owning card yet) is resumed now instead of
-      // waiting for its backoff; any other row is a duplicate and costs no GitHub lookup.
-      results.push(resumable(existing) ? await retryRow(ctx, companyId, config, existing, raw) : { fingerprint: fp, outcome: "duplicate" });
-      continue;
-    }
-    const check = await currentPrState(ctx, companyId, config, raw);
-    if (check.kind === "ok") results.push(await wakeForSignal(ctx, companyId, config, check.signal));
-    else if (check.kind === "transient") results.push(await deferSignal(ctx, companyId, config, raw, check.detail));
-    else results.push({ fingerprint: fp, outcome: check.outcome, detail: check.detail });
+    results.push(await processSignal(ctx, companyId, config, raw));
   }
   for (const r of results) {
-    if (r.outcome !== "duplicate") ctx.logger.info("pr-doer-wake", { ...r });
+    if (r.outcome !== "duplicate" || r.detail) ctx.logger.info("pr-doer-wake", { ...r });
   }
   return results;
 }
@@ -273,7 +312,7 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
             repo, number: pr.number, head: pr.headRefOid, state: "conflict", url: pr.url, headRef: pr.headRefName, draft: null, trusted: null, detail: {},
           };
           const check = evaluate(prStateFromGraph(repo, pr, config), signal, config); // this page is the authoritative read
-          results.push(check.kind === "ok" ? await wakeForSignal(ctx, companyId, config, check.signal) : { fingerprint: fingerprint(signal), outcome: check.kind === "skip" ? check.outcome : "error" });
+          results.push(check.kind === "ok" ? await processSignal(ctx, companyId, config, signal, check) : { fingerprint: fingerprint(signal), outcome: check.kind === "skip" ? check.outcome : "error" });
         }
         if (!connection.pageInfo.hasNextPage) {
           finished = true;
@@ -335,7 +374,7 @@ export function runSweep(): Promise<WakeResult[]> {
     const configs = new Map((await companiesFor(ctx, null)).map((c) => [c.companyId, c.config]));
     await sweepConflicts(ctx, configs, results);
     await retryWakes(ctx, configs, results);
-    for (const r of results) if (r.outcome !== "duplicate") ctx.logger.info("pr-doer-wake sweep", { ...r });
+    for (const r of results) if (r.outcome !== "duplicate" || r.detail) ctx.logger.info("pr-doer-wake sweep", { ...r });
     return results;
   })();
   sweepInflight = run;

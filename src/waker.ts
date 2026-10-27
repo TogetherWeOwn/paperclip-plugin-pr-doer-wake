@@ -128,10 +128,17 @@ export async function recordOutcome(ctx: PluginContext, companyId: string, fp: s
   await ctx.db.execute(recordOutcomeSql(namespace(ctx)), [companyId, fp, outcome, issueId]);
 }
 
-/** Drop a never-woken row so a later genuine signal can claim the fingerprint again (forgetSql). */
-export async function forget(ctx: PluginContext, companyId: string, fp: string) {
-  await ctx.db.execute(forgetSql(namespace(ctx)), [companyId, fp]);
+/**
+ * Drop a never-woken row so a later genuine signal can claim the fingerprint again (forgetSql). False when the row
+ * no longer carries this attempt's claim token: a newer signal was folded into it meanwhile, so it must be re-read.
+ */
+export async function forget(ctx: PluginContext, companyId: string, fp: string, token: string): Promise<boolean> {
+  const deleted = await ctx.db.execute(forgetSql(namespace(ctx)), [companyId, fp, token]);
+  return deleted.rowCount === 1;
 }
+
+/** Detail of a `duplicate` that lost the ledger row to another attempt; the caller looks at the row again. */
+export const CLAIM_TAKEN = "taken by another attempt";
 
 /**
  * requestWakeup was sent but its result is unknown (lost reply, timeout, worker stopped mid-call). The host may
@@ -163,7 +170,7 @@ export async function deferSignal(ctx: PluginContext, companyId: string, config:
   const fp = fingerprint(signal);
   const policy = policySkip(config, signal);
   if (policy) return { fingerprint: fp, outcome: policy };
-  if (!(await claim(ctx, companyId, fp, signal))) return { fingerprint: fp, outcome: "duplicate" };
+  if (!(await claim(ctx, companyId, fp, signal))) return { fingerprint: fp, outcome: "duplicate", detail: CLAIM_TAKEN };
   await recordOutcome(ctx, companyId, fp, "error", null);
   ctx.logger.warn("pr-doer-wake: PR state unavailable; the sweep job re-reads it", { fingerprint: fp, error: detail });
   return { fingerprint: fp, outcome: "deferred", detail };
@@ -189,16 +196,14 @@ export async function wakeForSignal(
   const fp = fingerprint(signal);
   const retry = opts.retry;
   // Final guard for every caller (webhook, conflict sweep, retries): the policy may have changed since the signal.
+  // A retry applies the same policy before its GitHub read (plugin.ts retryRow), so it never gets here with one.
   const policy = policySkip(config, signal);
-  if (policy) {
-    if (retry) await forget(ctx, companyId, fp);
-    return { fingerprint: fp, outcome: policy };
-  }
+  if (policy) return { fingerprint: fp, outcome: policy };
   if (signal.trusted === false) return { fingerprint: fp, outcome: "untrusted" };
   if (signal.draft === true) return { fingerprint: fp, outcome: "skipped_draft" };
   if (signal.draft === null) return { fingerprint: fp, outcome: "draft_unknown" };
 
-  if (!retry && !(await claim(ctx, companyId, fp, signal))) return { fingerprint: fp, outcome: "duplicate" };
+  if (!retry && !(await claim(ctx, companyId, fp, signal))) return { fingerprint: fp, outcome: "duplicate", detail: CLAIM_TAKEN };
   if (retry?.wakeAttemptedAt) return markUnconfirmed(ctx, companyId, fp, retry.issueId, "an earlier attempt already requested the wake");
 
   const ns = namespace(ctx);

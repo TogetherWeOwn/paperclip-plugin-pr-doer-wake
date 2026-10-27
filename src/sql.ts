@@ -15,7 +15,8 @@ comment_posted_at::text as comment_posted_at, wake_attempted_at::text as wake_at
 
 /**
  * Pre-check before any GitHub lookup: a row that already woke (or may have) makes the signal a duplicate at no
- * cost; a row whose wake was never attempted is resumed at once (plugin.ts). The claim stays the atomic gate.
+ * cost; a pending row whose wake was never attempted is resumed at once, and a row in flight takes the signal over
+ * (touchSql; plugin.ts processSignal). The claim stays the atomic gate.
  */
 export function seenSql(ns: string): string {
   return `select ${ROW_COLUMNS} from ${ns}.wake_ledger where company_id = $1 and fingerprint = $2`;
@@ -28,12 +29,25 @@ where company_id = $1 and fingerprint = $2`;
 }
 
 /**
- * A sweep takes a retry row only if nobody changed it since the select ($3 outcome, $4 updated_at as text):
- * rowCount 1 means this sweep owns the retry, 0 means another sweep (or the webhook path) got there first.
+ * A retry takes a row only if nobody changed it since the select ($3 outcome, $4 updated_at as text): rowCount 1
+ * means this attempt owns the retry, 0 means another one got there first. $5 is this attempt's own claim token,
+ * written as updated_at: forgetSql deletes the row only while it still carries it (see touchSql).
  */
 export function reclaimSql(ns: string): string {
-  return `update ${ns}.wake_ledger set outcome = 'retrying', attempts = attempts + 1, updated_at = now()
+  return `update ${ns}.wake_ledger set outcome = 'retrying', attempts = attempts + 1, updated_at = $5::timestamptz
 where company_id = $1 and fingerprint = $2 and outcome = $3 and updated_at::text = $4`;
+}
+
+/**
+ * A signal for a fingerprint whose attempt is in flight (claimed or retrying, wake not requested) is folded into
+ * that attempt instead of being dropped as a duplicate: the newest signal ($3) is stored and updated_at moves by one
+ * microsecond, which voids the attempt's claim token. If that attempt then finds nothing to wake on its (possibly
+ * older) GitHub snapshot, its forgetSql matches nothing and it keeps the row pending for the sweep to re-read.
+ * No new column: updated_at is the row version. rowCount 0: the row is no longer in flight (look again).
+ */
+export function touchSql(ns: string): string {
+  return `update ${ns}.wake_ledger set signal = $3::jsonb, updated_at = updated_at + interval '1 microsecond'
+where company_id = $1 and fingerprint = $2 and wake_attempted_at is null and outcome in ('claimed', 'retrying')`;
 }
 
 /** Phase marks: what a retry must not repeat (migrations/002_wake_phases.sql). */
@@ -83,11 +97,12 @@ order by updated_at asc limit 20`;
 /**
  * Drop a row whose wake was never requested: a skip that is not final for the fingerprint (check not red yet,
  * draft, not conflicting, repo stopped). A later genuine signal on the same head and state can then
- * claim it again. A row whose wake may have reached the host is never deleted (at most once).
+ * claim it again. A row whose wake may have reached the host is never deleted (at most once), nor one that a newer
+ * signal touched (touchSql) or another attempt took since this attempt's claim ($3, its reclaimSql token).
  */
 export function forgetSql(ns: string): string {
   return `delete from ${ns}.wake_ledger
-where company_id = $1 and fingerprint = $2 and wake_attempted_at is null`;
+where company_id = $1 and fingerprint = $2 and wake_attempted_at is null and updated_at = $3::timestamptz`;
 }
 
 /**

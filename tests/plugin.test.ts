@@ -19,6 +19,7 @@ import {
   releaseWakeAttemptSql,
   retryableSql,
   seenSql,
+  touchSql,
 } from "../src/sql.js";
 
 const CID = "ef993a7e-5ea7-445f-ba88-27a6a2690c3a";
@@ -65,6 +66,7 @@ let baseConfig: Record<string, unknown>;
 let tick: number; // monotonic stand-in for updated_at
 let onRetrySelect: (() => void) | null; // runs after the retry select returned its snapshot (another sweep racing)
 let fetchGate: Promise<void> | null; // holds every GitHub call until opened
+let onSeenSelect: (() => Promise<void>) | null; // runs once after a delivery's pre-check read its ledger row
 
 /** The doer's PR-link comment body for PR `n`. */
 const link = (n = 1903) => `PR: https://github.com/TogetherWeOwn/two-web-next/pull/${n}`;
@@ -154,6 +156,7 @@ function setup(config: Record<string, unknown> = {}) {
   tick = 0;
   onRetrySelect = null;
   fetchGate = null;
+  onSeenSelect = null;
   const touch = () => `2026-10-27 05:00:00.${String(++tick).padStart(6, "0")}+00`;
   const ctx = harness.ctx as any;
   ctx.secrets.resolve = async (ref: { secretId: string }) => (ref.secretId.endsWith("1") ? SECRET : "gh-token");
@@ -169,7 +172,13 @@ function setup(config: Record<string, unknown> = {}) {
     if (sql === reclaimSql(DB_NAMESPACE)) {
       const row = ledger.get(key);
       if (!row || row.outcome !== params[2] || row.updatedAt !== params[3]) return { rowCount: 0 };
-      Object.assign(row, { outcome: "retrying", attempts: row.attempts + 1, stale: false, updatedAt: touch() });
+      Object.assign(row, { outcome: "retrying", attempts: row.attempts + 1, stale: false, updatedAt: String(params[4]) }); // the claim token
+      return { rowCount: 1 };
+    }
+    if (sql === touchSql(DB_NAMESPACE)) {
+      const row = ledger.get(key);
+      if (!row || row.wakeAttemptedAt || !["claimed", "retrying"].includes(row.outcome)) return { rowCount: 0 };
+      Object.assign(row, { signal: String(params[2]), updatedAt: `${row.updatedAt} +1us` });
       return { rowCount: 1 };
     }
     if (sql === recordOutcomeSql(DB_NAMESPACE)) {
@@ -197,7 +206,7 @@ function setup(config: Record<string, unknown> = {}) {
     }
     if (sql === forgetSql(DB_NAMESPACE)) {
       const row = ledger.get(key);
-      if (!row || row.wakeAttemptedAt) return { rowCount: 0 };
+      if (!row || row.wakeAttemptedAt || row.updatedAt !== params[2]) return { rowCount: 0 }; // only under its own claim token
       ledger.delete(key);
       return { rowCount: 1 };
     }
@@ -231,7 +240,11 @@ function setup(config: Record<string, unknown> = {}) {
     const asRow = ([k, r]: [string, LedgerRow]) => ({ fingerprint: k.split("|")[1], outcome: r.outcome, attempts: r.attempts, updated_at: r.updatedAt, signal: r.signal, issue_id: r.issueId, comment_posted_at: r.commentPostedAt, wake_attempted_at: r.wakeAttemptedAt });
     if (sql === seenSql(DB_NAMESPACE)) {
       const key = `${params[0]}|${params[1]}`;
-      return ledger.has(key) ? [asRow([key, ledger.get(key)!])] : [];
+      const snapshot = ledger.has(key) ? [asRow([key, ledger.get(key)!])] : [];
+      const hook = onSeenSelect;
+      onSeenSelect = null;
+      await hook?.(); // another attempt races this delivery after its pre-check read the row
+      return snapshot;
     }
     if (sql === COMMENT_EXISTS_SQL) return comments.filter((c) => c.issueId === params[1] && c.body === params[2]).map(() => ({ id: "c" }));
     if (sql === retryableSql(DB_NAMESPACE)) {
@@ -1095,6 +1108,73 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
     expect(comments[0]!.body).toContain("`test` failure");
+  });
+
+  describe("a signal that meets an attempt in flight is never acknowledged as settled", () => {
+    const green: CheckRun = { id: "CR_kwDOrun200", name: "build", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-10-27T04:05:00Z" };
+    const testRed: CheckRun = { id: "CR_kwDOtest1", name: "test", status: "COMPLETED", conclusion: "FAILURE", startedAt: RUN_STARTED };
+    /** Start a sweep and return once its retry holds the row and waits on GitHub (gated), plus the gate opener. */
+    async function sweepHeldOnGithub(): Promise<{ sweep: Promise<unknown>; open: () => void }> {
+      let open!: () => void;
+      fetchGate = new Promise<void>((r) => { open = r; });
+      const calls = graphCalls;
+      const sweep = runSweep();
+      while (graphCalls === calls) await new Promise((r) => setTimeout(r, 0));
+      return { sweep, open: () => { fetchGate = null; open(); } };
+    }
+
+    it("a new gating failure delivered while a retry reads a green snapshot still wakes once", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build")); // pending
+      graphFail = false;
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [green] }; // build recovered; test not finished yet
+      const { sweep, open } = await sweepHeldOnGithub();
+      expect(row()!.outcome).toBe("retrying");
+      await deliver("check_run", ciFailed("test", "failure", HEAD, 1903, { nodeId: "CR_kwDOtest1" })); // same fingerprint
+      open();
+      await sweep; // its snapshot predates the test failure: green, but the row was touched, so it is kept
+      expect(wakes).toEqual([]);
+      expect(row()).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [green, testRed] };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+      expect(comments[0]!.body).toContain("`test` failure");
+      await deliver("check_run", ciFailed("test", "failure", HEAD, 1903, { nodeId: "CR_kwDOtest1" }));
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a redelivery that loses its resume to a sweep folds into that sweep instead of being dropped", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      graphFail = false;
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [green] };
+      let held!: { sweep: Promise<unknown>; open: () => void };
+      onSeenSelect = async () => { held = await sweepHeldOnGithub(); }; // the sweep re-claims between pre-check and resume
+      await deliver("check_run", ciFailed("test", "failure", HEAD, 1903, { nodeId: "CR_kwDOtest1" }));
+      held.open();
+      await held.sweep;
+      expect(wakes).toEqual([]);
+      expect(row()).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [green, testRed] };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a signal folded into an attempt that then wakes is never woken a second time", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      graphFail = false;
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun(), testRed] };
+      const { sweep, open } = await sweepHeldOnGithub();
+      await deliver("check_run", ciFailed("test", "failure", HEAD, 1903, { nodeId: "CR_kwDOtest1" }));
+      open();
+      await sweep;
+      expect(wakes).toHaveLength(1);
+      await harness.runJob(SWEEP_JOB_KEY);
+      await deliver("check_run", ciFailed("test", "failure", HEAD, 1903, { nodeId: "CR_kwDOtest1" }));
+      expect(hostWakeCalls).toBe(1);
+    });
   });
 
   it("a delivered run GitHub still lists as in progress (read lag) is retried, not dropped", async () => {
