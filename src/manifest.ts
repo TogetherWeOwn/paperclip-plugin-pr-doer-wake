@@ -23,7 +23,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "PR doer wake",
   description:
-    "Wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
+    "Wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears; ready_for_review and reopened re-check the head. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
