@@ -5,10 +5,12 @@ import {
   evaluate,
   fingerprint,
   ONE_PR_QUERY,
+  ONE_PR_WITH_CHECK_QUERY,
   OPEN_PRS_QUERY,
   mayAct,
   ownerOf,
   parseEvent,
+  policySkip,
   prStateFromGraph,
   SIGNATURE_RE,
   SUBSCRIBED_EVENTS,
@@ -18,11 +20,13 @@ import {
   type Signal,
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
-import { pruneSql, retryableSql, seenSql } from "./sql.js";
+import { compactSql, reclaimSql, retryableSql, seenSql } from "./sql.js";
 import { deferSignal, markUnconfirmed, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
 let lock: Promise<unknown> = Promise.resolve();
+/** The sweep running in this worker, if any (single flight; see runSweep). */
+let sweepInflight: Promise<WakeResult[]> | null = null;
 const secrets = new SecretCache();
 const MAX_SWEEP_ATTEMPTS = 6;
 type OpenPrsConnection = { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: GraphPr[] };
@@ -100,15 +104,22 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
 }
 
 /**
- * Is this signal's PR open, trusted, non-draft and on this head right now? Always one GraphQL read: webhook
- * payloads arrive late, out of order and with tied updated_at values, and draft conversion or closing does not
- * change the head, so nothing cached can authorize a wake. Fails closed: unreadable is transient, missing is closed.
+ * Is this signal's PR open, trusted, non-draft and on this head right now, and for a check signal is that check still
+ * red there? Always one GraphQL read: webhook payloads arrive late, out of order and with tied updated_at values,
+ * draft conversion or closing does not change the head, and checks are re-run on the same head, so nothing cached
+ * can authorize a wake. Fails closed: unreadable is transient, missing is closed.
  */
 async function currentPrState(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<PrCheck> {
   const [owner, name] = signal.repo.split("/");
+  const checkName = signal.state === "conflict" ? null : (signal.detail.checkName ?? (signal.state === "review_findings" ? config.reviewCheckName : null));
+  if (signal.state !== "conflict" && !checkName) return { kind: "skip", outcome: "check_not_red", detail: "signal names no check" };
   let pr: GraphPr | null | undefined;
   try {
-    const data = await githubGraphql<{ repository: { pullRequest: GraphPr | null } | null }>(ctx, companyId, config, ONE_PR_QUERY, { o: owner, r: name, n: signal.number });
+    const data = await githubGraphql<{ repository: { pullRequest: GraphPr | null } | null }>(
+      ctx, companyId, config,
+      checkName ? ONE_PR_WITH_CHECK_QUERY : ONE_PR_QUERY,
+      checkName ? { o: owner, r: name, n: signal.number, check: checkName } : { o: owner, r: name, n: signal.number },
+    );
     pr = data?.repository?.pullRequest;
   } catch (error) {
     return { kind: "transient", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
@@ -159,7 +170,8 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
   for (const [key, mark] of Object.entries(marks)) {
     const [companyId, repo] = key.split("|") as [string, string];
     const config = configs.get(companyId);
-    if (!config || !config.wakeStates.includes("conflict")) {
+    // Current policy, not the one at push time: a repo stopped since then is dropped without reading GitHub.
+    if (!config || policySkip(config, { repo, state: "conflict" })) {
       next.set(key, null);
       continue;
     }
@@ -219,22 +231,42 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
   });
 }
 
-type RetryRow = { fingerprint: string; signal: string; issue_id: string | null; comment_posted_at: string | null; wake_attempted_at: string | null };
+type RetryRow = {
+  fingerprint: string;
+  outcome: string;
+  updated_at: string;
+  signal: string;
+  issue_id: string | null;
+  comment_posted_at: string | null;
+  wake_attempted_at: string | null;
+};
 
 /**
- * Finish failed, stuck and card-pending wakes, re-reading the PR first so a now-draft, closed, merged or re-pushed
- * PR is never woken. A row whose wake was already requested is closed as wake_unconfirmed instead.
+ * Finish failed, stuck and card-pending wakes, re-reading the PR first so a now-draft, closed, merged, re-pushed or
+ * recovered PR is never woken. Each row is taken with a conditional UPDATE (reclaimSql) and skipped unless this
+ * sweep won it. A row whose wake may already have reached the host is closed as wake_unconfirmed instead.
  */
 async function retryWakes(ctx: PluginContext, configs: Map<string, DoerWakeConfig>, results: WakeResult[]): Promise<void> {
   const ns = ctx.db.namespace || DB_NAMESPACE;
   for (const [companyId, config] of configs) {
     const rows = await ctx.db.query<RetryRow>(retryableSql(ns), [companyId]);
     for (const row of rows) {
-      const signal = JSON.parse(row.signal) as Signal;
       const fp = row.fingerprint;
+      const claimed = await ctx.db.execute(reclaimSql(ns), [companyId, fp, row.outcome, row.updated_at]);
+      if (claimed.rowCount !== 1) {
+        results.push({ fingerprint: fp, outcome: "duplicate", detail: "taken by another attempt" });
+        continue;
+      }
+      const signal = JSON.parse(row.signal) as Signal;
       if (row.wake_attempted_at) {
         // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
         results.push(await markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake"));
+        continue;
+      }
+      const policy = policySkip(config, signal);
+      if (policy) {
+        await recordOutcome(ctx, companyId, fp, `stale:${policy}`, row.issue_id);
+        results.push({ fingerprint: fp, outcome: policy });
         continue;
       }
       const check = await currentPrState(ctx, companyId, config, signal);
@@ -251,17 +283,34 @@ async function retryWakes(ctx: PluginContext, configs: Map<string, DoerWakeConfi
       }
     }
   }
-  await ctx.db.execute(pruneSql(ns));
+  await ctx.db.execute(compactSql(ns));
 }
 
-export async function runSweep(): Promise<WakeResult[]> {
+/**
+ * One sweep at a time per worker. The host releases its own overlap guard when a job times out (5 minutes, equal to
+ * the schedule) without cancelling the worker call, so the next tick can arrive while this one still runs; it is
+ * skipped instead of retrying the same rows concurrently. reclaimSql still guards each row across processes.
+ */
+export function runSweep(): Promise<WakeResult[]> {
   const ctx = requireCtx();
-  const results: WakeResult[] = [];
-  const configs = new Map((await companiesFor(ctx, null)).map((c) => [c.companyId, c.config]));
-  await sweepConflicts(ctx, configs, results);
-  await retryWakes(ctx, configs, results);
-  for (const r of results) if (r.outcome !== "duplicate") ctx.logger.info("pr-doer-wake sweep", { ...r });
-  return results;
+  if (sweepInflight) {
+    ctx.logger.warn("pr-doer-wake: previous sweep still running; this tick is skipped");
+    return Promise.resolve([]);
+  }
+  const run = (async () => {
+    const results: WakeResult[] = [];
+    const configs = new Map((await companiesFor(ctx, null)).map((c) => [c.companyId, c.config]));
+    await sweepConflicts(ctx, configs, results);
+    await retryWakes(ctx, configs, results);
+    for (const r of results) if (r.outcome !== "duplicate") ctx.logger.info("pr-doer-wake sweep", { ...r });
+    return results;
+  })();
+  sweepInflight = run;
+  const settle = () => {
+    if (sweepInflight === run) sweepInflight = null;
+  };
+  run.then(settle, settle);
+  return run;
 }
 
 const plugin = definePlugin({

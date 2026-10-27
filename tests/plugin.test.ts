@@ -3,17 +3,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 import manifest from "../src/manifest.js";
 import { parseConfig, validateConfig } from "../src/config.js";
-import plugin from "../src/plugin.js";
+import plugin, { runSweep } from "../src/plugin.js";
 import { DB_NAMESPACE, SWEEP_JOB_KEY } from "../src/constants.js";
 import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
   claimSql,
+  compactSql,
   markCommentPostedSql,
   markWakeAttemptedSql,
-  pruneSql,
+  reclaimSql,
   recordOutcomeSql,
+  releaseWakeAttemptSql,
   retryableSql,
   seenSql,
 } from "../src/sql.js";
@@ -32,9 +34,18 @@ const organization = { login: "TogetherWeOwn" };
 
 type LedgerRow = {
   outcome: string; issueId: string | null; attempts: number; signal: string;
-  commentPostedAt: string | null; wakeAttemptedAt: string | null; stale?: boolean;
+  commentPostedAt: string | null; wakeAttemptedAt: string | null; stale?: boolean; aged?: boolean; updatedAt?: string;
 };
-type Graph = { mergeable: string; isDraft: boolean; state?: string; head?: string; cross?: boolean; association?: string; login?: string; ref?: string; updatedAt?: string };
+/** A check run as GitHub GraphQL reports it on the PR's head commit. */
+type CheckRun = { id: string; status: string; conclusion: string | null; startedAt: string | null };
+type Graph = {
+  mergeable: string; isDraft: boolean; state?: string; head?: string; cross?: boolean; association?: string; login?: string; ref?: string; updatedAt?: string;
+  /** Runs GitHub reports for the queried check name; default: the delivered failing run (RUN_ID) is still the latest. */
+  checks?: CheckRun[];
+};
+const RUN_ID = "CR_kwDOrun100";
+const RUN_STARTED = "2026-10-27T04:00:00Z";
+const redRun = (conclusion = "FAILURE"): CheckRun => ({ id: RUN_ID, status: "COMPLETED", conclusion, startedAt: RUN_STARTED });
 
 let harness: TestHarness;
 let ledger: Map<string, LedgerRow>;
@@ -44,8 +55,12 @@ let comments: Array<{ issueId: string; body: string }>;
 let graph: Graph | null;
 let graphFail: boolean;
 let graphCalls: number;
-let failNext: Set<string>; // one-shot injected failures: "comment", "markComment"
+let failNext: Set<string>; // one-shot injected failures: "comment", "markComment", "markWakeLostReply"
 let hostWakeCalls: number; // requestWakeup calls that reached the host, whatever the reply
+let baseConfig: Record<string, unknown>;
+let tick: number; // monotonic stand-in for updated_at
+let onRetrySelect: (() => void) | null; // runs after the retry select returned its snapshot (another sweep racing)
+let fetchGate: Promise<void> | null; // holds every GitHub call until opened
 
 function issue(id: string, identifier: string, status: string, extra: Record<string, unknown> = {}) {
   return { id, companyId: CID, identifier, title: identifier, status, assigneeAgentId: DOER, ...extra } as any;
@@ -79,27 +94,29 @@ const prEvent = (opts: { head?: string; draft?: boolean; ref?: string; action?: 
 const reviewFailed = (head = HEAD, ref = "feat/quality") => ({
   action: "completed",
   check_run: {
+    id: 100, node_id: RUN_ID, started_at: RUN_STARTED,
     name: "Paperclip Review", conclusion: "failure", head_sha: head, html_url: "https://github.com/TogetherWeOwn/two-web-next/runs/9",
     output: { title: "3/5" }, pull_requests: [{ number: 1903, head: { sha: head, ref }, base: { ref: "main" } }],
   },
 });
 
-const ciFailed = (name: string, conclusion = "failure", head = HEAD, number = 1903) => ({
+const ciFailed = (name: string, conclusion = "failure", head = HEAD, number = 1903, run: { nodeId?: string; startedAt?: string } = {}) => ({
   action: "completed",
-  check_run: { name, conclusion, head_sha: head, html_url: "https://github.com/x/runs/2", output: {}, pull_requests: [{ number, head: { sha: head, ref: "feat/quality" }, base: { ref: "main" } }] },
+  check_run: {
+    id: 100, node_id: run.nodeId ?? RUN_ID, started_at: run.startedAt ?? RUN_STARTED,
+    name, conclusion, head_sha: head, html_url: "https://github.com/x/runs/2", output: {}, pull_requests: [{ number, head: { sha: head, ref: "feat/quality" }, base: { ref: "main" } }],
+  },
 });
 const row = (number = 1903, state = "ci_red", head = HEAD) => ledger.get(`${CID}|togetherweown/two-web-next#${number}@${head}:${state}`);
 
 function setup(config: Record<string, unknown> = {}) {
-  harness = createTestHarness({
-    manifest,
-    config: {
-      enabled: true, shadow: false, githubOrg: "TogetherWeOwn",
-      webhookSecretRef: { type: "secret_ref", secretId: "00000000-0000-4000-8000-000000000001" },
-      githubTokenSecretRef: { type: "secret_ref", secretId: "00000000-0000-4000-8000-000000000002" },
-      excludeAgentIds: [REVIEWER], ...config,
-    },
-  });
+  baseConfig = {
+    enabled: true, shadow: false, githubOrg: "TogetherWeOwn",
+    webhookSecretRef: { type: "secret_ref", secretId: "00000000-0000-4000-8000-000000000001" },
+    githubTokenSecretRef: { type: "secret_ref", secretId: "00000000-0000-4000-8000-000000000002" },
+    excludeAgentIds: [REVIEWER], ...config,
+  };
+  harness = createTestHarness({ manifest, config: baseConfig });
   harness.seed({
     companies: [{ id: CID, name: "TogetherWeOwn" } as any],
     issues: [issue(CARD, "TOG-43084", "in_review"), issue(BLOCKER, "TOG-1", "in_progress"), issue(OTHER, "TOG-777", "in_progress")],
@@ -113,6 +130,10 @@ function setup(config: Record<string, unknown> = {}) {
   graphCalls = 0;
   failNext = new Set();
   hostWakeCalls = 0;
+  tick = 0;
+  onRetrySelect = null;
+  fetchGate = null;
+  const touch = () => `2026-10-27 05:00:00.${String(++tick).padStart(6, "0")}+00`;
   const ctx = harness.ctx as any;
   ctx.secrets.resolve = async (ref: { secretId: string }) => (ref.secretId.endsWith("1") ? SECRET : "gh-token");
   // In-memory stand-in for the plugin namespace + the whitelisted core reads.
@@ -121,50 +142,76 @@ function setup(config: Record<string, unknown> = {}) {
     const key = `${params[0]}|${params[1]}`;
     if (sql === claimSql(DB_NAMESPACE)) {
       if (ledger.has(key)) return { rowCount: 0 };
-      ledger.set(key, { outcome: "claimed", issueId: null, attempts: 0, signal: String(params[6]), commentPostedAt: null, wakeAttemptedAt: null });
+      ledger.set(key, { outcome: "claimed", issueId: null, attempts: 0, signal: String(params[6]), commentPostedAt: null, wakeAttemptedAt: null, updatedAt: touch() });
+      return { rowCount: 1 };
+    }
+    if (sql === reclaimSql(DB_NAMESPACE)) {
+      const row = ledger.get(key);
+      if (!row || row.outcome !== params[2] || row.updatedAt !== params[3]) return { rowCount: 0 };
+      Object.assign(row, { outcome: "retrying", attempts: row.attempts + 1, stale: false, updatedAt: touch() });
       return { rowCount: 1 };
     }
     if (sql === recordOutcomeSql(DB_NAMESPACE)) {
       const row = ledger.get(key)!;
-      Object.assign(row, { outcome: params[2], issueId: params[3], attempts: row.attempts + 1 });
+      Object.assign(row, { outcome: params[2], issueId: params[3], updatedAt: touch() });
       return { rowCount: 1 };
     }
     if (sql === markCommentPostedSql(DB_NAMESPACE)) {
       if (failNext.delete("markComment")) throw new Error("db connection reset");
-      Object.assign(ledger.get(key)!, { commentPostedAt: new Date().toISOString(), issueId: params[2] });
+      Object.assign(ledger.get(key)!, { commentPostedAt: new Date().toISOString(), issueId: params[2], updatedAt: touch() });
       return { rowCount: 1 };
     }
     if (sql === markWakeAttemptedSql(DB_NAMESPACE)) {
-      Object.assign(ledger.get(key)!, { wakeAttemptedAt: new Date().toISOString(), issueId: params[2] });
+      Object.assign(ledger.get(key)!, { wakeAttemptedAt: new Date().toISOString(), issueId: params[2], updatedAt: touch() });
+      if (failNext.delete("markWakeLostReply")) throw new Error("db connection reset"); // committed, reply lost
       return { rowCount: 1 };
     }
-    if (sql === pruneSql(DB_NAMESPACE)) return { rowCount: 0 };
+    if (sql === releaseWakeAttemptSql(DB_NAMESPACE)) {
+      Object.assign(ledger.get(key)!, { wakeAttemptedAt: null, outcome: "error", updatedAt: touch() });
+      return { rowCount: 1 };
+    }
+    if (sql === compactSql(DB_NAMESPACE)) {
+      let n = 0;
+      for (const r of ledger.values()) if (r.aged && r.signal !== "{}") { r.signal = "{}"; n += 1; }
+      return { rowCount: n };
+    }
     throw new Error(`unexpected execute ${sql}`);
   };
   ctx.db.query = async (sql: string, params: unknown[] = []) => {
-    const exclude = String(params[params.length - 1] ?? "").split(",");
+    const exclude = String(baseConfig.excludeAgentIds ?? "").split(",");
     const issues = [...[CARD, BLOCKER, OTHER].map((id) => harness.ctx.issues.get(id, CID))];
     const rows = (await Promise.all(issues)).filter(Boolean) as any[];
-    const live = rows.filter((r) => !["done", "cancelled"].includes(r.status) && !exclude.includes(r.assigneeAgentId));
-    if (sql === CARD_BY_IDENTIFIER_SQL) return live.filter((r) => r.identifier === params[1]);
-    if (sql === CARD_BY_COMMENT_SQL) return live.filter((r) => commentCards.get(String(params[2])) === r.id);
+    // Ownership is decided regardless of status or assignee eligibility; the comment path counts only comments by
+    // the card's own (non-excluded) assignee.
+    if (sql === CARD_BY_IDENTIFIER_SQL) return rows.filter((r) => r.identifier === params[1]).map((r) => ({ ...r, assignee_agent_id: r.assigneeAgentId }));
+    if (sql === CARD_BY_COMMENT_SQL) {
+      return rows.filter((r) => commentCards.get(String(params[2])) === r.id && !exclude.includes(r.assigneeAgentId)).map((r) => ({ ...r, assignee_agent_id: r.assigneeAgentId }));
+    }
     if (sql === seenSql(DB_NAMESPACE)) return ledger.has(`${params[0]}|${params[1]}`) ? [{ fingerprint: params[1] }] : [];
     if (sql === COMMENT_EXISTS_SQL) return comments.filter((c) => c.issueId === params[1] && c.body === params[2]).map(() => ({ id: "c" }));
     if (sql === retryableSql(DB_NAMESPACE)) {
-      return [...ledger.entries()]
-        .filter(([, r]) => (["error", "no_card"].includes(r.outcome) || (r.outcome === "claimed" && r.stale)) && r.attempts < 5) // time windows: see sql.test
-        .map(([k, r]) => ({ fingerprint: k.split("|")[1], signal: r.signal, issue_id: r.issueId, comment_posted_at: r.commentPostedAt, wake_attempted_at: r.wakeAttemptedAt }));
+      const snapshot = [...ledger.entries()]
+        .filter(([, r]) => r.signal !== "{}" && (["error", "no_card"].includes(r.outcome) || (["claimed", "retrying"].includes(r.outcome) && r.stale)) && r.attempts < 4) // time windows: see sql.test
+        .map(([k, r]) => ({ fingerprint: k.split("|")[1], outcome: r.outcome, updated_at: r.updatedAt, signal: r.signal, issue_id: r.issueId, comment_posted_at: r.commentPostedAt, wake_attempted_at: r.wakeAttemptedAt }));
+      onRetrySelect?.();
+      return snapshot;
     }
     throw new Error(`unexpected query ${sql}`);
   };
   ctx.http.fetch = async (_url: string, init?: { body?: string }) => {
     graphCalls += 1;
+    if (fetchGate) await fetchGate;
     if (graphFail) return new Response("bad gateway", { status: 502 });
-    const n = Number(JSON.parse(init?.body ?? "{}").variables?.n ?? 1903);
+    const variables = JSON.parse(init?.body ?? "{}").variables ?? {};
+    const n = Number(variables.n ?? 1903);
+    const runs = graph?.checks ?? [redRun()];
     const nodes = graph ? [{
       number: n, url: `https://github.com/TogetherWeOwn/two-web-next/pull/${n}`, state: graph.state ?? "OPEN", isDraft: graph.isDraft,
       isCrossRepository: graph.cross ?? false, authorAssociation: graph.association ?? "MEMBER", author: { login: graph.login ?? "doer" },
       headRefOid: graph.head ?? HEAD, headRefName: graph.ref ?? "feat/quality", baseRefName: "main", mergeable: graph.mergeable, updatedAt: graph.updatedAt ?? new Date().toISOString(),
+      ...(typeof variables.check === "string"
+        ? { commits: { nodes: [{ commit: { oid: graph.head ?? HEAD, checkSuites: { nodes: [{ checkRuns: { nodes: runs.map((r) => ({ ...r, name: variables.check })) } }] } } }] } }
+        : {}),
     }] : [];
     return new Response(JSON.stringify({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes }, pullRequest: nodes[0] ?? null } } }), { status: 200 });
   };
@@ -519,7 +566,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
 
   it("a row stuck at 'claimed' after the wake was requested (worker died mid-call) is not requested again", async () => {
     const signal = { repo: "togetherweown/two-web-next", number: 1903, head: HEAD, state: "ci_red", url: "u", headRef: "feat/quality", draft: false, trusted: true, detail: {} };
-    ledger.set(`${CID}|togetherweown/two-web-next#1903@${HEAD}:ci_red`, { outcome: "claimed", issueId: CARD, attempts: 0, signal: JSON.stringify(signal), commentPostedAt: new Date().toISOString(), wakeAttemptedAt: new Date().toISOString(), stale: true });
+    ledger.set(`${CID}|togetherweown/two-web-next#1903@${HEAD}:ci_red`, { outcome: "claimed", issueId: CARD, attempts: 0, signal: JSON.stringify(signal), commentPostedAt: new Date().toISOString(), wakeAttemptedAt: new Date().toISOString(), stale: true, updatedAt: "t0" });
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toEqual([]);
     expect(graphCalls).toBe(0);
@@ -528,7 +575,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
 
   it("recovers a ledger row stuck at 'claimed' (worker died between claim and outcome)", async () => {
     const signal = { repo: "togetherweown/two-web-next", number: 1903, head: HEAD, state: "ci_red", url: "https://github.com/TogetherWeOwn/two-web-next/pull/1903", headRef: "feat/quality", draft: false, trusted: true, detail: { checkName: "build", checkUrl: "u", conclusion: "failure" } };
-    ledger.set(`${CID}|togetherweown/two-web-next#1903@${HEAD}:ci_red`, { outcome: "claimed", issueId: null, attempts: 0, signal: JSON.stringify(signal), commentPostedAt: null, wakeAttemptedAt: null, stale: true });
+    ledger.set(`${CID}|togetherweown/two-web-next#1903@${HEAD}:ci_red`, { outcome: "claimed", issueId: null, attempts: 0, signal: JSON.stringify(signal), commentPostedAt: null, wakeAttemptedAt: null, stale: true, updatedAt: "t0" });
     graph = { mergeable: "MERGEABLE", isDraft: false };
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
@@ -652,5 +699,208 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(cursors).toEqual([null, "c1", "c2"]);
     await harness.runJob(SWEEP_JOB_KEY); // finished: nothing left to read
     expect(cursors).toHaveLength(3);
+  });
+
+  // --- review round 3 ---------------------------------------------------------------------------------------------
+
+  describe("retries are single-flight and re-claimed atomically", () => {
+    it("a second sweep while one is still running (host job timeout < sweep time) does not run again", async () => {
+      await failFirstWake();
+      await deliver("push", { ref: "refs/heads/main" }); // a marked repo too
+      let open!: () => void;
+      fetchGate = new Promise<void>((r) => { open = r; });
+      const calls = graphCalls;
+      const first = runSweep();
+      await new Promise((r) => setTimeout(r, 0));
+      const second = await runSweep(); // the next */5 tick, same worker
+      expect(second).toEqual([]);
+      expect(graphCalls - calls).toBe(1); // only the first sweep is reading GitHub
+      open();
+      await first;
+      expect(wakes).toHaveLength(1);
+      expect(comments).toHaveLength(1);
+      expect(await runSweep()).toBeDefined(); // released afterwards
+    });
+
+    it("a retry row another sweep already re-claimed is skipped (conditional UPDATE, rowCount 0)", async () => {
+      await failFirstWake();
+      const key = [...ledger.keys()][0]!;
+      onRetrySelect = () => {
+        // another sweep re-claimed the same row between this sweep's select and its re-claim
+        Object.assign(ledger.get(key)!, { outcome: "retrying", updatedAt: "2026-10-27 05:59:59.999999+00" });
+      };
+      const calls = graphCalls;
+      await runSweep();
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+      expect(graphCalls).toBe(calls); // no lookup either
+    });
+
+    it("a row left at 'retrying' by a dead sweep is retried, bounded by the attempt budget", async () => {
+      await failFirstWake();
+      const row0 = [...ledger.values()][0]!;
+      Object.assign(row0, { outcome: "retrying", stale: true, attempts: 4 });
+      await runSweep();
+      expect(wakes).toEqual([]); // budget spent
+      Object.assign(row0, { attempts: 1 });
+      await runSweep();
+      expect(wakes).toHaveLength(1);
+    });
+  });
+
+  describe("the failing check itself is revalidated", () => {
+    it("an older failing run delivered after a newer passing run on the same head never wakes", async () => {
+      await deliver("check_run", { action: "completed", check_run: { id: 200, node_id: "CR_kwDOrun200", started_at: "2026-10-27T04:05:00Z", name: "build", conclusion: "success", head_sha: HEAD, pull_requests: [{ number: 1903, head: { sha: HEAD, ref: "feat/quality" } }] } });
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [{ id: "CR_kwDOrun200", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-10-27T04:05:00Z" }] };
+      await deliver("check_run", ciFailed("build")); // run 100, started 04:00, delivered late
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+      expect(ledger.size).toBe(0);
+    });
+
+    it("a retry after the flaky check was re-run green (same head) never wakes", async () => {
+      await failFirstWake(); // review_findings
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [{ id: "CR_kwDOrun300", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-10-27T04:10:00Z" }] };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toEqual([]);
+      expect([...ledger.values()][0]!.outcome).toBe("stale:check_not_red");
+    });
+
+    it("the same run updated to passing (Paperclip Review re-scored) never wakes", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun("SUCCESS")] };
+      await deliver("check_run", reviewFailed());
+      expect(wakes).toEqual([]);
+    });
+
+    it("a re-run still in progress never wakes", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun(), { id: "CR_kwDOrun101", status: "IN_PROGRESS", conclusion: null, startedAt: null }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toEqual([]);
+    });
+
+    it("a newer run that failed again still wakes once", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [{ id: "CR_kwDOrun101", status: "COMPLETED", conclusion: "TIMED_OUT", startedAt: "2026-10-27T04:02:00Z" }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("GitHub not showing the delivered run yet is transient, not stale", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [{ id: "CR_kwDOrun050", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-10-27T03:50:00Z" }] };
+      await deliver("check_run", ciFailed("build")); // run 100 started 04:00, newer than anything GitHub lists
+      expect(wakes).toEqual([]);
+      expect(row()!.outcome).toBe("error");
+      graph = { mergeable: "MERGEABLE", isDraft: false };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+  });
+
+  describe("ownership is resolved before eligibility", () => {
+    it("a branch naming a done card never hands the wake to an unrelated live card that mentioned the PR", async () => {
+      harness.seed({ issues: [issue(CARD, "TOG-43084", "done")] });
+      commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", OTHER);
+      graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
+      await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+      expect(row(1903, "review_findings")!.outcome).toMatch(/^ambiguous_card/);
+    });
+
+    it("a branch naming a done card with no other evidence is held on that card", async () => {
+      harness.seed({ issues: [issue(CARD, "TOG-43084", "done")] });
+      commentCards.clear();
+      graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
+      await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
+      expect(wakes).toEqual([]);
+      expect(row(1903, "review_findings")!.outcome).toBe("held_status:done");
+    });
+
+    it("a branch naming a card now assigned to an excluded reviewer never wakes another card", async () => {
+      harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review", { assigneeAgentId: REVIEWER })] });
+      commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", OTHER);
+      graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
+      await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+      commentCards.clear();
+      await setup();
+      harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review", { assigneeAgentId: REVIEWER })] });
+      commentCards.clear();
+      graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
+      await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
+      expect(wakes).toEqual([]);
+      expect(row(1903, "review_findings")!).toMatchObject({ outcome: "no_card", issueId: CARD }); // pending on the owner
+    });
+  });
+
+  describe("wake attempts that provably never reached the host are retried", () => {
+    it("a wake mark whose DB reply was lost (requestWakeup never called) is retried and wakes once", async () => {
+      failNext.add("markWakeLostReply");
+      await deliver("check_run", ciFailed("build"));
+      expect(hostWakeCalls).toBe(0);
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(hostWakeCalls).toBe(1);
+      expect(row()!.outcome).toMatch(/^woken:/);
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(hostWakeCalls).toBe(1);
+    });
+
+    it("a host refusal before dispatch (WORKER_UNAVAILABLE, idle hold) is retried and wakes once", async () => {
+      const ctx = harness.ctx as any;
+      const original = ctx.issues.requestWakeup;
+      ctx.issues.requestWakeup = vi.fn(async () => { throw Object.assign(new Error("Plugin is held for idle sleep"), { code: -32000 }); });
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+      ctx.issues.requestWakeup = original;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+      expect(comments).toHaveLength(1);
+    });
+  });
+
+  it("ledger retention keeps a compact dedupe tombstone: an aged wake for a still-open PR never wakes again", async () => {
+    await deliver("push", { ref: "refs/heads/main" });
+    graph = { mergeable: "CONFLICTING", isDraft: false };
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes).toHaveLength(1);
+    for (const r of ledger.values()) r.aged = true; // 30 days later
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect([...ledger.values()].map((r) => r.signal)).toEqual(["{}"]);
+    await deliver("push", { ref: "refs/heads/main" }); // same PR, same head, still conflicting
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes).toHaveLength(1);
+  });
+
+  describe("stoppedRepos applies to scheduled work too", () => {
+    it("a retry row for a repo stopped after the first attempt never wakes", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!.outcome).toBe("error");
+      graphFail = false;
+      harness.setConfig({ ...baseConfig, stoppedRepos: ["togetherweown/two-web-next"] });
+      const calls = graphCalls;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toEqual([]);
+      expect(graphCalls).toBe(calls);
+      expect(row()!.outcome).toBe("stale:stopped_repo");
+    });
+
+    it("a pending conflict sweep for a repo stopped after the push never wakes or reads GitHub", async () => {
+      await deliver("push", { ref: "refs/heads/main" });
+      harness.setConfig({ ...baseConfig, stoppedRepos: ["togetherweown/two-web-next"] });
+      graph = { mergeable: "CONFLICTING", isDraft: false };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toEqual([]);
+      expect(graphCalls).toBe(0);
+    });
+
+    it("the final guard in wakeForSignal refuses a stopped repo whatever the caller", async () => {
+      const { wakeForSignal } = await import("../src/waker.js");
+      const config = parseConfig({ ...baseConfig, stoppedRepos: ["togetherweown/two-web-next"] });
+      const signal = { repo: "togetherweown/two-web-next", number: 1903, head: HEAD, state: "ci_red" as const, url: "u", headRef: null, draft: false, trusted: true, detail: {} };
+      expect(await wakeForSignal(harness.ctx, CID, config, signal)).toMatchObject({ outcome: "stopped_repo" });
+      expect(ledger.size).toBe(0);
+      expect(wakes).toEqual([]);
+    });
   });
 });

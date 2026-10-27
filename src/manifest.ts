@@ -52,7 +52,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SWEEP_JOB_KEY,
       displayName: "Conflict sweep and wake retries",
       description:
-        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR and finishes wakes that failed, stalled or had no owning card yet (never one already requested); prunes the ledger after 30 days.",
+        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR (and the failing check) and finishes wakes that failed, stalled or had no owning card yet (never one that may already have reached the host); compacts ledger rows older than 30 days into dedupe tombstones.",
       schedule: "*/5 * * * *",
     },
   ],

@@ -14,9 +14,19 @@ export function seenSql(ns: string): string {
   return `select fingerprint from ${ns}.wake_ledger where company_id = $1 and fingerprint = $2`;
 }
 
+/** Outcome of the attempt that holds the row. `attempts` counts sweep retries and is bumped only by reclaimSql. */
 export function recordOutcomeSql(ns: string): string {
-  return `update ${ns}.wake_ledger set outcome = $3, issue_id = $4, attempts = attempts + 1, updated_at = now()
+  return `update ${ns}.wake_ledger set outcome = $3, issue_id = $4, updated_at = now()
 where company_id = $1 and fingerprint = $2`;
+}
+
+/**
+ * A sweep takes a retry row only if nobody changed it since the select ($3 outcome, $4 updated_at as text):
+ * rowCount 1 means this sweep owns the retry, 0 means another sweep (or the webhook path) got there first.
+ */
+export function reclaimSql(ns: string): string {
+  return `update ${ns}.wake_ledger set outcome = 'retrying', attempts = attempts + 1, updated_at = now()
+where company_id = $1 and fingerprint = $2 and outcome = $3 and updated_at::text = $4`;
 }
 
 /** Phase marks: what a retry must not repeat (migrations/002_wake_phases.sql). */
@@ -30,43 +40,64 @@ export function markWakeAttemptedSql(ns: string): string {
 where company_id = $1 and fingerprint = $2`;
 }
 
-export const MAX_ATTEMPTS = 5;
+/**
+ * Undo the wake mark when requestWakeup provably never reached the host (the mark's own DB reply was lost before
+ * the call, or the host refused before dispatch), so the sweep may retry it instead of closing it unconfirmed.
+ */
+export function releaseWakeAttemptSql(ns: string): string {
+  return `update ${ns}.wake_ledger set wake_attempted_at = null, outcome = 'error', updated_at = now()
+where company_id = $1 and fingerprint = $2`;
+}
+
+/** Sweep retries per row after the first attempt (webhook or sweep). */
+export const MAX_RETRIES = 4;
 
 /**
- * Rows the sweep finishes: transient errors after 2 minutes, rows still at 'claimed' after 10 minutes (the worker
- * stopped between claim and outcome), and rows without a resolvable owning card yet (the doer's PR-link comment
- * often lands after a fast check) with a growing backoff of 5, 10, 15, 20 minutes. All bounded by MAX_ATTEMPTS.
+ * Rows the sweep finishes: transient errors after 2 minutes, rows still at 'claimed' or 'retrying' after 10 minutes
+ * (the worker stopped mid-attempt), and rows without a resolvable owning card yet (the doer's PR-link comment often
+ * lands after a fast check) with a growing backoff of 5, 10, 15, 20 minutes. All bounded by MAX_RETRIES; compacted
+ * tombstones (compactSql) are never retried. Each row is then taken with reclaimSql.
  */
 export function retryableSql(ns: string): string {
-  return `select fingerprint, signal::text as signal, issue_id::text as issue_id,
+  return `select fingerprint, outcome, updated_at::text as updated_at, signal::text as signal, issue_id::text as issue_id,
 comment_posted_at::text as comment_posted_at, wake_attempted_at::text as wake_attempted_at
 from ${ns}.wake_ledger
-where company_id = $1 and attempts < ${MAX_ATTEMPTS} and (
+where company_id = $1 and attempts < ${MAX_RETRIES} and signal <> '{}'::jsonb and (
 (outcome = 'error' and updated_at < now() - interval '2 minutes')
-or (outcome = 'claimed' and updated_at < now() - interval '10 minutes')
-or (outcome = 'no_card' and updated_at < now() - interval '5 minutes' * attempts))
+or (outcome in ('claimed', 'retrying') and updated_at < now() - interval '10 minutes')
+or (outcome = 'no_card' and updated_at < now() - interval '5 minutes' * (attempts + 1)))
 order by updated_at asc limit 20`;
 }
 
-export function pruneSql(ns: string): string {
-  return `delete from ${ns}.wake_ledger where updated_at < now() - interval '30 days'`;
+/**
+ * Retention: after 30 days a row keeps only its dedupe key and outcome (a tombstone of a few hundred bytes); the
+ * signal payload is dropped. Rows are never deleted: a still-open PR on the same head in the same state would
+ * otherwise wake again (for example a later default-branch push re-sweeping a conflict).
+ */
+export function compactSql(ns: string): string {
+  return `update ${ns}.wake_ledger set signal = '{}'::jsonb
+where updated_at < now() - interval '30 days' and signal <> '{}'::jsonb`;
 }
 
-/** The live card a `TOG-123-slug` head branch names. */
+/**
+ * The card a `TOG-123-slug` head branch names, whatever its status or assignee: ownership first, eligibility
+ * (status, assignee, blockers) is checked on the owner afterwards (waker.ts), so an ineligible owner holds the wake
+ * instead of handing it to another card.
+ */
 export const CARD_BY_IDENTIFIER_SQL = `select i.id, i.identifier, i.status, i.assignee_agent_id
 from public.issues i
-where i.company_id = $1 and i.identifier = $2 and i.status not in ('done', 'cancelled')
-and i.assignee_agent_id is not null and not (i.assignee_agent_id::text = any(string_to_array($3, ',')))
+where i.company_id = $1 and i.identifier = $2
 limit 1`;
 
 /**
- * The live card whose own assignee first posted this exact PR URL (the authoring card).
+ * The card whose own assignee first posted this exact PR URL (the authoring card), whatever its status. Comments by
+ * excluded agents (the Reviewer) and chat-channel cards never establish ownership.
  * Interim until plugins can read issue_work_products; see README "Card resolution".
  */
 export const CARD_BY_COMMENT_SQL = `select i.id, i.identifier, i.status, i.assignee_agent_id, min(c.created_at) as first_mention
 from public.issues i
 join public.issue_comments c on c.issue_id = i.id
-where i.company_id = $1 and i.status not in ('done', 'cancelled')
+where i.company_id = $1
 and i.assignee_agent_id is not null and not (i.assignee_agent_id::text = any(string_to_array($4, ',')))
 and i.origin_kind is distinct from 'chat_channel'
 and c.company_id = $1 and c.author_agent_id = i.assignee_agent_id and c.deleted_at is null

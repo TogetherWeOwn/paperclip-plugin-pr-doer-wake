@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../src/config.js";
-import { evaluate, fingerprint, isTrustedAuthor, mayAct, parseEvent, prStateFromGraph, reviewScore, verifySignature } from "../src/github.js";
+import { checkVerdict, evaluate, fingerprint, isTrustedAuthor, mayAct, parseEvent, policySkip, prStateFromGraph, reviewScore, verifySignature, type Signal } from "../src/github.js";
 
 const repository = { full_name: "TogetherWeOwn/two-web-next", default_branch: "main", owner: { login: "TogetherWeOwn" } };
 const config = parseConfig({ enabled: true, githubOrg: "TogetherWeOwn", webhookSecretRef: { type: "secret_ref", secretId: "x" }, githubTokenSecretRef: { type: "secret_ref", secretId: "y" } });
@@ -125,7 +125,8 @@ describe("pull_request and push", () => {
   });
   it("evaluate gates closed, superseded, untrusted, draft and no-longer-conflicting PRs", () => {
     const signal = { repo: "o/r", number: 7, head: HEAD, state: "ci_red" as const, url: "u", headRef: null, draft: null, trusted: null, detail: {} };
-    const entry = { repo: "o/r", number: 7, head: HEAD, headRef: "TOG-1-x", draft: false, url: "u", open: true, trusted: true, mergeable: "MERGEABLE" as const };
+    const red = [{ id: "CR_1", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-10-27T04:00:00Z" }];
+    const entry = { repo: "o/r", number: 7, head: HEAD, headRef: "TOG-1-x", draft: false, url: "u", open: true, trusted: true, mergeable: "MERGEABLE" as const, checkRuns: red };
     const conflict = { ...signal, state: "conflict" as const };
     expect(evaluate({ ...entry, mergeable: "CONFLICTING" }, conflict)).toMatchObject({ kind: "ok" });
     expect(evaluate(entry, conflict)).toMatchObject({ kind: "skip", outcome: "not_conflicting" });
@@ -135,6 +136,8 @@ describe("pull_request and push", () => {
     expect(evaluate({ ...entry, head: "f".repeat(40) }, signal)).toMatchObject({ kind: "skip", outcome: "stale_head" });
     expect(evaluate({ ...entry, trusted: false }, signal)).toMatchObject({ kind: "skip", outcome: "untrusted" });
     expect(evaluate({ ...entry, draft: true }, signal)).toMatchObject({ kind: "skip", outcome: "skipped_draft" });
+    const { checkRuns: _unread, ...unread } = entry;
+    expect(evaluate(unread, signal)).toMatchObject({ kind: "transient" }); // a check signal never wakes without its check read
   });
   it("signals a conflict when GitHub already reports mergeable_state dirty on a non-draft PR", () => {
     expect(parseEvent("pull_request", pr({ mergeable_state: "dirty" }), config).signals.map((s) => s.state)).toEqual(["conflict"]);
@@ -143,6 +146,54 @@ describe("pull_request and push", () => {
   it("marks a repo for the conflict sweep only when its default branch moves", () => {
     expect(parseEvent("push", { repository, ref: "refs/heads/main" }, config).sweepRepos).toEqual(["togetherweown/two-web-next"]);
     expect(parseEvent("push", { repository, ref: "refs/heads/TOG-1-x" }, config).sweepRepos).toEqual([]);
+  });
+});
+
+describe("checkVerdict (the failing check is revalidated)", () => {
+  const signal = (detail: Signal["detail"], state: Signal["state"] = "ci_red"): Signal => ({ repo: "o/r", number: 7, head: HEAD, state, url: "u", headRef: null, draft: null, trusted: null, detail: { checkName: "build", ...detail } });
+  const run = (id: string, conclusion: string | null, startedAt: string | null, status = "COMPLETED") => ({ id, status, conclusion, startedAt });
+  const mine = { checkRunId: "CR_100", checkStartedAt: "2026-10-27T04:00:00Z" };
+  it("still red when GitHub's newest run of the check is completed and red", () => {
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z")], signal(mine))).toBeNull();
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_101", "STARTUP_FAILURE", "2026-10-27T04:01:00Z")], signal(mine))).toBeNull();
+  });
+  it("stale when a newer run passed, is re-running, or the same run is no longer red", () => {
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_101", null, null, "QUEUED")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_100", "SUCCESS", "2026-10-27T04:00:00Z")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+  });
+  it("Paperclip Review is red only on FAILURE", () => {
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z")], signal(mine, "review_findings"))).toBeNull();
+    expect(checkVerdict([run("CR_100", "TIMED_OUT", "2026-10-27T04:00:00Z")], signal(mine, "review_findings"))).toMatchObject({ kind: "skip" });
+    expect(checkVerdict([run("CR_100", "ACTION_REQUIRED", "2026-10-27T04:00:00Z")], signal(mine, "review_findings"))).toMatchObject({ kind: "skip" });
+  });
+  it("transient when GitHub lists no run or only runs older than the delivered one", () => {
+    expect(checkVerdict(undefined, signal(mine))).toMatchObject({ kind: "transient" });
+    expect(checkVerdict([], signal(mine))).toMatchObject({ kind: "transient" });
+    expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal(mine))).toMatchObject({ kind: "transient" });
+    expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal({}))).toMatchObject({ kind: "skip" }); // old ledger row: no identity
+  });
+  it("parseEvent carries the delivered run's identity", () => {
+    const payload = checkRun("build", "failure");
+    (payload.check_run as any).node_id = "CR_100";
+    (payload.check_run as any).started_at = "2026-10-27T04:00:00Z";
+    expect(parseEvent("check_run", payload, config).signals[0]!.detail).toMatchObject({ checkRunId: "CR_100", checkStartedAt: "2026-10-27T04:00:00Z" });
+  });
+  it("prStateFromGraph reads runs only from the PR's head commit", () => {
+    const node = { number: 7, url: "u", state: "OPEN" as const, isDraft: false, isCrossRepository: false, authorAssociation: "MEMBER", author: { login: "doer" }, headRefOid: HEAD, headRefName: "x", baseRefName: "main", mergeable: "MERGEABLE" as const, updatedAt: "t" };
+    const commits = (oid: string) => ({ nodes: [{ commit: { oid, checkSuites: { nodes: [{ checkRuns: { nodes: [run("CR_1", "FAILURE", null)] } }, { checkRuns: { nodes: [run("CR_2", "SUCCESS", null)] } }] } } }] });
+    expect(prStateFromGraph("o/r", { ...node, commits: commits(HEAD) }, config).checkRuns?.map((r) => r.id)).toEqual(["CR_1", "CR_2"]);
+    expect(prStateFromGraph("o/r", { ...node, commits: commits("f".repeat(40)) }, config).checkRuns).toBeUndefined();
+    expect(prStateFromGraph("o/r", node, config).checkRuns).toBeUndefined();
+  });
+});
+
+describe("policySkip", () => {
+  it("re-applies stoppedRepos and wakeStates", () => {
+    expect(policySkip(parseConfig({ ...config, stoppedRepos: ["O/R"] }), { repo: "o/r", state: "ci_red" })).toBe("stopped_repo");
+    expect(policySkip(parseConfig({ ...config, wakeStates: ["conflict"] }), { repo: "o/r", state: "ci_red" })).toBe("skipped_state");
+    expect(policySkip(config, { repo: "o/r", state: "ci_red" })).toBeNull();
   });
 });
 

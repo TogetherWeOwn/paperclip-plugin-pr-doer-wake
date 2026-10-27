@@ -8,11 +8,13 @@ import {
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
   claimSql,
+  compactSql,
   markCommentPostedSql,
   markWakeAttemptedSql,
   prUrlPatterns,
-  pruneSql,
+  reclaimSql,
   recordOutcomeSql,
+  releaseWakeAttemptSql,
   retryableSql,
   seenSql,
 } from "../src/sql.js";
@@ -52,15 +54,32 @@ describe("host contract", () => {
     }
     expect(() => validatePluginRuntimeQuery(CARD_BY_COMMENT_SQL, DB_NAMESPACE, ["issues"])).toThrow(/issue_comments/);
   });
-  it("retries failed rows, rows stuck at claimed and card-pending rows with a growing backoff", () => {
+  it("retries failed rows, rows stuck at claimed or retrying and card-pending rows with a growing backoff", () => {
     const sql = retryableSql(DB_NAMESPACE);
     expect(sql).toMatch(/outcome = 'error'/);
-    expect(sql).toMatch(/outcome = 'claimed' and updated_at < now\(\) - interval '10 minutes'/);
-    expect(sql).toMatch(/outcome = 'no_card' and updated_at < now\(\) - interval '5 minutes' \* attempts/);
-    expect(sql).toMatch(/attempts < 5/);
+    expect(sql).toMatch(/outcome in \('claimed', 'retrying'\) and updated_at < now\(\) - interval '10 minutes'/);
+    expect(sql).toMatch(/outcome = 'no_card' and updated_at < now\(\) - interval '5 minutes' \* \(attempts \+ 1\)/);
+    expect(sql).toMatch(/attempts < 4/);
+    expect(sql).toMatch(/signal <> '\{\}'::jsonb/); // compacted tombstones are never retried
+    expect(sql).toMatch(/updated_at::text as updated_at/);
+  });
+  it("a retry re-claims its row with a conditional UPDATE on the selected outcome and updated_at", () => {
+    const sql = reclaimSql(DB_NAMESPACE);
+    expect(sql).toMatch(/set outcome = 'retrying', attempts = attempts \+ 1/);
+    expect(sql).toMatch(/where company_id = \$1 and fingerprint = \$2 and outcome = \$3 and updated_at::text = \$4/);
+  });
+  it("retention compacts aged rows into dedupe tombstones and never deletes them", () => {
+    const sql = compactSql(DB_NAMESPACE);
+    expect(sql).not.toMatch(/delete/i);
+    expect(sql).toMatch(/set signal = '\{\}'::jsonb/);
+    expect(sql).toMatch(/updated_at < now\(\) - interval '30 days'/);
+  });
+  it("ownership lookups do not filter on status or the card's eligibility", () => {
+    expect(CARD_BY_IDENTIFIER_SQL).not.toMatch(/status not in|assignee_agent_id is not null|string_to_array/);
+    expect(CARD_BY_COMMENT_SQL).not.toMatch(/status not in/);
   });
   it("runtime writes pass validatePluginRuntimeExecute", () => {
-    for (const q of [claimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), pruneSql(DB_NAMESPACE)]) {
+    for (const q of [claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeExecute(q, DB_NAMESPACE)).not.toThrow();
     }
   });

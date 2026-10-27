@@ -17,6 +17,19 @@ export interface PrState {
   /** Head branch in the base repo and a trusted author; see isTrustedAuthor. */
   trusted: boolean;
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  /**
+   * Runs of the signal's check on the PR's head commit as GitHub reports them now (LATEST per check suite).
+   * Undefined when not read (conflict signals); a check signal without it never wakes.
+   */
+  checkRuns?: CheckRunState[];
+}
+
+export interface CheckRunState {
+  /** GraphQL node id, the same value as the webhook's check_run.node_id. */
+  id: string;
+  status: string;
+  conclusion: string | null;
+  startedAt: string | null;
 }
 
 export interface Signal {
@@ -35,6 +48,10 @@ export interface Signal {
     checkName?: string;
     checkUrl?: string;
     conclusion?: string;
+    /** check_run.node_id of the delivered run: revalidation compares it with GitHub's current runs. */
+    checkRunId?: string;
+    /** check_run.started_at of the delivered run: tells a lagging GitHub read from a newer run. */
+    checkStartedAt?: string | null;
   };
 }
 
@@ -58,6 +75,8 @@ export const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"])
 
 /** Conclusions that mean the check really failed. cancelled/stale/skipped/neutral/action_required never wake. */
 export const RED_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure"]);
+/** The only Paperclip Review conclusion that is a finding (see parseEvent). */
+export const REVIEW_RED_CONCLUSIONS = new Set(["failure"]);
 
 /** pull_request actions whose payload may already report a merge conflict (`mergeable_state: dirty`). */
 export const CONFLICT_PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "ready_for_review", "edited"]);
@@ -108,22 +127,73 @@ export function isTrustedAuthor(config: DoerWakeConfig, association: unknown, lo
   return typeof login === "string" && config.trustedAuthors.includes(normalizeLogin(login));
 }
 
-export type SkipOutcome = "skipped_closed" | "stale_head" | "untrusted" | "skipped_draft" | "draft_unknown" | "not_conflicting";
+export type SkipOutcome =
+  | "skipped_closed"
+  | "stale_head"
+  | "untrusted"
+  | "skipped_draft"
+  | "draft_unknown"
+  | "not_conflicting"
+  | "check_not_red"
+  | "stopped_repo";
 
 export type PrCheck =
   | { kind: "ok"; signal: Signal }
   | { kind: "skip"; outcome: SkipOutcome; detail?: string }
   | { kind: "transient"; detail: string };
 
-/** May this signal wake, given the PR as GitHub reports it now? Closed, merged, re-pushed, untrusted and draft PRs never do. */
+/** Repo policy every path re-applies right before any effect: the config may have changed since the signal arrived. */
+export function policySkip(config: DoerWakeConfig, signal: Pick<Signal, "repo" | "state">): "stopped_repo" | "skipped_state" | null {
+  if (config.stoppedRepos.includes(signal.repo.toLowerCase())) return "stopped_repo";
+  if (!config.wakeStates.includes(signal.state)) return "skipped_state";
+  return null;
+}
+
+function startedMs(run: CheckRunState): number {
+  // A queued run has not started yet: it is the newest.
+  if (!run.startedAt) return Number.POSITIVE_INFINITY;
+  const ms = Date.parse(run.startedAt);
+  return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
+}
+
+/**
+ * Is the signal's check still red on this head? Webhooks arrive late and out of order and checks are re-run on the
+ * same head, so the delivered conclusion alone never wakes: GitHub's newest run of that check name must be completed
+ * and red. A newer passing, re-running or updated-to-passing run is stale; GitHub not listing the delivered run yet
+ * (its read lags the webhook) is transient.
+ */
+export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal): PrCheck | null {
+  if (!runs) return { kind: "transient", detail: "check runs not read" };
+  if (runs.length === 0) return { kind: "transient", detail: `no ${signal.detail.checkName ?? "check"} run visible on the head yet` };
+  const red = signal.state === "review_findings" ? REVIEW_RED_CONCLUSIONS : RED_CONCLUSIONS;
+  const latest = runs.reduce((a, b) => (startedMs(b) > startedMs(a) ? b : a));
+  if (latest.status === "COMPLETED" && red.has(String(latest.conclusion ?? "").toLowerCase())) return null; // still red
+  const delivered = signal.detail.checkRunId ? runs.find((r) => r.id === signal.detail.checkRunId) : undefined;
+  const deliveredStart = signal.detail.checkStartedAt ? Date.parse(signal.detail.checkStartedAt) : Number.NaN;
+  if (!delivered && !Number.isNaN(deliveredStart) && startedMs(latest) < deliveredStart) {
+    return { kind: "transient", detail: "GitHub does not list the failing run yet" };
+  }
+  const detail = latest.status === "COMPLETED" ? `latest run ${String(latest.conclusion).toLowerCase()}` : `latest run ${latest.status.toLowerCase()}`;
+  return { kind: "skip", outcome: "check_not_red", detail };
+}
+
+/**
+ * May this signal wake, given the PR as GitHub reports it now? Closed, merged, re-pushed, untrusted and draft PRs
+ * never do; nor does a check signal whose check is no longer red, or a conflict GitHub no longer reports.
+ */
 export function evaluate(pr: PrState, signal: Signal): PrCheck {
   if (!pr.open) return { kind: "skip", outcome: "skipped_closed" };
   if (pr.head !== signal.head) return { kind: "skip", outcome: "stale_head", detail: pr.head };
   if (!pr.trusted) return { kind: "skip", outcome: "untrusted" };
   if (pr.draft) return { kind: "skip", outcome: "skipped_draft" };
-  if (signal.state === "conflict" && pr.mergeable !== "CONFLICTING") {
-    // GitHub computes mergeability lazily: UNKNOWN is read again by the sweep.
-    return pr.mergeable === "UNKNOWN" ? { kind: "transient", detail: "mergeability not computed yet" } : { kind: "skip", outcome: "not_conflicting" };
+  if (signal.state === "conflict") {
+    if (pr.mergeable !== "CONFLICTING") {
+      // GitHub computes mergeability lazily: UNKNOWN is read again by the sweep.
+      return pr.mergeable === "UNKNOWN" ? { kind: "transient", detail: "mergeability not computed yet" } : { kind: "skip", outcome: "not_conflicting" };
+    }
+  } else {
+    const verdict = checkVerdict(pr.checkRuns, signal);
+    if (verdict) return verdict;
   }
   return { kind: "ok", signal: { ...signal, draft: false, trusted: true, headRef: pr.headRef ?? signal.headRef } };
 }
@@ -209,7 +279,14 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
         headRef: typeof pr.head?.ref === "string" ? pr.head.ref : null,
         draft: null,
         trusted: null,
-        detail: { score, checkName: name, checkUrl: String(run.html_url ?? run.details_url ?? ""), conclusion },
+        detail: {
+          score,
+          checkName: name,
+          checkUrl: String(run.html_url ?? run.details_url ?? ""),
+          conclusion,
+          ...(typeof run.node_id === "string" ? { checkRunId: run.node_id } : {}),
+          checkStartedAt: typeof run.started_at === "string" ? run.started_at : null,
+        },
       });
     }
     return out;
@@ -233,8 +310,19 @@ export const OPEN_PRS_QUERY = `query($o:String!,$r:String!,$base:String,$cursor:
 pullRequests(states:OPEN,first:50,after:$cursor,baseRefName:$base){pageInfo{hasNextPage endCursor}
 nodes{${PR_FIELDS}}}}}`;
 
+/** One PR, for conflict signals (mergeability is in PR_FIELDS). */
 export const ONE_PR_QUERY = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
 pullRequest(number:$n){${PR_FIELDS}}}}`;
+
+/**
+ * One PR plus the current runs of one check name on its head commit, in the same read, for check signals.
+ * GitHub GraphQL: Commit.checkSuites(filterBy: CheckSuiteFilter{checkName}), CheckSuite.checkRuns(filterBy:
+ * CheckRunFilter{checkName, checkType: LATEST}).
+ */
+export const ONE_PR_WITH_CHECK_QUERY = `query($o:String!,$r:String!,$n:Int!,$check:String!){repository(owner:$o,name:$r){
+pullRequest(number:$n){${PR_FIELDS}
+commits(last:1){nodes{commit{oid checkSuites(first:20,filterBy:{checkName:$check}){nodes{
+checkRuns(first:10,filterBy:{checkName:$check,checkType:LATEST}){nodes{id status conclusion startedAt}}}}}}}}}}`;
 
 export interface GraphPr {
   number: number;
@@ -249,10 +337,21 @@ export interface GraphPr {
   baseRefName: string;
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   updatedAt: string;
+  /** Only with ONE_PR_WITH_CHECK_QUERY. */
+  commits?: { nodes: Array<{ commit: { oid: string; checkSuites: { nodes: Array<{ checkRuns: { nodes: CheckRunState[] } }> } } }> };
+}
+
+/** The check runs ONE_PR_WITH_CHECK_QUERY read on the PR's head commit; undefined if not read or not the head. */
+function checkRunsFromGraph(pr: GraphPr): CheckRunState[] | undefined {
+  const commit = pr.commits?.nodes?.[0]?.commit;
+  if (!commit || commit.oid !== pr.headRefOid) return undefined;
+  return commit.checkSuites.nodes.flatMap((suite) => suite.checkRuns.nodes);
 }
 
 export function prStateFromGraph(repo: string, pr: GraphPr, config: DoerWakeConfig): PrState {
+  const checkRuns = checkRunsFromGraph(pr);
   return {
+    ...(checkRuns ? { checkRuns } : {}),
     repo,
     number: pr.number,
     head: pr.headRefOid,

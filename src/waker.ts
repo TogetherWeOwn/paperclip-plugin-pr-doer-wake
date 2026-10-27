@@ -1,7 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { DoerWakeConfig } from "./config.js";
 import { CONTEXT_SOURCE, DB_NAMESPACE } from "./constants.js";
-import { fingerprint, type Signal, type SkipOutcome } from "./github.js";
+import { fingerprint, policySkip, type Signal, type SkipOutcome } from "./github.js";
 import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
@@ -11,6 +11,7 @@ import {
   markWakeAttemptedSql,
   prUrlPatterns,
   recordOutcomeSql,
+  releaseWakeAttemptSql,
 } from "./sql.js";
 
 export interface CardRef {
@@ -59,6 +60,18 @@ const HOST_REFUSALS = [
   "paused",
 ];
 
+/**
+ * requestWakeup failures that prove the host never ran the handler, so nothing was queued and a retry is safe:
+ * WORKER_UNAVAILABLE (-32000) is answered before dispatch while the plugin is held for idle sleep
+ * (plugin-worker-manager.ts handleWorkerRequest), and the SDK refuses locally when its RPC host is not running
+ * (worker-rpc-host.js callHost). Everything else, timeouts included, may have been accepted.
+ */
+function provablyNotSent(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if ((error as { code?: unknown }).code === -32000) return true;
+  return /worker RPC host is not running/.test(error.message);
+}
+
 function namespace(ctx: PluginContext): string {
   return ctx.db.namespace || DB_NAMESPACE;
 }
@@ -66,8 +79,10 @@ function namespace(ctx: PluginContext): string {
 export type CardResolution = { kind: "card"; card: CardRef } | { kind: "none" } | { kind: "ambiguous"; detail: string };
 
 /**
- * The owning card from both interim paths (README "Card resolution"). When both find a card and they disagree,
- * the owner is unknown: the wake is held rather than sent to a card that may be unrelated.
+ * The owning card from both interim paths (README "Card resolution"), found without regard to status or assignee
+ * eligibility: an ineligible owner (done, handed to the Reviewer) must hold the wake, not pass it to another card.
+ * When both paths find a card and they disagree, the owner is unknown: the wake is held rather than sent to a card
+ * that may be unrelated. Eligibility is checked on the owner afterwards (wakeForSignal).
  */
 export async function resolveCard(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<CardResolution> {
   const exclude = config.excludeAgentIds.join(",");
@@ -76,7 +91,7 @@ export async function resolveCard(ctx: PluginContext, companyId: string, config:
   if (signal.headRef) {
     const match = new RegExp(config.branchIdentifierPattern).exec(signal.headRef);
     if (match?.[1]) {
-      const rows = await ctx.db.query<Row>(CARD_BY_IDENTIFIER_SQL, [companyId, match[1], exclude]);
+      const rows = await ctx.db.query<Row>(CARD_BY_IDENTIFIER_SQL, [companyId, match[1]]);
       if (rows[0]) byBranch = { id: rows[0].id, identifier: rows[0].identifier, status: rows[0].status, via: "branch" };
     }
   }
@@ -133,7 +148,8 @@ async function claim(ctx: PluginContext, companyId: string, fp: string, signal: 
  */
 export async function deferSignal(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal, detail: string): Promise<WakeResult> {
   const fp = fingerprint(signal);
-  if (!config.wakeStates.includes(signal.state)) return { fingerprint: fp, outcome: "skipped_state" };
+  const policy = policySkip(config, signal);
+  if (policy) return { fingerprint: fp, outcome: policy };
   if (!(await claim(ctx, companyId, fp, signal))) return { fingerprint: fp, outcome: "duplicate" };
   await recordOutcome(ctx, companyId, fp, "error", null);
   ctx.logger.warn("pr-doer-wake: PR state unavailable; the sweep job re-reads it", { fingerprint: fp, error: detail });
@@ -142,10 +158,11 @@ export async function deferSignal(ctx: PluginContext, companyId: string, config:
 
 /**
  * Wake the card that owns this PR at most once per (PR, head SHA, state).
- * Order: state filter -> draft/trust gate -> atomic ledger claim -> card -> eligibility and hold checks ->
- * evidence comment -> wake-attempt mark -> requestWakeup. requestWakeup stays the authority for terminal status,
- * blockers, assignee and budget. A retry (`opts.retry`) skips the claim and every phase the ledger says already
- * happened; once a wake was attempted it is never requested again (see markUnconfirmed).
+ * Order: repo policy (stoppedRepos, wakeStates) -> draft/trust gate -> atomic ledger claim -> owning card ->
+ * eligibility and hold checks -> evidence comment -> wake-attempt mark -> requestWakeup. requestWakeup stays the
+ * authority for terminal status, blockers, assignee and budget. A retry (`opts.retry`, already re-claimed by the
+ * sweep) skips the claim and every phase the ledger says already happened; once a wake may have reached the host it
+ * is never requested again (see markUnconfirmed). The mark is released only when the request provably never left.
  */
 export async function wakeForSignal(
   ctx: PluginContext,
@@ -156,7 +173,12 @@ export async function wakeForSignal(
 ): Promise<WakeResult> {
   const fp = fingerprint(signal);
   const retry = opts.retry;
-  if (!config.wakeStates.includes(signal.state)) return { fingerprint: fp, outcome: "skipped_state" };
+  // Final guard for every caller (webhook, conflict sweep, retries): the policy may have changed since the signal.
+  const policy = policySkip(config, signal);
+  if (policy) {
+    if (retry) await recordOutcome(ctx, companyId, fp, `stale:${policy}`, retry.issueId);
+    return { fingerprint: fp, outcome: policy };
+  }
   if (signal.trusted === false) return { fingerprint: fp, outcome: "untrusted" };
   if (signal.draft === true) return { fingerprint: fp, outcome: "skipped_draft" };
   if (signal.draft === null) return { fingerprint: fp, outcome: "draft_unknown" };
@@ -214,7 +236,14 @@ export async function wakeForSignal(
       await ctx.db.execute(markCommentPostedSql(ns), [companyId, fp, card.id]);
     }
     const reason = `github_pr_${signal.state}`;
-    await ctx.db.execute(markWakeAttemptedSql(ns), [companyId, fp, card.id]);
+    try {
+      await ctx.db.execute(markWakeAttemptedSql(ns), [companyId, fp, card.id]);
+    } catch (error) {
+      // The mark may have committed with its reply lost, but requestWakeup was not called: undo it so the sweep
+      // retries instead of closing the row as wake_unconfirmed with zero wakes.
+      await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp]).catch(() => undefined);
+      throw error;
+    }
     try {
       const result = await ctx.issues.requestWakeup(card.id, companyId, {
         reason,
@@ -228,6 +257,11 @@ export async function wakeForSignal(
       if (HOST_REFUSALS.some((m) => message.includes(m))) {
         await recordOutcome(ctx, companyId, fp, `refused:${message.slice(0, 120)}`, card.id);
         return { fingerprint: fp, outcome: "refused", card: card.identifier, detail: message };
+      }
+      if (provablyNotSent(error)) {
+        await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp]);
+        ctx.logger.warn("pr-doer-wake: wake request never reached the host; the sweep job retries it", { fingerprint: fp, error: message });
+        return { fingerprint: fp, outcome: "error", card: card.identifier, detail: message };
       }
       return { ...(await markUnconfirmed(ctx, companyId, fp, card.id, message)), card: card.identifier };
     }
