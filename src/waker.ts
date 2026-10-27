@@ -288,6 +288,8 @@ export async function wakeForSignal(
     if (!issue.assigneeAgentId || config.excludeAgentIds.includes(issue.assigneeAgentId)) {
       return await decide("no_card", card.id, { fingerprint: fp, outcome: "no_card", card: card.identifier, detail: "assignee not eligible" });
     }
+    // Holds on the card are never final for the fingerprint: no wake was requested, so a later genuine signal on the
+    // same head and state resumes the row (plugin.ts resumable) and wakes once the card is eligible. Not polled.
     const status = issue.status;
     if (["backlog", "done", "cancelled"].includes(status) || (config.skipBlockedStatus && status === "blocked")) {
       return await decide(`held_status:${status}`, card.id, { fingerprint: fp, outcome: "held_status", card: card.identifier, detail: status });
@@ -318,7 +320,7 @@ export async function wakeForSignal(
     } catch (error) {
       // The mark may have committed with its reply lost, but requestWakeup was not called: undo it so the sweep
       // retries instead of closing the row as wake_unconfirmed with zero wakes.
-      await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp, mark]).catch(() => undefined);
+      await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp, mark, "error"]).catch(() => undefined);
       throw error;
     }
     // Another attempt took this row while this one stalled (it requested the wake, held it or forgot it), or a wake
@@ -336,10 +338,13 @@ export async function wakeForSignal(
       const message = error instanceof Error ? error.message : String(error);
       const refusal = hostRefusal(message);
       if (refusal && !refusal.retry) {
-        return { ...(await decide(`refused:${message.slice(0, 120)}`, card.id, { fingerprint: fp, outcome: "refused", detail: message })), card: card.identifier };
+        // Nothing was queued: the mark is released, so a later genuine signal may wake once the cause is gone
+        // (blockers cleared, agent resumed); the sweep does not poll it.
+        const released = await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp, mark, `refused:${message.slice(0, 120)}`]);
+        return released.rowCount === 1 ? { fingerprint: fp, outcome: "refused", card: card.identifier, detail: message } : superseded(card);
       }
       if (refusal || provablyNotSent(error)) {
-        await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp, mark]);
+        await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp, mark, "error"]);
         ctx.logger.warn("pr-doer-wake: wake request not queued by the host; the sweep job retries it", { fingerprint: fp, error: message });
         return { fingerprint: fp, outcome: "deferred", card: card.identifier, detail: message };
       }

@@ -42,7 +42,7 @@ type LedgerRow = {
   createdAt?: string;
 };
 /** A check run as GitHub GraphQL reports it on the PR's head commit. */
-type CheckRun = { id: string; name: string; status: string; conclusion: string | null; startedAt: string | null; url?: string };
+type CheckRun = { id: string; name: string; status: string; conclusion: string | null; startedAt: string | null; url?: string; /** Check suite node id (default CS_1). */ suite?: string };
 type Graph = {
   mergeable: string; isDraft: boolean; state?: string; head?: string; cross?: boolean; association?: string; login?: string; ref?: string; updatedAt?: string;
   /** Runs GitHub reports on the head commit; default: the delivered failing runs (RUN_ID) of build and Paperclip Review are still the latest. */
@@ -71,6 +71,7 @@ let onRetrySelect: (() => void) | null; // runs after the retry select returned 
 let fetchGate: Promise<void> | null; // holds every GitHub call until opened
 let onSeenSelect: (() => Promise<void>) | null; // runs once after a delivery's pre-check read its ledger row
 let githubBody: unknown; // when set, GitHub GraphQL answers exactly this body (HTTP 200)
+let pageSize: number; // GitHub's page size for check suites and check runs (the queries ask for 100)
 
 /** The doer's PR-link comment body for PR `n`. */
 const link = (n = 1903) => `PR: https://github.com/TogetherWeOwn/two-web-next/pull/${n}`;
@@ -162,6 +163,7 @@ function setup(config: Record<string, unknown> = {}) {
   fetchGate = null;
   onSeenSelect = null;
   githubBody = undefined;
+  pageSize = 100;
   const touch = () => `2026-10-27 05:00:00.${String(++tick).padStart(6, "0")}+00`;
   /** claimFence: the row still carries the attempt's claim (created_at, attempts). */
   const holds = (row: LedgerRow, createdAt: unknown, attempts: unknown) => row.createdAt === createdAt && row.attempts === attempts;
@@ -220,7 +222,7 @@ function setup(config: Record<string, unknown> = {}) {
     if (sql === releaseWakeAttemptSql(DB_NAMESPACE)) {
       const row = ledger.get(key);
       if (!row || row.wakeAttemptedAt !== params[2]) return { rowCount: 0 }; // only this attempt's own mark
-      Object.assign(row, { wakeAttemptedAt: null, outcome: "error", updatedAt: touch() });
+      Object.assign(row, { wakeAttemptedAt: null, outcome: String(params[3]), updatedAt: touch() });
       return { rowCount: 1 };
     }
     if (sql === compactSql(DB_NAMESPACE)) {
@@ -272,14 +274,29 @@ function setup(config: Record<string, unknown> = {}) {
     if (githubBody !== undefined) return new Response(JSON.stringify(githubBody), { status: 200 });
     const variables = JSON.parse(init?.body ?? "{}").variables ?? {};
     const n = Number(variables.n ?? 1903);
-    const runs = graph?.checks ?? [redRun(), redRun("FAILURE", "Paperclip Review")];
+    const runs = (graph?.checks ?? [redRun(), redRun("FAILURE", "Paperclip Review")]).map((r) => ({ url: `https://github.com/x/runs/${r.id}`, ...r }));
     const query = String(JSON.parse(init?.body ?? "{}").query ?? "");
+    // Connections paged like GitHub's: `pageSize` nodes per page, the cursor is the next offset.
+    const paged = <T>(all: T[], cursor: unknown) => {
+      const from = cursor ? Number(cursor) : 0;
+      return { pageInfo: { hasNextPage: from + pageSize < all.length, endCursor: String(from + pageSize) }, nodes: all.slice(from, from + pageSize) };
+    };
+    const runsPage = (suite: unknown, cursor: unknown) => {
+      const { pageInfo, nodes } = paged(runs.filter((r) => (r.suite ?? "CS_1") === suite), cursor);
+      return { pageInfo, nodes: nodes.map(({ suite: _suite, ...r }) => r) };
+    };
+    const suitesPage = (cursor: unknown) => {
+      const { pageInfo, nodes } = paged([...new Set(runs.map((r) => r.suite ?? "CS_1"))], cursor);
+      return { pageInfo, nodes: nodes.map((id) => ({ id, checkRuns: runsPage(id, null) })) };
+    };
+    if (query.includes("node(id:")) return new Response(JSON.stringify({ data: { node: { checkRuns: runsPage(variables.id, variables.runs) } } }), { status: 200 });
+    if (query.includes("object(oid:")) return new Response(JSON.stringify({ data: { repository: { object: { checkSuites: suitesPage(variables.suites) } } } }), { status: 200 });
     const nodes = graph ? [{
       number: n, url: `https://github.com/TogetherWeOwn/two-web-next/pull/${n}`, state: graph.state ?? "OPEN", isDraft: graph.isDraft,
       isCrossRepository: graph.cross ?? false, authorAssociation: graph.association ?? "MEMBER", author: { login: graph.login ?? "doer" },
       headRefOid: graph.head ?? HEAD, headRefName: graph.ref ?? "feat/quality", baseRefName: "main", mergeable: graph.mergeable, updatedAt: graph.updatedAt ?? new Date().toISOString(),
       ...(query.includes("checkSuites")
-        ? { commits: { nodes: [{ commit: { oid: graph.head ?? HEAD, checkSuites: { nodes: [{ checkRuns: { nodes: runs.map((r) => ({ url: `https://github.com/x/runs/${r.id}`, ...r })) } }] } } }] } }
+        ? { commits: { nodes: [{ commit: { oid: graph.head ?? HEAD, checkSuites: suitesPage(null) } }] } }
         : {}),
     }] : [];
     const data = { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes }, pullRequest: nodes[0] ?? null } };
@@ -1206,7 +1223,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toEqual([]);
     expect(row()!.outcome).toBe("error");
     const errors = harness.logs.filter((l) => l.level === "error");
-    expect(errors.map((l) => l.message)).toEqual([expect.stringMatching(/GitHub token lacks a permission/)]);
+    expect(errors.map((l) => l.message)).toEqual([expect.stringMatching(/GitHub token cannot see the repository or lacks a permission/)]);
     expect(JSON.stringify(errors[0]!.meta)).toMatch(/checkSuites/);
     graph = { mergeable: "MERGEABLE", isDraft: false }; // token fixed
     await harness.runJob(SWEEP_JOB_KEY);
@@ -1420,7 +1437,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     });
   });
 
-  describe("GitHub NOT_FOUND means the repository or PR is gone (missing is closed)", () => {
+  describe("GitHub NOT_FOUND: a PR gone from a visible repo is closed; a repository the token cannot see is a config error", () => {
     const repoGone = {
       data: { repository: null },
       errors: [{ type: "NOT_FOUND", path: ["repository"], locations: [{ line: 1, column: 63 }], message: "Could not resolve to a Repository with the name 'TogetherWeOwn/two-web-next'." }],
@@ -1430,7 +1447,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       errors: [{ type: "NOT_FOUND", path: ["repository", "pullRequest"], locations: [{ line: 2, column: 1 }], message: "Could not resolve to a PullRequest with the number of 1903." }],
     };
 
-    for (const [label, body] of [["repository", repoGone], ["pull request", prGone]] as const) {
+    for (const [label, body] of [["pull request", prGone]] as const) {
       it(`a pending row whose ${label} no longer exists is forgotten, not re-read forever`, async () => {
         graphFail = true;
         await deliver("check_run", ciFailed("build"));
@@ -1453,14 +1470,42 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       });
     }
 
-    it("a conflict sweep mark for a deleted repository is dropped after one read", async () => {
+    const tokenErrors = () => harness.logs.filter((l) => l.level === "error" && /GitHub token cannot see the repository or lacks a permission/.test(l.message));
+
+    it("a delivery for a repository the token cannot see is kept as a config error and wakes once the token can see it", async () => {
+      githubBody = repoGone;
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+      expect(tokenErrors()).toHaveLength(1);
+      expect(JSON.stringify(tokenErrors()[0]!.meta)).toMatch(/NOT_FOUND/);
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(row()!.outcome).toBe("error"); // retried with backoff (hourly at most), never treated as closed
+      githubBody = undefined; // token fixed
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a pending row whose repository the token cannot see is kept, not forgotten", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      graphFail = false;
+      githubBody = repoGone;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(row()!.outcome).toBe("error");
+      githubBody = undefined;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a conflict sweep mark for a repository the token cannot see is kept and finished once it can", async () => {
       await deliver("push", { ref: "refs/heads/main" });
       githubBody = repoGone;
       await harness.runJob(SWEEP_JOB_KEY);
-      const calls = graphCalls;
+      expect(tokenErrors()).toHaveLength(1);
+      githubBody = undefined;
+      graph = { mergeable: "CONFLICTING", isDraft: false };
       await harness.runJob(SWEEP_JOB_KEY);
-      expect(graphCalls).toBe(calls);
-      expect(harness.logs.filter((l) => l.message === "pr-doer-wake: conflict sweep failed")).toHaveLength(0);
+      expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
     });
 
     it("any other GraphQL error stays transient: the signal is kept", async () => {
@@ -1550,6 +1595,97 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       row()!.signal = "{}";
       await deliver("check_run", ciFailed("build"));
       expect(wakes).toHaveLength(1);
+    });
+  });
+
+  // --- review round 5 (2026-10-27) ---------------------------------------------------------------------------------
+
+  describe("a hold on the card never burns the fingerprint", () => {
+    const rerun = { nodeId: "CR_kwDOrun101", startedAt: "2026-10-27T04:05:00Z" };
+    const rerunRed: CheckRun = { id: rerun.nodeId, name: "build", status: "COMPLETED", conclusion: "FAILURE", startedAt: rerun.startedAt };
+    /** The card blocked by BLOCKER, whose status decides whether the blocker is resolved (harness relations). */
+    const blockedBy = (status: string) => harness.seed({
+      issues: [issue(BLOCKER, "TOG-1", status), issue(CARD, "TOG-43084", "in_review", { blockedBy: [{ id: BLOCKER, identifier: "TOG-1", status }] })],
+    });
+
+    it("after the blocker clears, a genuinely new failing run on the same head wakes once", async () => {
+      blockedBy("in_progress");
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!.outcome).toBe("held_blockers");
+      const calls = graphCalls;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(graphCalls).toBe(calls); // a hold is not polled: only a later genuine signal resumes it
+      blockedBy("done");
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [rerunRed] };
+      await deliver("check_run", ciFailed("build", "failure", HEAD, 1903, rerun));
+      expect(wakes).toHaveLength(1);
+      expect(row()!.outcome).toMatch(/^woken:/);
+      await deliver("check_run", ciFailed("build", "failure", HEAD, 1903, rerun));
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(hostWakeCalls).toBe(1);
+    });
+
+    it("a later signal while the card is still blocked is held again, without a wake or a comment", async () => {
+      blockedBy("in_progress");
+      await deliver("check_run", ciFailed("build"));
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [rerunRed] };
+      await deliver("check_run", ciFailed("build", "failure", HEAD, 1903, rerun));
+      expect(row()!.outcome).toBe("held_blockers");
+      expect(wakes).toEqual([]);
+      expect(comments).toEqual([]);
+    });
+
+    it("a card in blocked status (skipBlockedStatus) wakes on a later genuine signal once it is unblocked", async () => {
+      harness.seed({ issues: [issue(CARD, "TOG-43084", "blocked")] });
+      await deliver("check_run", reviewFailed());
+      expect(row(1903, "review_findings")!.outcome).toBe("held_status:blocked");
+      harness.seed({ issues: [issue(CARD, "TOG-43084", "in_progress")] });
+      await deliver("check_run", reviewFailed());
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a host refusal for blockers (nothing queued) does not stop a later genuine signal once they clear", async () => {
+      const ctx = harness.ctx as any;
+      const original = ctx.issues.requestWakeup;
+      ctx.issues.requestWakeup = vi.fn(async () => {
+        hostWakeCalls += 1;
+        ctx.issues.requestWakeup = original;
+        throw Object.assign(new Error("Issue is blocked by unresolved blockers"), { name: "JsonRpcCallError", code: -32603 });
+      });
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!).toMatchObject({ outcome: "refused:Issue is blocked by unresolved blockers", wakeAttemptedAt: null });
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(hostWakeCalls).toBe(1); // not polled
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [rerunRed] };
+      await deliver("check_run", ciFailed("build", "failure", HEAD, 1903, rerun));
+      expect(wakes).toHaveLength(1);
+      expect(hostWakeCalls).toBe(2);
+      expect(comments).toHaveLength(1); // the evidence comment of the refused attempt is not repeated
+    });
+  });
+
+  describe("check runs keep their suite and are read completely", () => {
+    it("a passing run of the same name in an independent check suite never hides a genuine failure", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun(), { id: "CR_kwDOother", name: "build", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-10-27T04:05:00Z", suite: "CS_2" }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a newer passing run of the same name in the same suite still supersedes the failure", async () => {
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun(), { id: "CR_kwDOrerun", name: "build", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-10-27T04:05:00Z" }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toEqual([]);
+      expect(ledger.size).toBe(0);
+    });
+
+    it("the delivered run is found however many suites and runs the head commit has", async () => {
+      pageSize = 2;
+      const green = (suite: string, n: number): CheckRun[] =>
+        Array.from({ length: n }, (_, i) => ({ id: `CR_${suite}_${i}`, name: `lint-${suite}-${i}`, status: "COMPLETED", conclusion: "SUCCESS", startedAt: RUN_STARTED, suite }));
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [...green("CS_1", 2), ...green("CS_2", 2), ...green("CS_3", 3), { ...redRun(), suite: "CS_3" }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toHaveLength(1);
+      expect(ledger.size).toBe(1);
     });
   });
 });

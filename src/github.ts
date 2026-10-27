@@ -18,7 +18,7 @@ export interface PrState {
   trusted: boolean;
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   /**
-   * Check runs on the PR's head commit as GitHub reports them now (LATEST per check suite).
+   * Every check run on the PR's head commit as GitHub reports it now (LATEST per check suite, all pages).
    * Undefined when not read (conflict signals); a check signal without it never wakes.
    */
   checkRuns?: CheckRunState[];
@@ -32,6 +32,8 @@ export interface CheckRunState {
   conclusion: string | null;
   startedAt: string | null;
   url?: string | null;
+  /** Node id of the run's check suite: a run supersedes only runs of the same name in the same suite. */
+  suite?: string;
 }
 
 export interface Signal {
@@ -161,8 +163,10 @@ function startedMs(run: CheckRunState): number {
 export type CheckVerdict = { kind: "red"; run: CheckRunState } | Exclude<PrCheck, { kind: "ok" }>;
 
 /**
- * Is the signal's state still red on this head, by GitHub's newest run of each relevant check name? Webhooks arrive
- * late and out of order and checks are re-run on the same head, so a delivered conclusion alone never wakes.
+ * Is the signal's state still red on this head, by GitHub's newest run of each relevant check name in each check
+ * suite? Webhooks arrive late and out of order and checks are re-run on the same head, so a delivered conclusion
+ * alone never wakes. A re-run supersedes a run only within its own suite: an independent suite (another app or
+ * workflow) exposing the same name never hides a genuine failure.
  * Relevant: for review_findings the review check only; for ci_red every gating check (isGatingCheck, never the
  * review), because the state is per head: when the delivered check recovered but another gating check is red, the
  * signal is still red and that check is the evidence (no pending evidence has to be kept in the ledger).
@@ -175,11 +179,12 @@ export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal, 
   const own = signal.detail.checkName ?? (review ? config.reviewCheckName : undefined);
   const relevant = (name: string) => (review ? name === own : name !== config.reviewCheckName && isGatingCheck(config, signal.repo, name));
   const red = review ? REVIEW_RED_CONCLUSIONS : RED_CONCLUSIONS;
-  const latest = new Map<string, CheckRunState>();
+  const latest = new Map<string, CheckRunState>(); // per (suite, name)
   for (const run of runs) {
     if (!relevant(run.name)) continue;
-    const seen = latest.get(run.name);
-    if (!seen || startedMs(run) > startedMs(seen)) latest.set(run.name, run);
+    const key = `${run.suite ?? ""}\n${run.name}`;
+    const seen = latest.get(key);
+    if (!seen || startedMs(run) > startedMs(seen)) latest.set(key, run);
   }
   const redNow = [...latest.values()]
     .filter((r) => r.status === "COMPLETED" && red.has(String(r.conclusion ?? "").toLowerCase()))
@@ -195,7 +200,7 @@ export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal, 
   if (!delivered && (ownRuns.length === 0 || (!Number.isNaN(deliveredStart) && newestOwn < deliveredStart))) {
     return { kind: "transient", detail: `GitHub does not list the failing ${own ?? "check"} run yet` };
   }
-  const mine = own ? latest.get(own) : undefined;
+  const mine = [...latest.values()].filter((r) => r.name === own).sort((a, b) => startedMs(b) - startedMs(a))[0];
   const detail = mine ? `latest ${own} run ${(mine.status === "COMPLETED" ? String(mine.conclusion) : mine.status).toLowerCase()}` : "no gating check red";
   return { kind: "skip", outcome: "check_not_red", detail };
 }
@@ -350,16 +355,30 @@ nodes{${PR_FIELDS}}}}}`;
 export const ONE_PR_QUERY = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
 pullRequest(number:$n){${PR_FIELDS}}}}`;
 
+const RUNS = "checkRuns(first:100,after:$runs,filterBy:{checkType:LATEST}){pageInfo{hasNextPage endCursor} nodes{id name status conclusion startedAt url}}";
+const SUITES = `checkSuites(first:100,after:$suites){pageInfo{hasNextPage endCursor} nodes{id ${RUNS}}}`;
+
 /**
- * One PR plus the latest check runs on its head commit, in the same read, for check signals (checkVerdict filters
- * the relevant names). GitHub GraphQL: Commit.checkSuites, CheckSuite.checkRuns(filterBy: CheckRunFilter{checkType:
- * LATEST}). Reading check suites needs the Checks read permission, which fine-grained personal access tokens cannot
- * get (README "GitHub token").
+ * One PR plus the first page of check suites and runs on its head commit, in the same read, for check signals
+ * (checkVerdict filters the relevant names; plugin.ts headCheckRuns reads the remaining pages with the two queries
+ * below). GitHub GraphQL: Commit.checkSuites, CheckSuite.checkRuns(filterBy: CheckRunFilter{checkType: LATEST}).
+ * Reading check suites needs the Checks read permission, which fine-grained personal access tokens cannot get
+ * (README "GitHub token").
  */
-export const ONE_PR_WITH_CHECKS_QUERY = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
+export const ONE_PR_WITH_CHECKS_QUERY = `query($o:String!,$r:String!,$n:Int!,$suites:String,$runs:String){repository(owner:$o,name:$r){
 pullRequest(number:$n){${PR_FIELDS}
-commits(last:1){nodes{commit{oid checkSuites(first:50){nodes{
-checkRuns(first:100,filterBy:{checkType:LATEST}){nodes{id name status conclusion startedAt url}}}}}}}}}}`;
+commits(last:1){nodes{commit{oid ${SUITES}}}}}}}`;
+
+/** The next page of check suites on a commit (the head the first read saw). */
+export const HEAD_SUITES_QUERY = `query($o:String!,$r:String!,$oid:GitObjectID!,$suites:String,$runs:String){repository(owner:$o,name:$r){
+object(oid:$oid){... on Commit{${SUITES}}}}}`;
+
+/** The next page of check runs in one check suite. */
+export const SUITE_RUNS_QUERY = `query($id:ID!,$runs:String){node(id:$id){... on CheckSuite{${RUNS}}}}`;
+
+type Page<T> = { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: T[] };
+export type GraphRuns = Page<Omit<CheckRunState, "suite">>;
+export type GraphSuites = Page<{ id: string; checkRuns: GraphRuns }>;
 
 export interface GraphPr {
   number: number;
@@ -375,18 +394,17 @@ export interface GraphPr {
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   updatedAt: string;
   /** Only with ONE_PR_WITH_CHECKS_QUERY. */
-  commits?: { nodes: Array<{ commit: { oid: string; checkSuites: { nodes: Array<{ checkRuns: { nodes: CheckRunState[] } }> } } }> };
+  commits?: { nodes: Array<{ commit: { oid: string; checkSuites: GraphSuites } }> };
 }
 
-/** The check runs ONE_PR_WITH_CHECKS_QUERY read on the PR's head commit; undefined if not read or not the head. */
-function checkRunsFromGraph(pr: GraphPr): CheckRunState[] | undefined {
+/** The commit ONE_PR_WITH_CHECKS_QUERY read, if it is the PR's head; its check runs are then authoritative. */
+export function headCommit(pr: GraphPr): { oid: string; checkSuites: GraphSuites } | undefined {
   const commit = pr.commits?.nodes?.[0]?.commit;
-  if (!commit || commit.oid !== pr.headRefOid) return undefined;
-  return commit.checkSuites.nodes.flatMap((suite) => suite.checkRuns.nodes);
+  return commit && commit.oid === pr.headRefOid ? commit : undefined;
 }
 
-export function prStateFromGraph(repo: string, pr: GraphPr, config: DoerWakeConfig): PrState {
-  const checkRuns = checkRunsFromGraph(pr);
+/** `checkRuns`: every run on the head commit (plugin.ts headCheckRuns); omitted when not read. */
+export function prStateFromGraph(repo: string, pr: GraphPr, config: DoerWakeConfig, checkRuns?: CheckRunState[]): PrState {
   return {
     ...(checkRuns ? { checkRuns } : {}),
     repo,

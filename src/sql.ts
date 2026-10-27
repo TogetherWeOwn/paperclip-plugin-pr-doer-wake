@@ -85,11 +85,12 @@ where company_id = $1 and fingerprint = $2 and wake_attempted_at is null and ${c
 
 /**
  * Undo this attempt's own wake mark ($3, the value it set) when requestWakeup provably never reached the host (the
- * mark's own DB reply was lost before the call, or the host refused before dispatch), so the sweep may retry it
- * instead of closing it unconfirmed. Never clears another attempt's mark.
+ * mark's own DB reply was lost before the call, or the host refused before queueing anything) and record $4: `error`
+ * for the sweep to retry, or `refused:<message>`, which only a later genuine signal resumes (plugin.ts resumable).
+ * Never clears another attempt's mark.
  */
 export function releaseWakeAttemptSql(ns: string): string {
-  return `update ${ns}.wake_ledger set wake_attempted_at = null, outcome = 'error', updated_at = now()
+  return `update ${ns}.wake_ledger set wake_attempted_at = null, outcome = $4, updated_at = now()
 where company_id = $1 and fingerprint = $2 and wake_attempted_at = $3::timestamptz`;
 }
 
@@ -124,8 +125,11 @@ where company_id = $1 and fingerprint = $2 and wake_attempted_at is null and upd
 }
 
 /**
- * Outcomes that settle a row for good (the part before any `:`). Every other row is pending (claimed, retrying,
- * error, no_card, an earlier build's stale:<reason>) and still needs its signal.
+ * Outcomes the sweep never retries (the part before any `:`), so their signal payload is not needed: a woken or
+ * possibly woken row (woken, wake_unconfirmed), a fail-closed decision (ambiguous_card, shadow), and a never-woken
+ * hold on the card (held_status, held_blockers, refused), which only a later genuine signal resumes, with its own
+ * payload (plugin.ts resumable). Every other row is pending (claimed, retrying, error, no_card, an earlier build's
+ * stale:<reason>) and still needs its signal.
  */
 export const SETTLED_OUTCOMES = ["woken", "wake_unconfirmed", "refused", "held_status", "held_blockers", "ambiguous_card", "shadow"] as const;
 

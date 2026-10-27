@@ -4,6 +4,8 @@ import { DB_NAMESPACE, SWEEP_JOB_KEY, WEBHOOK_KEY } from "./constants.js";
 import {
   evaluate,
   fingerprint,
+  HEAD_SUITES_QUERY,
+  headCommit,
   ONE_PR_QUERY,
   ONE_PR_WITH_CHECKS_QUERY,
   OPEN_PRS_QUERY,
@@ -14,8 +16,12 @@ import {
   prStateFromGraph,
   SIGNATURE_RE,
   SUBSCRIBED_EVENTS,
+  SUITE_RUNS_QUERY,
   verifySignature,
+  type CheckRunState,
   type GraphPr,
+  type GraphRuns,
+  type GraphSuites,
   type PrCheck,
   type Signal,
 } from "./github.js";
@@ -96,14 +102,24 @@ export const TOKEN_PERMISSIONS =
 
 type GraphqlError = { type?: string; message?: string; path?: unknown[] };
 
+function pathOf(e: GraphqlError): string {
+  return Array.isArray(e?.path) ? e.path.join(".") : "";
+}
+
 /**
- * GitHub's answer for a repository or PR that does not exist (deleted, transferred, or invisible to the token):
- * `data.repository: null` or `pullRequest: null` beside a NOT_FOUND error on exactly that path. That is data, not a
- * failure: the caller's null branch closes it (missing is closed), instead of re-reading it forever.
+ * GitHub's answer for a PR that does not exist in a repository the token can see (deleted or transferred PR):
+ * `pullRequest: null` beside a NOT_FOUND error on exactly that path. That is data, not a failure: the caller's null
+ * branch closes it (missing is closed), instead of re-reading it forever. NOT_FOUND on `repository` is not: GitHub
+ * answers it the same for a private repo the token cannot see, so it is a config error (see githubGraphql).
  */
-function isMissing(e: GraphqlError): boolean {
-  const path = Array.isArray(e?.path) ? e.path.join(".") : "";
-  return e?.type === "NOT_FOUND" && (path === "repository" || path === "repository.pullRequest");
+function isMissingPr(e: GraphqlError): boolean {
+  return e?.type === "NOT_FOUND" && pathOf(e) === "repository.pullRequest";
+}
+
+/** A field or repository the token may not read: FORBIDDEN, INSUFFICIENT_SCOPES, or NOT_FOUND on `repository`. */
+function isDenied(e: GraphqlError): boolean {
+  return e?.type === "FORBIDDEN" || e?.type === "INSUFFICIENT_SCOPES" || /not accessible by/i.test(String(e?.message ?? ""))
+    || (e?.type === "NOT_FOUND" && pathOf(e) === "repository");
 }
 
 async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: DoerWakeConfig, query: string, variables: Record<string, unknown>): Promise<T | null> {
@@ -119,21 +135,20 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
   if (!response.ok) throw new Error(`GitHub GraphQL HTTP ${response.status}`);
   const body = (await response.json()) as { data?: T; errors?: GraphqlError[] };
   if (body.errors) {
-    // A field the token may not read comes back as a partial error beside partial data: a config error, never
-    // read as "PR closed" or "check not red". The signal stays retryable and wakes once the token is fixed.
-    const denied = (Array.isArray(body.errors) ? body.errors : []).filter(
-      (e) => e?.type === "FORBIDDEN" || e?.type === "INSUFFICIENT_SCOPES" || /not accessible by/i.test(String(e?.message ?? "")),
-    );
-    if (denied.length > 0) {
-      const paths = denied.map((e) => (Array.isArray(e.path) ? e.path.join(".") : "?"));
-      ctx.logger.error("pr-doer-wake: GitHub token lacks a permission (config error); the signal is kept and retried", {
-        companyId, paths, types: denied.map((e) => e.type ?? null), needs: TOKEN_PERMISSIONS,
-      });
-      throw new Error(`GitHub token lacks a permission for ${paths.join(", ")}`);
-    }
     const errors = Array.isArray(body.errors) ? body.errors : [];
-    if (errors.length > 0 && errors.every(isMissing)) {
-      ctx.logger.warn("pr-doer-wake: GitHub says the repository or pull request does not exist (or the token cannot see it); treated as closed", {
+    // A field or repository the token may not read comes back as a partial error beside partial data: a config
+    // error, never read as "PR closed" or "check not red". The signal stays retryable (backoff, hourly at most) and
+    // wakes once the token is fixed.
+    const denied = errors.filter(isDenied);
+    if (denied.length > 0) {
+      const paths = denied.map((e) => pathOf(e) || "?");
+      ctx.logger.error("pr-doer-wake: GitHub token cannot see the repository or lacks a permission (config error); the signal is kept and retried", {
+        companyId, repo: variables.o ? `${variables.o}/${variables.r}` : null, paths, types: denied.map((e) => e.type ?? null), needs: TOKEN_PERMISSIONS,
+      });
+      throw new Error(`GitHub token cannot read ${paths.join(", ")}`);
+    }
+    if (errors.length > 0 && errors.every(isMissingPr)) {
+      ctx.logger.warn("pr-doer-wake: GitHub says the pull request does not exist; treated as closed", {
         companyId, repo: `${variables.o}/${variables.r}`, number: variables.n ?? null,
       });
       return body.data ?? null;
@@ -144,14 +159,48 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
 }
 
 /**
+ * Every check run on the head commit: the first page came with the PR read, the rest is paged through (suites, then
+ * the runs of each suite), so a run past the first 100 suites or runs is never invisible. Any failed page throws:
+ * the caller treats it as transient, never as "not red".
+ */
+async function headCheckRuns(ctx: PluginContext, companyId: string, config: DoerWakeConfig, repo: string, commit: { oid: string; checkSuites: GraphSuites }): Promise<CheckRunState[]> {
+  const [o, r] = repo.split("/");
+  const runs: CheckRunState[] = [];
+  let suites = commit.checkSuites;
+  for (;;) {
+    for (const suite of suites.nodes) {
+      let page = suite.checkRuns;
+      for (;;) {
+        runs.push(...page.nodes.map((run) => ({ ...run, suite: suite.id })));
+        if (!page.pageInfo.hasNextPage) break;
+        if (!page.pageInfo.endCursor) throw new Error(`check suite ${suite.id}: next page without a cursor`);
+        const data = await githubGraphql<{ node: { checkRuns?: GraphRuns } | null }>(ctx, companyId, config, SUITE_RUNS_QUERY, { id: suite.id, runs: page.pageInfo.endCursor });
+        if (!data?.node?.checkRuns) throw new Error(`check suite ${suite.id} not readable`);
+        page = data.node.checkRuns;
+      }
+    }
+    if (!suites.pageInfo.hasNextPage) return runs;
+    if (!suites.pageInfo.endCursor) throw new Error(`check suites of ${commit.oid}: next page without a cursor`);
+    const data = await githubGraphql<{ repository: { object: { checkSuites?: GraphSuites } | null } | null }>(
+      ctx, companyId, config, HEAD_SUITES_QUERY, { o, r, oid: commit.oid, suites: suites.pageInfo.endCursor },
+    );
+    const next = data?.repository?.object?.checkSuites;
+    if (!next) throw new Error(`check suites of ${commit.oid} not readable`);
+    suites = next;
+  }
+}
+
+/**
  * Is this signal's PR open, trusted, non-draft and on this head right now, and for a check signal is that check still
- * red there? Always one GraphQL read: webhook payloads arrive late, out of order and with tied updated_at values,
- * draft conversion or closing does not change the head, and checks are re-run on the same head, so nothing cached
- * can authorize a wake. Fails closed: unreadable is transient, missing is closed.
+ * red there? Always read from GitHub GraphQL: webhook payloads arrive late, out of order and with tied updated_at
+ * values, draft conversion or closing does not change the head, and checks are re-run on the same head, so nothing
+ * cached can authorize a wake. Fails closed: unreadable (a repository the token cannot see included) is transient,
+ * a PR missing from a visible repository is closed.
  */
 async function currentPrState(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<PrCheck> {
   const [owner, name] = signal.repo.split("/");
   let pr: GraphPr | null | undefined;
+  let checkRuns: CheckRunState[] | undefined;
   try {
     const data = await githubGraphql<{ repository: { pullRequest: GraphPr | null } | null }>(
       ctx, companyId, config,
@@ -159,11 +208,13 @@ async function currentPrState(ctx: PluginContext, companyId: string, config: Doe
       { o: owner, r: name, n: signal.number },
     );
     pr = data?.repository?.pullRequest;
+    const commit = pr && signal.state !== "conflict" ? headCommit(pr) : undefined;
+    if (commit) checkRuns = await headCheckRuns(ctx, companyId, config, signal.repo, commit);
   } catch (error) {
     return { kind: "transient", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
   }
-  if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "repository or PR not found" };
-  return evaluate(prStateFromGraph(signal.repo, pr, config), signal, config);
+  if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "PR not found" };
+  return evaluate(prStateFromGraph(signal.repo, pr, config, checkRuns), signal, config);
 }
 
 type LedgerRow = {
@@ -178,14 +229,19 @@ type LedgerRow = {
   wake_attempted_at: string | null;
 };
 
+/** Never-woken outcomes a genuine signal resumes (the part before any `:`); see resumable. */
+const RESUMABLE = new Set(["error", "no_card", "stale", "held_status", "held_blockers", "refused"]);
+
 /**
  * A row whose wake was never requested and that no attempt holds right now: a signal may resume it at once, with its
- * own payload (so even a pending row an earlier build compacted to `{}` resumes). `stale:<reason>` rows were written
- * by builds before 0.1.2 final for skips that did not burn anything.
+ * own payload (so even a row compacted to `{}` resumes). Pending rows (`error`, `no_card`) are also retried by the
+ * sweep; holds on the card (`held_status`, `held_blockers`, a host `refused`, all before anything was queued) only
+ * by a later genuine signal, so a card that is unblocked later still wakes on the next red. `stale:<reason>` rows
+ * were written by builds before 0.1.2 final for skips that did not burn anything. `ambiguous_card` and `shadow`
+ * stay settled (fail closed), as does every row whose wake may have reached the host.
  */
 function resumable(row: LedgerRow): boolean {
-  const pending = row.outcome === "error" || row.outcome === "no_card" || row.outcome.startsWith("stale:");
-  return pending && !row.wake_attempted_at;
+  return RESUMABLE.has(row.outcome.split(":")[0]!) && !row.wake_attempted_at;
 }
 
 /**
@@ -241,9 +297,9 @@ const SIGNAL_ROUNDS = 4;
  * Act on one genuine signal whatever the ledger already holds for its fingerprint, never acknowledging it as settled
  * while an attempt that may still forget the row is in flight:
  * - no row: read GitHub (or use `known`, a read the caller already made) and wake, defer or skip;
- * - a pending row whose wake was never attempted: resume it at once with this signal (retryRow);
+ * - a pending or held row whose wake was never attempted (resumable): resume it at once with this signal (retryRow);
  * - a row in flight (claimed or retrying, wake not requested): fold this signal into it (touchSql);
- * - any other row (woken, unconfirmed, held, refused, shadow): a duplicate, at no GitHub cost.
+ * - any other row (woken, unconfirmed, ambiguous, shadow): a duplicate, at no GitHub cost.
  * When another attempt changes the row between these steps, the row is looked at again.
  */
 async function processSignal(ctx: PluginContext, companyId: string, config: DoerWakeConfig, raw: Signal, known?: PrCheck): Promise<WakeResult> {

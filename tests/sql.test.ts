@@ -70,6 +70,7 @@ describe("host contract", () => {
   });
   it("the wake mark is the atomic gate before requestWakeup, and a release undoes only its own mark", () => {
     expect(markWakeAttemptedSql(DB_NAMESPACE)).toMatch(/set wake_attempted_at = \$4::timestamptz, issue_id = \$3, updated_at = now\(\)\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null and created_at = \$5::timestamptz and attempts = \$6$/);
+    expect(releaseWakeAttemptSql(DB_NAMESPACE)).toMatch(/outcome = \$4/);
     expect(releaseWakeAttemptSql(DB_NAMESPACE)).toMatch(/where company_id = \$1 and fingerprint = \$2 and wake_attempted_at = \$3::timestamptz$/);
   });
   it("forgetting a row never touches one whose wake may have reached the host, or one changed since this attempt's claim", () => {

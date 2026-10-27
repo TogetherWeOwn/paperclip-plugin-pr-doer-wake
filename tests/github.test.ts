@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../src/config.js";
-import { checkVerdict, evaluate, fingerprint, isTrustedAuthor, mayAct, parseEvent, policySkip, prStateFromGraph, reviewScore, verifySignature, type Signal } from "../src/github.js";
+import { checkVerdict, evaluate, fingerprint, headCommit, isTrustedAuthor, mayAct, parseEvent, policySkip, prStateFromGraph, reviewScore, verifySignature, type Signal } from "../src/github.js";
 
 const repository = { full_name: "TogetherWeOwn/two-web-next", default_branch: "main", owner: { login: "TogetherWeOwn" } };
 const config = parseConfig({ enabled: true, githubOrg: "TogetherWeOwn", webhookSecretRef: { type: "secret_ref", secretId: "x" }, githubTokenSecretRef: { type: "secret_ref", secretId: "y" } });
@@ -174,6 +174,12 @@ describe("checkVerdict (the failing checks are revalidated)", () => {
     expect(checkVerdict(runs, signal(mine), ignoring)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
     expect(checkVerdict([run("CR_100", "SUCCESS", "2026-10-27T04:00:00Z"), review("CR_9", "FAILURE")], signal(mine), config)).toMatchObject({ kind: "skip" }); // the review is not CI
   });
+  it("a run supersedes only runs of the same name in its own check suite", () => {
+    const inSuite = (r: ReturnType<typeof run>, suite: string) => ({ ...r, suite });
+    const failed = inSuite(run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), "CS_1");
+    expect(checkVerdict([failed, inSuite(run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z"), "CS_2")], signal(mine), config)).toMatchObject({ kind: "red", run: { id: "CR_100" } });
+    expect(checkVerdict([failed, inSuite(run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z"), "CS_1")], signal(mine), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+  });
   it("Paperclip Review is red only on FAILURE of the review check itself", () => {
     expect(checkVerdict([review("CR_100", "FAILURE")], signal(mine, "review_findings"), config)).toMatchObject({ kind: "red" });
     expect(checkVerdict([review("CR_100", "TIMED_OUT")], signal(mine, "review_findings"), config)).toMatchObject({ kind: "skip" });
@@ -192,12 +198,15 @@ describe("checkVerdict (the failing checks are revalidated)", () => {
     (payload.check_run as any).started_at = "2026-10-27T04:00:00Z";
     expect(parseEvent("check_run", payload, config).signals[0]!.detail).toMatchObject({ checkRunId: "CR_100", checkStartedAt: "2026-10-27T04:00:00Z" });
   });
-  it("prStateFromGraph reads runs only from the PR's head commit", () => {
+  it("runs are read only from the PR's head commit", () => {
     const node = { number: 7, url: "u", state: "OPEN" as const, isDraft: false, isCrossRepository: false, authorAssociation: "MEMBER", author: { login: "doer" }, headRefOid: HEAD, headRefName: "x", baseRefName: "main", mergeable: "MERGEABLE" as const, updatedAt: "t" };
-    const commits = (oid: string) => ({ nodes: [{ commit: { oid, checkSuites: { nodes: [{ checkRuns: { nodes: [run("CR_1", "FAILURE", null)] } }, { checkRuns: { nodes: [run("CR_2", "SUCCESS", null)] } }] } } }] });
-    expect(prStateFromGraph("o/r", { ...node, commits: commits(HEAD) }, config).checkRuns?.map((r) => r.id)).toEqual(["CR_1", "CR_2"]);
-    expect(prStateFromGraph("o/r", { ...node, commits: commits("f".repeat(40)) }, config).checkRuns).toBeUndefined();
+    const none = { hasNextPage: false, endCursor: null };
+    const commits = (oid: string) => ({ nodes: [{ commit: { oid, checkSuites: { pageInfo: none, nodes: [{ id: "CS_1", checkRuns: { pageInfo: none, nodes: [run("CR_1", "FAILURE", null)] } }] } } }] });
+    expect(headCommit({ ...node, commits: commits(HEAD) })?.oid).toBe(HEAD);
+    expect(headCommit({ ...node, commits: commits("f".repeat(40)) })).toBeUndefined();
+    expect(headCommit(node)).toBeUndefined();
     expect(prStateFromGraph("o/r", node, config).checkRuns).toBeUndefined();
+    expect(prStateFromGraph("o/r", node, config, [run("CR_1", "FAILURE", null)]).checkRuns?.map((r) => r.id)).toEqual(["CR_1"]);
   });
 });
 
