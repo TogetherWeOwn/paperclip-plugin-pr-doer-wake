@@ -18,7 +18,7 @@ export interface PrState {
   trusted: boolean;
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   /**
-   * Runs of the signal's check on the PR's head commit as GitHub reports them now (LATEST per check suite).
+   * Check runs on the PR's head commit as GitHub reports them now (LATEST per check suite).
    * Undefined when not read (conflict signals); a check signal without it never wakes.
    */
   checkRuns?: CheckRunState[];
@@ -27,9 +27,11 @@ export interface PrState {
 export interface CheckRunState {
   /** GraphQL node id, the same value as the webhook's check_run.node_id. */
   id: string;
+  name: string;
   status: string;
   conclusion: string | null;
   startedAt: string | null;
+  url?: string | null;
 }
 
 export interface Signal {
@@ -156,46 +158,80 @@ function startedMs(run: CheckRunState): number {
   return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
 }
 
+export type CheckVerdict = { kind: "red"; run: CheckRunState } | Exclude<PrCheck, { kind: "ok" }>;
+
 /**
- * Is the signal's check still red on this head? Webhooks arrive late and out of order and checks are re-run on the
- * same head, so the delivered conclusion alone never wakes: GitHub's newest run of that check name must be completed
- * and red. A newer passing, re-running or updated-to-passing run is stale; GitHub not listing the delivered run yet
- * (its read lags the webhook) is transient.
+ * Is the signal's state still red on this head, by GitHub's newest run of each relevant check name? Webhooks arrive
+ * late and out of order and checks are re-run on the same head, so a delivered conclusion alone never wakes.
+ * Relevant: for review_findings the review check only; for ci_red every gating check (isGatingCheck, never the
+ * review), because the state is per head: when the delivered check recovered but another gating check is red, the
+ * signal is still red and that check is the evidence (no pending evidence has to be kept in the ledger).
+ * Not red now is transient while GitHub's read lags the webhook (the delivered run is not listed yet, or still listed
+ * as not completed) and otherwise check_not_red: a newer run's own completion delivery starts again.
  */
-export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal): PrCheck | null {
+export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal, config: DoerWakeConfig): CheckVerdict {
   if (!runs) return { kind: "transient", detail: "check runs not read" };
-  if (runs.length === 0) return { kind: "transient", detail: `no ${signal.detail.checkName ?? "check"} run visible on the head yet` };
-  const red = signal.state === "review_findings" ? REVIEW_RED_CONCLUSIONS : RED_CONCLUSIONS;
-  const latest = runs.reduce((a, b) => (startedMs(b) > startedMs(a) ? b : a));
-  if (latest.status === "COMPLETED" && red.has(String(latest.conclusion ?? "").toLowerCase())) return null; // still red
-  const delivered = signal.detail.checkRunId ? runs.find((r) => r.id === signal.detail.checkRunId) : undefined;
-  const deliveredStart = signal.detail.checkStartedAt ? Date.parse(signal.detail.checkStartedAt) : Number.NaN;
-  if (!delivered && !Number.isNaN(deliveredStart) && startedMs(latest) < deliveredStart) {
-    return { kind: "transient", detail: "GitHub does not list the failing run yet" };
+  const review = signal.state === "review_findings";
+  const own = signal.detail.checkName ?? (review ? config.reviewCheckName : undefined);
+  const relevant = (name: string) => (review ? name === own : name !== config.reviewCheckName && isGatingCheck(config, signal.repo, name));
+  const red = review ? REVIEW_RED_CONCLUSIONS : RED_CONCLUSIONS;
+  const latest = new Map<string, CheckRunState>();
+  for (const run of runs) {
+    if (!relevant(run.name)) continue;
+    const seen = latest.get(run.name);
+    if (!seen || startedMs(run) > startedMs(seen)) latest.set(run.name, run);
   }
-  const detail = latest.status === "COMPLETED" ? `latest run ${String(latest.conclusion).toLowerCase()}` : `latest run ${latest.status.toLowerCase()}`;
+  const redNow = [...latest.values()]
+    .filter((r) => r.status === "COMPLETED" && red.has(String(r.conclusion ?? "").toLowerCase()))
+    .sort((a, b) => (a.name === own ? -1 : b.name === own ? 1 : a.name.localeCompare(b.name)));
+  if (redNow[0]) return { kind: "red", run: redNow[0] };
+  const ownRuns = runs.filter((r) => r.name === own);
+  const delivered = signal.detail.checkRunId ? ownRuns.find((r) => r.id === signal.detail.checkRunId) : undefined;
+  if (delivered && delivered.status !== "COMPLETED") {
+    return { kind: "transient", detail: `GitHub still lists the delivered run as ${delivered.status.toLowerCase()}` };
+  }
+  const deliveredStart = signal.detail.checkStartedAt ? Date.parse(signal.detail.checkStartedAt) : Number.NaN;
+  const newestOwn = ownRuns.reduce((max, r) => Math.max(max, startedMs(r)), Number.NEGATIVE_INFINITY);
+  if (!delivered && (ownRuns.length === 0 || (!Number.isNaN(deliveredStart) && newestOwn < deliveredStart))) {
+    return { kind: "transient", detail: `GitHub does not list the failing ${own ?? "check"} run yet` };
+  }
+  const mine = own ? latest.get(own) : undefined;
+  const detail = mine ? `latest ${own} run ${(mine.status === "COMPLETED" ? String(mine.conclusion) : mine.status).toLowerCase()}` : "no gating check red";
   return { kind: "skip", outcome: "check_not_red", detail };
 }
 
 /**
  * May this signal wake, given the PR as GitHub reports it now? Closed, merged, re-pushed, untrusted and draft PRs
- * never do; nor does a check signal whose check is no longer red, or a conflict GitHub no longer reports.
+ * never do; nor does a check signal whose state is no longer red, or a conflict GitHub no longer reports.
  */
-export function evaluate(pr: PrState, signal: Signal): PrCheck {
+export function evaluate(pr: PrState, signal: Signal, config: DoerWakeConfig): PrCheck {
   if (!pr.open) return { kind: "skip", outcome: "skipped_closed" };
   if (pr.head !== signal.head) return { kind: "skip", outcome: "stale_head", detail: pr.head };
   if (!pr.trusted) return { kind: "skip", outcome: "untrusted" };
   if (pr.draft) return { kind: "skip", outcome: "skipped_draft" };
+  let detail = signal.detail;
   if (signal.state === "conflict") {
     if (pr.mergeable !== "CONFLICTING") {
       // GitHub computes mergeability lazily: UNKNOWN is read again by the sweep.
       return pr.mergeable === "UNKNOWN" ? { kind: "transient", detail: "mergeability not computed yet" } : { kind: "skip", outcome: "not_conflicting" };
     }
   } else {
-    const verdict = checkVerdict(pr.checkRuns, signal);
-    if (verdict) return verdict;
+    const verdict = checkVerdict(pr.checkRuns, signal, config);
+    if (verdict.kind !== "red") return verdict;
+    const run = verdict.run;
+    if (run.id !== signal.detail.checkRunId) {
+      // The evidence is the run that is red now (a newer red run, or another gating check).
+      detail = {
+        ...detail,
+        checkName: run.name,
+        checkUrl: run.url ?? "",
+        conclusion: String(run.conclusion).toLowerCase(),
+        checkRunId: run.id,
+        checkStartedAt: run.startedAt,
+      };
+    }
   }
-  return { kind: "ok", signal: { ...signal, draft: false, trusted: true, headRef: pr.headRef ?? signal.headRef } };
+  return { kind: "ok", signal: { ...signal, detail, draft: false, trusted: true, headRef: pr.headRef ?? signal.headRef } };
 }
 
 type Json = Record<string, any>;
@@ -315,14 +351,15 @@ export const ONE_PR_QUERY = `query($o:String!,$r:String!,$n:Int!){repository(own
 pullRequest(number:$n){${PR_FIELDS}}}}`;
 
 /**
- * One PR plus the current runs of one check name on its head commit, in the same read, for check signals.
- * GitHub GraphQL: Commit.checkSuites(filterBy: CheckSuiteFilter{checkName}), CheckSuite.checkRuns(filterBy:
- * CheckRunFilter{checkName, checkType: LATEST}).
+ * One PR plus the latest check runs on its head commit, in the same read, for check signals (checkVerdict filters
+ * the relevant names). GitHub GraphQL: Commit.checkSuites, CheckSuite.checkRuns(filterBy: CheckRunFilter{checkType:
+ * LATEST}). Reading check suites needs the Checks read permission, which fine-grained personal access tokens cannot
+ * get (README "GitHub token").
  */
-export const ONE_PR_WITH_CHECK_QUERY = `query($o:String!,$r:String!,$n:Int!,$check:String!){repository(owner:$o,name:$r){
+export const ONE_PR_WITH_CHECKS_QUERY = `query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
 pullRequest(number:$n){${PR_FIELDS}
-commits(last:1){nodes{commit{oid checkSuites(first:20,filterBy:{checkName:$check}){nodes{
-checkRuns(first:10,filterBy:{checkName:$check,checkType:LATEST}){nodes{id status conclusion startedAt}}}}}}}}}}`;
+commits(last:1){nodes{commit{oid checkSuites(first:50){nodes{
+checkRuns(first:100,filterBy:{checkType:LATEST}){nodes{id name status conclusion startedAt url}}}}}}}}}}`;
 
 export interface GraphPr {
   number: number;
@@ -337,11 +374,11 @@ export interface GraphPr {
   baseRefName: string;
   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   updatedAt: string;
-  /** Only with ONE_PR_WITH_CHECK_QUERY. */
+  /** Only with ONE_PR_WITH_CHECKS_QUERY. */
   commits?: { nodes: Array<{ commit: { oid: string; checkSuites: { nodes: Array<{ checkRuns: { nodes: CheckRunState[] } }> } } }> };
 }
 
-/** The check runs ONE_PR_WITH_CHECK_QUERY read on the PR's head commit; undefined if not read or not the head. */
+/** The check runs ONE_PR_WITH_CHECKS_QUERY read on the PR's head commit; undefined if not read or not the head. */
 function checkRunsFromGraph(pr: GraphPr): CheckRunState[] | undefined {
   const commit = pr.commits?.nodes?.[0]?.commit;
   if (!commit || commit.oid !== pr.headRefOid) return undefined;

@@ -7,6 +7,7 @@ import {
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
   claimSql,
+  forgetSql,
   markCommentPostedSql,
   markWakeAttemptedSql,
   prUrlPatterns,
@@ -34,6 +35,7 @@ export type Outcome =
   | "woken"
   | "refused"
   | "wake_unconfirmed"
+  | "gave_up"
   | "error";
 
 export interface WakeResult {
@@ -79,8 +81,8 @@ function namespace(ctx: PluginContext): string {
 export type CardResolution = { kind: "card"; card: CardRef } | { kind: "none" } | { kind: "ambiguous"; detail: string };
 
 /**
- * The owning card from both interim paths (README "Card resolution"), found without regard to status or assignee
- * eligibility: an ineligible owner (done, handed to the Reviewer) must hold the wake, not pass it to another card.
+ * The owning card from both interim paths (README "Card resolution"), found without regard to status or the card's
+ * current assignee: an ineligible owner (done, handed to the Reviewer) must hold the wake, not pass it to another card.
  * When both paths find a card and they disagree, the owner is unknown: the wake is held rather than sent to a card
  * that may be unrelated. Eligibility is checked on the owner afterwards (wakeForSignal).
  */
@@ -124,14 +126,23 @@ export async function recordOutcome(ctx: PluginContext, companyId: string, fp: s
   await ctx.db.execute(recordOutcomeSql(namespace(ctx)), [companyId, fp, outcome, issueId]);
 }
 
+/** Drop a never-woken row so a later genuine signal can claim the fingerprint again (forgetSql). */
+export async function forget(ctx: PluginContext, companyId: string, fp: string) {
+  await ctx.db.execute(forgetSql(namespace(ctx)), [companyId, fp]);
+}
+
 /**
  * requestWakeup was sent but its result is unknown (lost reply, timeout, worker stopped mid-call). The host may
  * have queued, deferred or coalesced it, and plugins can neither have it dedupe by idempotencyKey nor read its
  * receipt (agent_wakeup_requests is not a plugin core-read table), so it is never requested again: at most once.
+ * This is the accepted missed-wake case of the delivery contract; it is counted by this fixed log message
+ * (plugin_logs, level warn) and by the ledger outcome.
  */
+export const WAKE_UNCONFIRMED_LOG = "pr-doer-wake: wake_unconfirmed (request sent, result unknown; not repeated)";
+
 export async function markUnconfirmed(ctx: PluginContext, companyId: string, fp: string, issueId: string | null, detail: string): Promise<WakeResult> {
   await recordOutcome(ctx, companyId, fp, "wake_unconfirmed", issueId);
-  ctx.logger.warn("pr-doer-wake: wake request outcome unknown; not repeated (at most once)", { fingerprint: fp, error: detail });
+  ctx.logger.warn(WAKE_UNCONFIRMED_LOG, { fingerprint: fp, issueId, error: detail });
   return { fingerprint: fp, outcome: "wake_unconfirmed", detail };
 }
 
@@ -176,7 +187,7 @@ export async function wakeForSignal(
   // Final guard for every caller (webhook, conflict sweep, retries): the policy may have changed since the signal.
   const policy = policySkip(config, signal);
   if (policy) {
-    if (retry) await recordOutcome(ctx, companyId, fp, `stale:${policy}`, retry.issueId);
+    if (retry) await forget(ctx, companyId, fp);
     return { fingerprint: fp, outcome: policy };
   }
   if (signal.trusted === false) return { fingerprint: fp, outcome: "untrusted" };
@@ -236,13 +247,19 @@ export async function wakeForSignal(
       await ctx.db.execute(markCommentPostedSql(ns), [companyId, fp, card.id]);
     }
     const reason = `github_pr_${signal.state}`;
+    const mark = new Date().toISOString();
+    let marked: { rowCount: number };
     try {
-      await ctx.db.execute(markWakeAttemptedSql(ns), [companyId, fp, card.id]);
+      marked = await ctx.db.execute(markWakeAttemptedSql(ns), [companyId, fp, card.id, mark]);
     } catch (error) {
       // The mark may have committed with its reply lost, but requestWakeup was not called: undo it so the sweep
       // retries instead of closing the row as wake_unconfirmed with zero wakes.
-      await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp]).catch(() => undefined);
+      await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp, mark]).catch(() => undefined);
       throw error;
+    }
+    if (marked.rowCount !== 1) {
+      // Another attempt took this row while this one stalled: it requested the wake or forgot the row. Leave it.
+      return { fingerprint: fp, outcome: "duplicate", card: card.identifier, detail: "another attempt holds the wake" };
     }
     try {
       const result = await ctx.issues.requestWakeup(card.id, companyId, {
@@ -259,7 +276,7 @@ export async function wakeForSignal(
         return { fingerprint: fp, outcome: "refused", card: card.identifier, detail: message };
       }
       if (provablyNotSent(error)) {
-        await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp]);
+        await ctx.db.execute(releaseWakeAttemptSql(ns), [companyId, fp, mark]);
         ctx.logger.warn("pr-doer-wake: wake request never reached the host; the sweep job retries it", { fingerprint: fp, error: message });
         return { fingerprint: fp, outcome: "error", card: card.identifier, detail: message };
       }

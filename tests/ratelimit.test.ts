@@ -19,7 +19,7 @@ function gate(): Gate {
   return { promise, open };
 }
 
-let resolveError: (() => Error | null) | null = null;
+let resolveError: ((secretId: string) => Error | null) | null = null;
 
 async function boot(opts: { resolveGate?: () => Gate | null; fetchStatus?: number } = {}) {
   const harness = createTestHarness({
@@ -39,7 +39,7 @@ async function boot(opts: { resolveGate?: () => Gate | null; fetchStatus?: numbe
     const g = opts.resolveGate?.();
     if (g) await g.promise; // the host round trip is still in flight
     if (calls.resolves > 30) throw Object.assign(new Error("Rate limit exceeded for secret resolution"), { name: "RateLimitExceededError" });
-    const injected = resolveError?.();
+    const injected = resolveError?.(ref.secretId);
     if (injected) throw injected;
     return ref.secretId.endsWith("1") ? currentSecret : "gh-token";
   };
@@ -200,6 +200,30 @@ describe("secret-resolution budget (host limit 30/min)", () => {
     await deliver("check_run", redOnPr(22));
     expect(calls.tokenResolves).toBe(2);
   });
+
+  for (const [label, message] of [
+    ["unbound", "Secret is not bound to plugin:x at githubTokenSecretRef"],
+    ["deactivated", "Secret is not active"],
+    ["rate-limited", "Rate limit exceeded for secret resolution"],
+  ] as const) {
+    it(`a GitHub token whose resolution fails (${label}) is not re-resolved on every lookup (negative cache)`, async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-27T05:00:00Z"));
+      resolveError = null;
+      const { calls } = await boot();
+      await deliver("check_run", redOnPr(1)); // webhook secret resolved and cached; token resolved once
+      resolveError = (secretId) => (secretId.endsWith("2") ? rpcError(message) : null); // only the token fails
+      vi.setSystemTime(new Date("2026-10-27T05:11:00Z")); // token past its TTL
+      const before = calls.tokenResolves;
+      for (let n = 2; n <= 26; n += 1) await deliver("check_run", redOnPr(n)); // 25 lookups
+      await runSweep();
+      expect(calls.tokenResolves - before).toBe(1);
+      vi.setSystemTime(new Date("2026-10-27T05:12:01Z")); // after the backoff: one more resolution
+      await deliver("check_run", redOnPr(27));
+      await deliver("check_run", redOnPr(28));
+      expect(calls.tokenResolves - before).toBe(2);
+    });
+  }
 
   it("one sweep over many marked repos and pages resolves the token once", async () => {
     const { calls } = await boot();

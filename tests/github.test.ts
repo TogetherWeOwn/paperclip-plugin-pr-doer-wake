@@ -125,19 +125,19 @@ describe("pull_request and push", () => {
   });
   it("evaluate gates closed, superseded, untrusted, draft and no-longer-conflicting PRs", () => {
     const signal = { repo: "o/r", number: 7, head: HEAD, state: "ci_red" as const, url: "u", headRef: null, draft: null, trusted: null, detail: {} };
-    const red = [{ id: "CR_1", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-10-27T04:00:00Z" }];
+    const red = [{ id: "CR_1", name: "build", status: "COMPLETED", conclusion: "FAILURE", startedAt: "2026-10-27T04:00:00Z" }];
     const entry = { repo: "o/r", number: 7, head: HEAD, headRef: "TOG-1-x", draft: false, url: "u", open: true, trusted: true, mergeable: "MERGEABLE" as const, checkRuns: red };
     const conflict = { ...signal, state: "conflict" as const };
-    expect(evaluate({ ...entry, mergeable: "CONFLICTING" }, conflict)).toMatchObject({ kind: "ok" });
-    expect(evaluate(entry, conflict)).toMatchObject({ kind: "skip", outcome: "not_conflicting" });
-    expect(evaluate({ ...entry, mergeable: "UNKNOWN" }, conflict)).toMatchObject({ kind: "transient" });
-    expect(evaluate(entry, signal)).toMatchObject({ kind: "ok", signal: { draft: false, trusted: true, headRef: "TOG-1-x" } });
-    expect(evaluate({ ...entry, open: false }, signal)).toMatchObject({ kind: "skip", outcome: "skipped_closed" });
-    expect(evaluate({ ...entry, head: "f".repeat(40) }, signal)).toMatchObject({ kind: "skip", outcome: "stale_head" });
-    expect(evaluate({ ...entry, trusted: false }, signal)).toMatchObject({ kind: "skip", outcome: "untrusted" });
-    expect(evaluate({ ...entry, draft: true }, signal)).toMatchObject({ kind: "skip", outcome: "skipped_draft" });
+    expect(evaluate({ ...entry, mergeable: "CONFLICTING" }, conflict, config)).toMatchObject({ kind: "ok" });
+    expect(evaluate(entry, conflict, config)).toMatchObject({ kind: "skip", outcome: "not_conflicting" });
+    expect(evaluate({ ...entry, mergeable: "UNKNOWN" }, conflict, config)).toMatchObject({ kind: "transient" });
+    expect(evaluate(entry, signal, config)).toMatchObject({ kind: "ok", signal: { draft: false, trusted: true, headRef: "TOG-1-x" } });
+    expect(evaluate({ ...entry, open: false }, signal, config)).toMatchObject({ kind: "skip", outcome: "skipped_closed" });
+    expect(evaluate({ ...entry, head: "f".repeat(40) }, signal, config)).toMatchObject({ kind: "skip", outcome: "stale_head" });
+    expect(evaluate({ ...entry, trusted: false }, signal, config)).toMatchObject({ kind: "skip", outcome: "untrusted" });
+    expect(evaluate({ ...entry, draft: true }, signal, config)).toMatchObject({ kind: "skip", outcome: "skipped_draft" });
     const { checkRuns: _unread, ...unread } = entry;
-    expect(evaluate(unread, signal)).toMatchObject({ kind: "transient" }); // a check signal never wakes without its check read
+    expect(evaluate(unread, signal, config)).toMatchObject({ kind: "transient" }); // a check signal never wakes without its checks read
   });
   it("signals a conflict when GitHub already reports mergeable_state dirty on a non-draft PR", () => {
     expect(parseEvent("pull_request", pr({ mergeable_state: "dirty" }), config).signals.map((s) => s.state)).toEqual(["conflict"]);
@@ -149,30 +149,42 @@ describe("pull_request and push", () => {
   });
 });
 
-describe("checkVerdict (the failing check is revalidated)", () => {
-  const signal = (detail: Signal["detail"], state: Signal["state"] = "ci_red"): Signal => ({ repo: "o/r", number: 7, head: HEAD, state, url: "u", headRef: null, draft: null, trusted: null, detail: { checkName: "build", ...detail } });
-  const run = (id: string, conclusion: string | null, startedAt: string | null, status = "COMPLETED") => ({ id, status, conclusion, startedAt });
+describe("checkVerdict (the failing checks are revalidated)", () => {
+  const signal = (detail: Signal["detail"], state: Signal["state"] = "ci_red"): Signal => ({ repo: "o/r", number: 7, head: HEAD, state, url: "u", headRef: null, draft: null, trusted: null, detail: { checkName: state === "review_findings" ? "Paperclip Review" : "build", ...detail } });
+  const run = (id: string, conclusion: string | null, startedAt: string | null, status = "COMPLETED", name = "build") => ({ id, name, status, conclusion, startedAt, url: `https://github.com/o/r/runs/${id}` });
+  const review = (id: string, conclusion: string | null) => run(id, conclusion, "2026-10-27T04:00:00Z", "COMPLETED", "Paperclip Review");
   const mine = { checkRunId: "CR_100", checkStartedAt: "2026-10-27T04:00:00Z" };
-  it("still red when GitHub's newest run of the check is completed and red", () => {
-    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z")], signal(mine))).toBeNull();
-    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_101", "STARTUP_FAILURE", "2026-10-27T04:01:00Z")], signal(mine))).toBeNull();
+  it("red when GitHub's newest run of the check is completed and red", () => {
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z")], signal(mine), config)).toMatchObject({ kind: "red", run: { id: "CR_100" } });
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_101", "STARTUP_FAILURE", "2026-10-27T04:01:00Z")], signal(mine), config)).toMatchObject({ kind: "red", run: { id: "CR_101" } });
   });
   it("stale when a newer run passed, is re-running, or the same run is no longer red", () => {
-    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
-    expect(checkVerdict([run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
-    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_101", null, null, "QUEUED")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
-    expect(checkVerdict([run("CR_100", "SUCCESS", "2026-10-27T04:00:00Z")], signal(mine))).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z")], signal(mine), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_200", "SUCCESS", "2026-10-27T04:05:00Z")], signal(mine), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z"), run("CR_101", null, null, "QUEUED")], signal(mine), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_100", "SUCCESS", "2026-10-27T04:00:00Z")], signal(mine), config)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
   });
-  it("Paperclip Review is red only on FAILURE", () => {
-    expect(checkVerdict([run("CR_100", "FAILURE", "2026-10-27T04:00:00Z")], signal(mine, "review_findings"))).toBeNull();
-    expect(checkVerdict([run("CR_100", "TIMED_OUT", "2026-10-27T04:00:00Z")], signal(mine, "review_findings"))).toMatchObject({ kind: "skip" });
-    expect(checkVerdict([run("CR_100", "ACTION_REQUIRED", "2026-10-27T04:00:00Z")], signal(mine, "review_findings"))).toMatchObject({ kind: "skip" });
+  it("transient while GitHub still lists the delivered run itself as not completed (read lag)", () => {
+    expect(checkVerdict([run("CR_100", null, "2026-10-27T04:00:00Z", "IN_PROGRESS")], signal(mine), config)).toMatchObject({ kind: "transient" });
   });
-  it("transient when GitHub lists no run or only runs older than the delivered one", () => {
-    expect(checkVerdict(undefined, signal(mine))).toMatchObject({ kind: "transient" });
-    expect(checkVerdict([], signal(mine))).toMatchObject({ kind: "transient" });
-    expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal(mine))).toMatchObject({ kind: "transient" });
-    expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal({}))).toMatchObject({ kind: "skip" }); // old ledger row: no identity
+  it("ci_red: any other gating check still red on the head keeps the signal red, with that check as evidence", () => {
+    const runs = [run("CR_100", "SUCCESS", "2026-10-27T04:00:00Z"), run("CR_300", "FAILURE", "2026-10-27T04:00:00Z", "COMPLETED", "test")];
+    expect(checkVerdict(runs, signal(mine), config)).toMatchObject({ kind: "red", run: { name: "test" } });
+    const ignoring = parseConfig({ ...config, ignoreChecks: ["test"] });
+    expect(checkVerdict(runs, signal(mine), ignoring)).toMatchObject({ kind: "skip", outcome: "check_not_red" });
+    expect(checkVerdict([run("CR_100", "SUCCESS", "2026-10-27T04:00:00Z"), review("CR_9", "FAILURE")], signal(mine), config)).toMatchObject({ kind: "skip" }); // the review is not CI
+  });
+  it("Paperclip Review is red only on FAILURE of the review check itself", () => {
+    expect(checkVerdict([review("CR_100", "FAILURE")], signal(mine, "review_findings"), config)).toMatchObject({ kind: "red" });
+    expect(checkVerdict([review("CR_100", "TIMED_OUT")], signal(mine, "review_findings"), config)).toMatchObject({ kind: "skip" });
+    expect(checkVerdict([review("CR_100", "ACTION_REQUIRED")], signal(mine, "review_findings"), config)).toMatchObject({ kind: "skip" });
+    expect(checkVerdict([review("CR_100", "SUCCESS"), run("CR_5", "FAILURE", "2026-10-27T04:00:00Z")], signal(mine, "review_findings"), config)).toMatchObject({ kind: "skip" });
+  });
+  it("transient when GitHub lists no run of the check or only runs older than the delivered one", () => {
+    expect(checkVerdict(undefined, signal(mine), config)).toMatchObject({ kind: "transient" });
+    expect(checkVerdict([], signal(mine), config)).toMatchObject({ kind: "transient" });
+    expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal(mine), config)).toMatchObject({ kind: "transient" });
+    expect(checkVerdict([run("CR_050", "SUCCESS", "2026-10-27T03:50:00Z")], signal({}), config)).toMatchObject({ kind: "skip" }); // old ledger row: no identity
   });
   it("parseEvent carries the delivered run's identity", () => {
     const payload = checkRun("build", "failure");

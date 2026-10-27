@@ -1,8 +1,17 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { NAMESPACE_SLUG, PLUGIN_ID, PLUGIN_VERSION, SWEEP_JOB_KEY, WAKE_STATES, WEBHOOK_KEY } from "./constants.js";
 
+/**
+ * A Paperclip secret binding. `format: "secret-ref"` makes the host render a secret picker and bind the secret to
+ * this plugin (PLUGIN_SPEC.md section 19.8; collectSecretRefPaths in server/src/services/json-schema-secret-refs.ts).
+ * The picker stores the object `{ type: "secret_ref", secretId, version? }`, so the type stays "object": with
+ * `type: "string"` the host's Ajv check (plugin-config-validator.ts) refuses that object ("must be string"), and a
+ * bare UUID string is refused by the secrets handler. The `type: "string"` fields of the bundled sandbox providers
+ * are environment config, which environment-config.ts converts before validating.
+ */
 const secretRef = {
   type: "object",
+  format: "secret-ref",
   required: ["type", "secretId"],
   additionalProperties: true,
   properties: { type: { const: "secret_ref" }, secretId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } },
@@ -14,7 +23,7 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "PR doer wake",
   description:
-    "Wakes the card that owns an open, non-draft GitHub pull request once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
+    "Wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -52,7 +61,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SWEEP_JOB_KEY,
       displayName: "Conflict sweep and wake retries",
       description:
-        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR (and the failing check) and finishes wakes that failed, stalled or had no owning card yet (never one that may already have reached the host); compacts ledger rows older than 30 days into dedupe tombstones.",
+        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR (and its failing checks) and finishes wakes that failed, stalled or had no eligible owning card yet, with backoff (never one that may already have reached the host); compacts ledger rows older than 30 days into dedupe tombstones.",
       schedule: "*/5 * * * *",
     },
   ],
@@ -63,7 +72,11 @@ const manifest: PaperclipPluginManifestV1 = {
       shadow: { type: "boolean", default: true, description: "Record and log what would be woken, but post nothing and wake nobody." },
       githubOrg: { type: "string", description: "GitHub organization login whose webhooks this company accepts, e.g. TogetherWeOwn." },
       webhookSecretRef: { ...secretRef, description: "Paperclip secret holding the GitHub webhook secret." },
-      githubTokenSecretRef: { ...secretRef, description: "Required when enabled. Paperclip secret with a read-only GitHub token (pull requests: read). Every wake is revalidated against GitHub first, and the conflict sweep reads mergeability with it." },
+      githubTokenSecretRef: {
+        ...secretRef,
+        description:
+          "Required when enabled. Paperclip secret with a GitHub token that can read pull requests and check runs in githubOrg: a classic token (no scope for public repos, repo for private ones) or a token with Pull requests: read and Checks: read. Fine-grained personal access tokens cannot read check runs. Every wake is revalidated against GitHub first, and the conflict sweep reads mergeability with it.",
+      },
       reviewCheckName: { type: "string", default: "Paperclip Review" },
       requiredChecks: {
         type: "object",

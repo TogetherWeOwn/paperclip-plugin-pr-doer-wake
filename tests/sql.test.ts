@@ -7,8 +7,10 @@ import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
+  MAX_RETRIES,
   claimSql,
   compactSql,
+  forgetSql,
   markCommentPostedSql,
   markWakeAttemptedSql,
   prUrlPatterns,
@@ -25,6 +27,7 @@ import {
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
 } from "./fixtures/host-sql-validator.js";
+import { collectSecretRefPaths, validateInstanceConfig } from "./fixtures/host-config-validator.js";
 
 const core = manifest.database!.coreReadTables!;
 
@@ -54,14 +57,26 @@ describe("host contract", () => {
     }
     expect(() => validatePluginRuntimeQuery(CARD_BY_COMMENT_SQL, DB_NAMESPACE, ["issues"])).toThrow(/issue_comments/);
   });
-  it("retries failed rows, rows stuck at claimed or retrying and card-pending rows with a growing backoff", () => {
+  it("retries failed and card-pending rows with exponential backoff (2..60 minutes) and rows stuck at claimed or retrying", () => {
     const sql = retryableSql(DB_NAMESPACE);
-    expect(sql).toMatch(/outcome = 'error'/);
+    expect(sql).toMatch(/outcome in \('error', 'no_card'\) and updated_at < now\(\) - interval '1 minute' \* least\(power\(2, attempts \+ 1\), 60\)/);
     expect(sql).toMatch(/outcome in \('claimed', 'retrying'\) and updated_at < now\(\) - interval '10 minutes'/);
-    expect(sql).toMatch(/outcome = 'no_card' and updated_at < now\(\) - interval '5 minutes' \* \(attempts \+ 1\)/);
-    expect(sql).toMatch(/attempts < 4/);
+    // No attempt cap in SQL: a row past MAX_RETRIES is selected once more and forgotten (plugin.ts), never stranded.
+    expect(sql).not.toMatch(/attempts </);
+    expect(MAX_RETRIES).toBeGreaterThanOrEqual(10); // ~8 hours of retries before giving up
     expect(sql).toMatch(/signal <> '\{\}'::jsonb/); // compacted tombstones are never retried
     expect(sql).toMatch(/updated_at::text as updated_at/);
+  });
+  it("the wake mark is the atomic gate before requestWakeup, and a release undoes only its own mark", () => {
+    expect(markWakeAttemptedSql(DB_NAMESPACE)).toMatch(/set wake_attempted_at = \$4::timestamptz, issue_id = \$3, updated_at = now\(\)\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null$/);
+    expect(releaseWakeAttemptSql(DB_NAMESPACE)).toMatch(/where company_id = \$1 and fingerprint = \$2 and wake_attempted_at = \$3::timestamptz$/);
+  });
+  it("forgetting a row never touches one whose wake may have reached the host", () => {
+    expect(forgetSql(DB_NAMESPACE)).toMatch(/^delete from \S+\.wake_ledger\s+where company_id = \$1 and fingerprint = \$2 and wake_attempted_at is null$/);
+  });
+  it("the dedupe pre-check returns what a redelivery needs to resume a never-attempted row", () => {
+    expect(seenSql(DB_NAMESPACE)).toMatch(/outcome, attempts, updated_at::text as updated_at, signal::text as signal/);
+    expect(seenSql(DB_NAMESPACE)).toMatch(/wake_attempted_at::text as wake_attempted_at/);
   });
   it("a retry re-claims its row with a conditional UPDATE on the selected outcome and updated_at", () => {
     const sql = reclaimSql(DB_NAMESPACE);
@@ -77,11 +92,29 @@ describe("host contract", () => {
   it("ownership lookups do not filter on status or the card's eligibility", () => {
     expect(CARD_BY_IDENTIFIER_SQL).not.toMatch(/status not in|assignee_agent_id is not null|string_to_array/);
     expect(CARD_BY_COMMENT_SQL).not.toMatch(/status not in/);
+    // The card's CURRENT assignee never decides ownership: reassigning the owner must not promote a later card.
+    expect(CARD_BY_COMMENT_SQL).not.toMatch(/assignee_agent_id/);
+    expect(CARD_BY_COMMENT_SQL).toMatch(/c\.author_agent_id is not null and not \(c\.author_agent_id::text = any\(string_to_array\(\$4, ','\)\)\)/);
+    expect(CARD_BY_COMMENT_SQL).toMatch(/order by first_mention asc/);
   });
   it("runtime writes pass validatePluginRuntimeExecute", () => {
-    for (const q of [claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {
+    for (const q of [claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), forgetSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeExecute(q, DB_NAMESPACE)).not.toThrow();
     }
+  });
+});
+
+describe("secret config fields (PLUGIN_SPEC.md section 19.8)", () => {
+  const schema = manifest.instanceConfigSchema as Record<string, any>;
+  const binding = { type: "secret_ref", secretId: "00000000-0000-4000-8000-000000000001" };
+  it("are annotated format: secret-ref, so the host renders a secret picker and binds them", () => {
+    expect([...collectSecretRefPaths(schema)].sort()).toEqual(["githubTokenSecretRef", "webhookSecretRef"]);
+  });
+  it("accept the { type: secret_ref, secretId, version? } object the picker stores (host Ajv validator)", () => {
+    const config = { enabled: true, githubOrg: "o", webhookSecretRef: binding, githubTokenSecretRef: { ...binding, version: 2 } };
+    expect(validateInstanceConfig(config, schema)).toEqual({ valid: true });
+    // type: "string" would make the host refuse the stored binding object ("must be string").
+    expect(validateInstanceConfig({ webhookSecretRef: "not-a-ref" }, schema).valid).toBe(false);
   });
 });
 

@@ -9,9 +9,16 @@ export function claimSql(ns: string): string {
 values ($1, $2, $3, $4, $5, $6, $7::jsonb) on conflict do nothing`;
 }
 
-/** Cheap pre-check so a redelivered or repeated red check costs no GitHub lookup. The claim stays the atomic gate. */
+/** What a retry needs from a ledger row (sweep and redelivery alike). */
+const ROW_COLUMNS = `fingerprint, outcome, attempts, updated_at::text as updated_at, signal::text as signal, issue_id::text as issue_id,
+comment_posted_at::text as comment_posted_at, wake_attempted_at::text as wake_attempted_at`;
+
+/**
+ * Pre-check before any GitHub lookup: a row that already woke (or may have) makes the signal a duplicate at no
+ * cost; a row whose wake was never attempted is resumed at once (plugin.ts). The claim stays the atomic gate.
+ */
 export function seenSql(ns: string): string {
-  return `select fingerprint from ${ns}.wake_ledger where company_id = $1 and fingerprint = $2`;
+  return `select ${ROW_COLUMNS} from ${ns}.wake_ledger where company_id = $1 and fingerprint = $2`;
 }
 
 /** Outcome of the attempt that holds the row. `attempts` counts sweep retries and is bumped only by reclaimSql. */
@@ -35,38 +42,56 @@ export function markCommentPostedSql(ns: string): string {
 where company_id = $1 and fingerprint = $2`;
 }
 
+/**
+ * The atomic gate right before requestWakeup: rowCount 1 only for the first attempt that marks the row. An attempt
+ * that stalled past the 10-minute stuck window while another one took its row (and woke, or forgot the row after a
+ * skip) gets 0 and never requests the wake. $4 is this attempt's own mark value.
+ */
 export function markWakeAttemptedSql(ns: string): string {
-  return `update ${ns}.wake_ledger set wake_attempted_at = now(), issue_id = $3, updated_at = now()
-where company_id = $1 and fingerprint = $2`;
+  return `update ${ns}.wake_ledger set wake_attempted_at = $4::timestamptz, issue_id = $3, updated_at = now()
+where company_id = $1 and fingerprint = $2 and wake_attempted_at is null`;
 }
 
 /**
- * Undo the wake mark when requestWakeup provably never reached the host (the mark's own DB reply was lost before
- * the call, or the host refused before dispatch), so the sweep may retry it instead of closing it unconfirmed.
+ * Undo this attempt's own wake mark ($3, the value it set) when requestWakeup provably never reached the host (the
+ * mark's own DB reply was lost before the call, or the host refused before dispatch), so the sweep may retry it
+ * instead of closing it unconfirmed. Never clears another attempt's mark.
  */
 export function releaseWakeAttemptSql(ns: string): string {
   return `update ${ns}.wake_ledger set wake_attempted_at = null, outcome = 'error', updated_at = now()
-where company_id = $1 and fingerprint = $2`;
+where company_id = $1 and fingerprint = $2 and wake_attempted_at = $3::timestamptz`;
 }
 
-/** Sweep retries per row after the first attempt (webhook or sweep). */
-export const MAX_RETRIES = 4;
+/**
+ * Retries per row (sweep and redelivery). With the backoff below the last one runs about 8 hours after the first
+ * failure; a row selected again after that is forgotten (forgetSql), never left to block a later signal.
+ */
+export const MAX_RETRIES = 12;
 
 /**
- * Rows the sweep finishes: transient errors after 2 minutes, rows still at 'claimed' or 'retrying' after 10 minutes
- * (the worker stopped mid-attempt), and rows without a resolvable owning card yet (the doer's PR-link comment often
- * lands after a fast check) with a growing backoff of 5, 10, 15, 20 minutes. All bounded by MAX_RETRIES; compacted
- * tombstones (compactSql) are never retried. Each row is then taken with reclaimSql.
+ * Rows the sweep finishes: transient errors (GitHub down, secret refused) and rows without a resolvable or eligible
+ * owning card yet (the doer's PR-link comment often lands after a fast check; the owner may be with the Reviewer)
+ * with an exponential backoff of 2, 4, 8, 16, 32, then 60 minutes; and rows still at 'claimed' or 'retrying' after
+ * 10 minutes (the worker stopped mid-attempt). Compacted tombstones (compactSql) are never retried. Each row is then
+ * taken with reclaimSql.
  */
 export function retryableSql(ns: string): string {
-  return `select fingerprint, outcome, updated_at::text as updated_at, signal::text as signal, issue_id::text as issue_id,
-comment_posted_at::text as comment_posted_at, wake_attempted_at::text as wake_attempted_at
+  return `select ${ROW_COLUMNS}
 from ${ns}.wake_ledger
-where company_id = $1 and attempts < ${MAX_RETRIES} and signal <> '{}'::jsonb and (
-(outcome = 'error' and updated_at < now() - interval '2 minutes')
-or (outcome in ('claimed', 'retrying') and updated_at < now() - interval '10 minutes')
-or (outcome = 'no_card' and updated_at < now() - interval '5 minutes' * (attempts + 1)))
+where company_id = $1 and signal <> '{}'::jsonb and (
+(outcome in ('error', 'no_card') and updated_at < now() - interval '1 minute' * least(power(2, attempts + 1), 60))
+or (outcome in ('claimed', 'retrying') and updated_at < now() - interval '10 minutes'))
 order by updated_at asc limit 20`;
+}
+
+/**
+ * Drop a row whose wake was never requested: a skip that is not final for the fingerprint (check not red yet,
+ * draft, not conflicting), or a spent retry budget. A later genuine signal on the same head and state can then
+ * claim it again. A row whose wake may have reached the host is never deleted (at most once).
+ */
+export function forgetSql(ns: string): string {
+  return `delete from ${ns}.wake_ledger
+where company_id = $1 and fingerprint = $2 and wake_attempted_at is null`;
 }
 
 /**
@@ -90,19 +115,20 @@ where i.company_id = $1 and i.identifier = $2
 limit 1`;
 
 /**
- * The card whose own assignee first posted this exact PR URL (the authoring card), whatever its status. Comments by
- * excluded agents (the Reviewer) and chat-channel cards never establish ownership.
+ * The card on which an agent first posted this exact PR URL (the doer's PR-link comment), whatever the card's status
+ * or CURRENT assignee: ownership must not move when the owner is handed to the Reviewer, or a later card that merely
+ * mentioned the PR would be promoted. Comments by excluded agents (the Reviewer), by people and by plugins (no
+ * author agent) and chat-channel cards never establish ownership. Eligibility is checked on the owner afterwards.
  * Interim until plugins can read issue_work_products; see README "Card resolution".
  */
-export const CARD_BY_COMMENT_SQL = `select i.id, i.identifier, i.status, i.assignee_agent_id, min(c.created_at) as first_mention
+export const CARD_BY_COMMENT_SQL = `select i.id, i.identifier, i.status, min(c.created_at) as first_mention
 from public.issues i
 join public.issue_comments c on c.issue_id = i.id
-where i.company_id = $1
-and i.assignee_agent_id is not null and not (i.assignee_agent_id::text = any(string_to_array($4, ',')))
-and i.origin_kind is distinct from 'chat_channel'
-and c.company_id = $1 and c.author_agent_id = i.assignee_agent_id and c.deleted_at is null
+where i.company_id = $1 and i.origin_kind is distinct from 'chat_channel'
+and c.company_id = $1 and c.deleted_at is null
+and c.author_agent_id is not null and not (c.author_agent_id::text = any(string_to_array($4, ',')))
 and c.body ilike $2 and c.body ~* $3
-group by i.id, i.identifier, i.status, i.assignee_agent_id
+group by i.id, i.identifier, i.status
 order by first_mention asc
 limit 1`;
 

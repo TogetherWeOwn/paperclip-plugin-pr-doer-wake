@@ -8,14 +8,18 @@ export const SECRET_TTL_MS = 10 * 60_000;
  * (every other failure evicts it); past this age it is refused even then.
  */
 export const SECRET_MAX_STALE_MS = 30 * 60_000;
-/** After a verification miss, at most one re-resolution per key in this window. */
+/**
+ * After a verification miss, at most one re-resolution per key in this window; also how long a failed resolution
+ * (secret unbound, deactivated or deleted, or the host's rate limit) is cached before `get` resolves again.
+ */
 export const SECRET_MISS_BACKOFF_MS = 60_000;
 /** After GitHub rejects the token (HTTP 401), no re-resolution of it for this long. */
 export const SECRET_REJECTED_BACKOFF_MS = 5 * 60_000;
 
-type Entry = { value: string | null; fetchedAt: number; attemptedAt: number; rejectedUntil: number };
+/** `retryAfter`: no resolution through `get` before this time (negative cache after a failure or a 401). */
+type Entry = { value: string | null; fetchedAt: number; attemptedAt: number; retryAfter: number };
 
-/** Thrown by `get` while a rejected secret backs off. Callers treat it as transient. */
+/** Thrown by `get` while a failed or rejected secret backs off. Callers treat it as transient. */
 export class SecretBackoffError extends Error {
   override name = "SecretBackoffError";
 }
@@ -77,14 +81,15 @@ export class SecretCache {
   }
 
   /**
-   * The fresh cached value, else one shared host resolution. Throws host refusals (rate limit), and
-   * SecretBackoffError while a rejected secret backs off.
+   * The fresh cached value, else one shared host resolution. Throws host refusals, and SecretBackoffError while a
+   * failed or rejected secret backs off (negative cache), so an unbound or deactivated secret costs one resolution
+   * per backoff window however many lookups ask for it.
    */
   async get(ctx: PluginContext, companyId: string, ref: SecretRef, configPath: string): Promise<string> {
     const fresh = this.peek(companyId, ref, configPath);
     if (fresh) return fresh;
     const entry = this.entries.get(this.key(companyId, ref, configPath));
-    if (entry && this.now() < entry.rejectedUntil) throw new SecretBackoffError(`${configPath} was rejected; backing off`);
+    if (entry && this.now() < entry.retryAfter) throw new SecretBackoffError(`${configPath} could not be resolved; backing off`);
     return this.resolveOnce(ctx, companyId, ref, configPath);
   }
 
@@ -97,7 +102,7 @@ export class SecretCache {
     const key = this.key(companyId, ref, configPath);
     const running = this.inflight.get(key);
     const entry = this.entries.get(key);
-    if (!running && entry && this.now() - entry.attemptedAt < SECRET_MISS_BACKOFF_MS) return null;
+    if (!running && entry && (this.now() - entry.attemptedAt < SECRET_MISS_BACKOFF_MS || this.now() < entry.retryAfter)) return null;
     try {
       return await (running ?? this.resolveOnce(ctx, companyId, ref, configPath));
     } catch (error) {
@@ -114,7 +119,7 @@ export class SecretCache {
   /** GitHub rejected this secret (HTTP 401): drop it and do not re-resolve it for SECRET_REJECTED_BACKOFF_MS. */
   reject(companyId: string, ref: SecretRef, configPath: string): void {
     const now = this.now();
-    this.entries.set(this.key(companyId, ref, configPath), { value: null, fetchedAt: 0, attemptedAt: now, rejectedUntil: now + SECRET_REJECTED_BACKOFF_MS });
+    this.entries.set(this.key(companyId, ref, configPath), { value: null, fetchedAt: 0, attemptedAt: now, retryAfter: now + SECRET_REJECTED_BACKOFF_MS });
   }
 
   clear(): void {
@@ -128,7 +133,7 @@ export class SecretCache {
     if (running) return running;
     const now = this.now();
     const previous = this.entries.get(key);
-    this.entries.set(key, { value: previous?.value ?? null, fetchedAt: previous?.fetchedAt ?? 0, attemptedAt: now, rejectedUntil: 0 });
+    this.entries.set(key, { value: previous?.value ?? null, fetchedAt: previous?.fetchedAt ?? 0, attemptedAt: now, retryAfter: 0 });
     let request: Promise<string>;
     try {
       request = Promise.resolve(ctx.secrets.resolve(ref as never, { companyId, configPath }));
@@ -137,12 +142,14 @@ export class SecretCache {
     }
     const promise = request.then(
       (value) => {
-        this.entries.set(key, { value, fetchedAt: now, attemptedAt: now, rejectedUntil: 0 });
+        this.entries.set(key, { value, fetchedAt: now, attemptedAt: now, retryAfter: 0 });
         return value;
       },
       (error: unknown) => {
-        // Fail closed: keep the old value only when the host merely rate-limited this resolution.
-        if (!isRateLimited(error)) this.entries.set(key, { value: null, fetchedAt: 0, attemptedAt: now, rejectedUntil: 0 });
+        // Fail closed: keep the old value only when the host merely rate-limited this resolution. Either way, cache
+        // the failure for SECRET_MISS_BACKOFF_MS so repeated lookups cannot spend the shared 30/min budget.
+        const kept = isRateLimited(error) ? this.entries.get(key) : undefined;
+        this.entries.set(key, { value: kept?.value ?? null, fetchedAt: kept?.fetchedAt ?? 0, attemptedAt: now, retryAfter: now + SECRET_MISS_BACKOFF_MS });
         throw error;
       },
     );

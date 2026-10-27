@@ -5,7 +5,7 @@ import {
   evaluate,
   fingerprint,
   ONE_PR_QUERY,
-  ONE_PR_WITH_CHECK_QUERY,
+  ONE_PR_WITH_CHECKS_QUERY,
   OPEN_PRS_QUERY,
   mayAct,
   ownerOf,
@@ -20,8 +20,8 @@ import {
   type Signal,
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
-import { compactSql, reclaimSql, retryableSql, seenSql } from "./sql.js";
-import { deferSignal, markUnconfirmed, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
+import { MAX_RETRIES, compactSql, reclaimSql, retryableSql, seenSql } from "./sql.js";
+import { deferSignal, forget, markUnconfirmed, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
 let lock: Promise<unknown> = Promise.resolve();
@@ -87,6 +87,12 @@ async function verifiedCompany(ctx: PluginContext, candidates: Company[], rawBod
   return null;
 }
 
+/** What the GitHub token must be allowed to read (README "GitHub token"). */
+export const TOKEN_PERMISSIONS =
+  "pull requests and check runs of every repo in githubOrg: a classic token (no scope for public repos, `repo` for private ones) or another token with Pull requests: read and Checks: read; fine-grained personal access tokens cannot read check runs";
+
+type GraphqlError = { type?: string; message?: string; path?: unknown[] };
+
 async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: DoerWakeConfig, query: string, variables: Record<string, unknown>): Promise<T | null> {
   if (!config.githubTokenSecretRef) throw new Error("githubTokenSecretRef is not configured");
   const token = await secrets.get(ctx, companyId, config.githubTokenSecretRef, "githubTokenSecretRef");
@@ -98,8 +104,22 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
   // A dead token (expired PAT) must not re-resolve on every lookup: the budget is shared with the webhook secret.
   if (response.status === 401) secrets.reject(companyId, config.githubTokenSecretRef, "githubTokenSecretRef");
   if (!response.ok) throw new Error(`GitHub GraphQL HTTP ${response.status}`);
-  const body = (await response.json()) as { data?: T; errors?: unknown };
-  if (body.errors) throw new Error("GitHub GraphQL returned errors");
+  const body = (await response.json()) as { data?: T; errors?: GraphqlError[] };
+  if (body.errors) {
+    // A field the token may not read comes back as a partial error beside partial data: a config error, never
+    // read as "PR closed" or "check not red". The signal stays retryable and wakes once the token is fixed.
+    const denied = (Array.isArray(body.errors) ? body.errors : []).filter(
+      (e) => e?.type === "FORBIDDEN" || e?.type === "INSUFFICIENT_SCOPES" || /not accessible by/i.test(String(e?.message ?? "")),
+    );
+    if (denied.length > 0) {
+      const paths = denied.map((e) => (Array.isArray(e.path) ? e.path.join(".") : "?"));
+      ctx.logger.error("pr-doer-wake: GitHub token lacks a permission (config error); the signal is kept and retried", {
+        companyId, paths, types: denied.map((e) => e.type ?? null), needs: TOKEN_PERMISSIONS,
+      });
+      throw new Error(`GitHub token lacks a permission for ${paths.join(", ")}`);
+    }
+    throw new Error("GitHub GraphQL returned errors");
+  }
   return body.data ?? null;
 }
 
@@ -111,25 +131,81 @@ async function githubGraphql<T>(ctx: PluginContext, companyId: string, config: D
  */
 async function currentPrState(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<PrCheck> {
   const [owner, name] = signal.repo.split("/");
-  const checkName = signal.state === "conflict" ? null : (signal.detail.checkName ?? (signal.state === "review_findings" ? config.reviewCheckName : null));
-  if (signal.state !== "conflict" && !checkName) return { kind: "skip", outcome: "check_not_red", detail: "signal names no check" };
   let pr: GraphPr | null | undefined;
   try {
     const data = await githubGraphql<{ repository: { pullRequest: GraphPr | null } | null }>(
       ctx, companyId, config,
-      checkName ? ONE_PR_WITH_CHECK_QUERY : ONE_PR_QUERY,
-      checkName ? { o: owner, r: name, n: signal.number, check: checkName } : { o: owner, r: name, n: signal.number },
+      signal.state === "conflict" ? ONE_PR_QUERY : ONE_PR_WITH_CHECKS_QUERY,
+      { o: owner, r: name, n: signal.number },
     );
     pr = data?.repository?.pullRequest;
   } catch (error) {
     return { kind: "transient", detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
   }
   if (!pr) return { kind: "skip", outcome: "skipped_closed", detail: "PR not found" };
-  return evaluate(prStateFromGraph(signal.repo, pr, config), signal);
+  return evaluate(prStateFromGraph(signal.repo, pr, config), signal, config);
 }
 
-async function alreadySeen(ctx: PluginContext, companyId: string, fp: string): Promise<boolean> {
-  return (await ctx.db.query(seenSql(ctx.db.namespace || DB_NAMESPACE), [companyId, fp])).length > 0;
+type LedgerRow = {
+  fingerprint: string;
+  outcome: string;
+  attempts: number;
+  updated_at: string;
+  signal: string;
+  issue_id: string | null;
+  comment_posted_at: string | null;
+  wake_attempted_at: string | null;
+};
+
+/**
+ * A row whose wake was never requested and that no attempt holds right now: a signal may resume it at once.
+ * `stale:<reason>` rows were written by builds before 0.1.2 final for skips that did not burn anything.
+ */
+function resumable(row: LedgerRow): boolean {
+  const pending = row.outcome === "error" || row.outcome === "no_card" || row.outcome.startsWith("stale:");
+  return pending && !row.wake_attempted_at && row.signal !== "{}";
+}
+
+/**
+ * Take one ledger row (conditional UPDATE, rowCount 1 = this attempt owns it) and finish it: re-apply policy and
+ * re-read the PR from GitHub, then wake, keep it for another retry, or forget it. Shared by the sweep and by an
+ * authenticated redelivery (`fresh`, the newly delivered signal for the same fingerprint, whose run identity tells
+ * GitHub read lag from a recovered check). A row whose wake may have reached the host is closed as
+ * wake_unconfirmed and never requested again; a row past MAX_RETRIES is forgotten so a later signal starts over.
+ */
+async function retryRow(ctx: PluginContext, companyId: string, config: DoerWakeConfig, row: LedgerRow, fresh?: Signal): Promise<WakeResult> {
+  const ns = ctx.db.namespace || DB_NAMESPACE;
+  const fp = row.fingerprint;
+  const claimed = await ctx.db.execute(reclaimSql(ns), [companyId, fp, row.outcome, row.updated_at]);
+  if (claimed.rowCount !== 1) return { fingerprint: fp, outcome: "duplicate", detail: "taken by another attempt" };
+  if (row.wake_attempted_at) {
+    // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
+    return markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake");
+  }
+  if (Number(row.attempts) >= MAX_RETRIES) {
+    await forget(ctx, companyId, fp);
+    ctx.logger.warn("pr-doer-wake: retries spent; the row is forgotten and a later signal starts over", { fingerprint: fp, lastOutcome: row.outcome });
+    return { fingerprint: fp, outcome: "gave_up", detail: row.outcome };
+  }
+  const signal = fresh ?? (JSON.parse(row.signal) as Signal);
+  const policy = policySkip(config, signal);
+  if (policy) {
+    await forget(ctx, companyId, fp);
+    return { fingerprint: fp, outcome: policy };
+  }
+  const check = await currentPrState(ctx, companyId, config, signal);
+  if (check.kind === "transient") {
+    await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
+    return { fingerprint: fp, outcome: "deferred", detail: check.detail };
+  }
+  if (check.kind === "skip") {
+    // Not woken: forgotten, so a later genuine signal on the same head and state can still wake.
+    await forget(ctx, companyId, fp);
+    return { fingerprint: fp, outcome: check.outcome, detail: check.detail };
+  }
+  return wakeForSignal(ctx, companyId, config, check.signal, {
+    retry: { issueId: row.issue_id, commentPostedAt: row.comment_posted_at, wakeAttemptedAt: row.wake_attempted_at },
+  });
 }
 
 export async function handleGithubEvent(eventName: string, payload: Record<string, any>, companyId: string, config: DoerWakeConfig): Promise<WakeResult[]> {
@@ -149,9 +225,16 @@ export async function handleGithubEvent(eventName: string, payload: Record<strin
       results.push({ fingerprint: fp, outcome: "skipped_state" });
       continue;
     }
-    if (await alreadySeen(ctx, companyId, fp)) {
-      results.push({ fingerprint: fp, outcome: "duplicate" });
-      continue;
+    const [existing] = await ctx.db.query<LedgerRow>(seenSql(ctx.db.namespace || DB_NAMESPACE), [companyId, fp]);
+    if (existing) {
+      // A row whose wake was never attempted (GitHub was down, no owning card yet) is resumed now instead of
+      // waiting for its backoff; any other row is a duplicate and costs no GitHub lookup. A row whose retries are
+      // spent is forgotten, and this signal then starts over below.
+      const resumed = resumable(existing) ? await retryRow(ctx, companyId, config, existing, raw) : { fingerprint: fp, outcome: "duplicate" as const };
+      if (resumed.outcome !== "gave_up") {
+        results.push(resumed);
+        continue;
+      }
     }
     const check = await currentPrState(ctx, companyId, config, raw);
     if (check.kind === "ok") results.push(await wakeForSignal(ctx, companyId, config, check.signal));
@@ -194,7 +277,7 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
           const signal: Signal = {
             repo, number: pr.number, head: pr.headRefOid, state: "conflict", url: pr.url, headRef: pr.headRefName, draft: null, trusted: null, detail: {},
           };
-          const check = evaluate(prStateFromGraph(repo, pr, config), signal); // this page is the authoritative read
+          const check = evaluate(prStateFromGraph(repo, pr, config), signal, config); // this page is the authoritative read
           results.push(check.kind === "ok" ? await wakeForSignal(ctx, companyId, config, check.signal) : { fingerprint: fingerprint(signal), outcome: check.kind === "skip" ? check.outcome : "error" });
         }
         if (!connection.pageInfo.hasNextPage) {
@@ -231,56 +314,12 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
   });
 }
 
-type RetryRow = {
-  fingerprint: string;
-  outcome: string;
-  updated_at: string;
-  signal: string;
-  issue_id: string | null;
-  comment_posted_at: string | null;
-  wake_attempted_at: string | null;
-};
-
-/**
- * Finish failed, stuck and card-pending wakes, re-reading the PR first so a now-draft, closed, merged, re-pushed or
- * recovered PR is never woken. Each row is taken with a conditional UPDATE (reclaimSql) and skipped unless this
- * sweep won it. A row whose wake may already have reached the host is closed as wake_unconfirmed instead.
- */
+/** Finish failed, stuck and card-pending wakes (retryableSql backoff), one row at a time (retryRow). */
 async function retryWakes(ctx: PluginContext, configs: Map<string, DoerWakeConfig>, results: WakeResult[]): Promise<void> {
   const ns = ctx.db.namespace || DB_NAMESPACE;
   for (const [companyId, config] of configs) {
-    const rows = await ctx.db.query<RetryRow>(retryableSql(ns), [companyId]);
-    for (const row of rows) {
-      const fp = row.fingerprint;
-      const claimed = await ctx.db.execute(reclaimSql(ns), [companyId, fp, row.outcome, row.updated_at]);
-      if (claimed.rowCount !== 1) {
-        results.push({ fingerprint: fp, outcome: "duplicate", detail: "taken by another attempt" });
-        continue;
-      }
-      const signal = JSON.parse(row.signal) as Signal;
-      if (row.wake_attempted_at) {
-        // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
-        results.push(await markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake"));
-        continue;
-      }
-      const policy = policySkip(config, signal);
-      if (policy) {
-        await recordOutcome(ctx, companyId, fp, `stale:${policy}`, row.issue_id);
-        results.push({ fingerprint: fp, outcome: policy });
-        continue;
-      }
-      const check = await currentPrState(ctx, companyId, config, signal);
-      if (check.kind === "transient") {
-        await recordOutcome(ctx, companyId, fp, "error", row.issue_id);
-        results.push({ fingerprint: fp, outcome: "deferred", detail: check.detail });
-      } else if (check.kind === "skip") {
-        await recordOutcome(ctx, companyId, fp, `stale:${check.outcome}`, row.issue_id);
-        results.push({ fingerprint: fp, outcome: check.outcome, detail: check.detail });
-      } else {
-        results.push(await wakeForSignal(ctx, companyId, config, check.signal, {
-          retry: { issueId: row.issue_id, commentPostedAt: row.comment_posted_at, wakeAttemptedAt: row.wake_attempted_at },
-        }));
-      }
+    for (const row of await ctx.db.query<LedgerRow>(retryableSql(ns), [companyId])) {
+      results.push(await retryRow(ctx, companyId, config, row));
     }
   }
   await ctx.db.execute(compactSql(ns));
