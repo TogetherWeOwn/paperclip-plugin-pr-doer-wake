@@ -19,7 +19,7 @@ import {
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
 import { pruneSql, retryableSql, seenSql } from "./sql.js";
-import { deferSignal, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
+import { deferSignal, markUnconfirmed, recordOutcome, wakeForSignal, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
 let lock: Promise<unknown> = Promise.resolve();
@@ -221,7 +221,10 @@ async function sweepConflicts(ctx: PluginContext, configs: Map<string, DoerWakeC
 
 type RetryRow = { fingerprint: string; signal: string; issue_id: string | null; comment_posted_at: string | null; wake_attempted_at: string | null };
 
-/** Finish failed and stuck wakes, re-reading the PR first so a now-draft, closed, merged or re-pushed PR is never woken. */
+/**
+ * Finish failed, stuck and card-pending wakes, re-reading the PR first so a now-draft, closed, merged or re-pushed
+ * PR is never woken. A row whose wake was already requested is closed as wake_unconfirmed instead.
+ */
 async function retryWakes(ctx: PluginContext, configs: Map<string, DoerWakeConfig>, results: WakeResult[]): Promise<void> {
   const ns = ctx.db.namespace || DB_NAMESPACE;
   for (const [companyId, config] of configs) {
@@ -229,6 +232,11 @@ async function retryWakes(ctx: PluginContext, configs: Map<string, DoerWakeConfi
     for (const row of rows) {
       const signal = JSON.parse(row.signal) as Signal;
       const fp = row.fingerprint;
+      if (row.wake_attempted_at) {
+        // Sent before, result unknown: never requested twice (no host receipt to tell; see markUnconfirmed).
+        results.push(await markUnconfirmed(ctx, companyId, fp, row.issue_id, "an earlier attempt already requested the wake"));
+        continue;
+      }
       const check = await currentPrState(ctx, companyId, config, signal);
       if (check.kind === "transient") {
         await recordOutcome(ctx, companyId, fp, "error", row.issue_id);

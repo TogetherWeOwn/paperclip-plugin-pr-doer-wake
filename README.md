@@ -27,20 +27,22 @@ Paperclip has no path from a PR result to the doer's card: `chat-github-checks.t
 
 ## Guarantees
 
-- Exactly once: atomic `INSERT ... ON CONFLICT DO NOTHING` on `(company_id, fingerprint)` in the plugin's own namespace table `wake_ledger`.
-- Retries: the sweep finishes rows at `error` (after 2 minutes) and rows stuck at `claimed` (after 10 minutes, the worker stopped mid-wake), up to 5 attempts. Before every retry it re-reads the PR from GitHub: draft, closed, merged, re-pushed or untrusted PRs end as `stale:<reason>` and are never woken. A PR lookup that fails transiently (GitHub 5xx, secret rate limit) is claimed as `error` and re-read by the sweep instead of dropped.
-- Phases: `comment_posted_at` and `wake_attempted_at` (migration 002) record what an attempt already did. A retry posts the evidence comment only if neither the phase nor an identical comment on the card exists. The host does not dedupe plugin wakes by `idempotencyKey` (it is stored, but `server/src/services/heartbeat/queue.ts` only checks it for `execution-reconciliation:` keys), so a retry after an ambiguous `requestWakeup` first looks in `heartbeat_runs` for a run on the card with this plugin's `contextSnapshot.source` and wake reason created since the attempt, and records that run instead of waking again.
-- Holds: cards in `backlog`/`done`/`cancelled`, with an unresolved `blockedBy`, or (with `skipBlockedStatus`) in `blocked` get no comment and no wake. `ctx.issues.requestWakeup` re-checks assignee, terminal status, blockers and budget hard-stops on the host (`server/src/services/plugin-host-services.ts:2354-2372`).
+- At most once: atomic `INSERT ... ON CONFLICT DO NOTHING` on `(company_id, fingerprint)` in the plugin's own namespace table `wake_ledger`, and a wake that was requested is never requested again.
+- Retries: the sweep finishes rows at `error` (after 2 minutes), rows stuck at `claimed` (after 10 minutes, the worker stopped mid-wake) and rows at `no_card` (after 5, 10, 15, 20 minutes: the doer's PR-link comment often lands after a fast check), up to 5 attempts. Before every retry it re-reads the PR from GitHub: draft, closed, merged, re-pushed or untrusted PRs end as `stale:<reason>` and are never woken. A PR lookup that fails transiently (GitHub 5xx, secret rate limit, rejected token) is claimed as `error` and re-read by the sweep instead of dropped.
+- Phases: `comment_posted_at` and `wake_attempted_at` (migration 002) record what an attempt already did. A retry posts the evidence comment only if neither the phase nor an identical comment on the card exists. Once `wake_attempted_at` is set and no success reply was recorded (lost reply, timeout, worker stopped mid-call), the row ends as `wake_unconfirmed` and is not requested again, with a warning in the log. The host can accept a plugin wake as a new run, coalesce it into a running one or persist it as a deferred request with no run (`server/src/services/heartbeat/queue.ts` ~3733-3740 and ~4110-4118), it does not dedupe plugin `idempotencyKey`s (only `execution-reconciliation:` keys), and plugins cannot read `agent_wakeup_requests`, so no plugin-side check can prove a lost request was not accepted. Upstream exit (not filed yet; search first per CONTRIBUTING.md): have `requestWakeup` dedupe on a plugin `idempotencyKey` and return the existing receipt, which would let a retry safely repeat the call.
+- Holds: cards in `backlog`/`done`/`cancelled`, with an unresolved `blockedBy`, or (with `skipBlockedStatus`) in `blocked` get no comment and no wake. Every attempt, retries included, re-reads the card and treats it as `no_card` if its current assignee is missing or in `excludeAgentIds`. `ctx.issues.requestWakeup` re-checks assignee, terminal status, blockers and budget hard-stops on the host (`server/src/services/plugin-host-services.ts:2354-2372`).
 - The evidence comment is plugin-authored; plugin comments never wake anyone (SDK `createComment` doc). The wake is `requestWakeup` with reason `github_pr_<state>`.
 - `shadow: true` (the default) records `shadow:<card>` in the ledger and wakes nobody.
 
 ## Card resolution (interim)
 
-Core reads: `issues`, `issue_comments` (card resolution, evidence-comment check) and `heartbeat_runs` (ambiguous-wake check). Plugins cannot read `issue_work_products` (not in `PLUGIN_DATABASE_CORE_READ_TABLES`, `packages/shared/src/constants.ts:1442`). Until upstream adds it, the owner is:
-1. the live card named by the head branch (`TOG-123-slug`), else
+Core reads: `issues` and `issue_comments` only (card resolution, evidence-comment check). Plugins cannot read `issue_work_products` (not in `PLUGIN_DATABASE_CORE_READ_TABLES`, `packages/shared/src/constants.ts:1442`). Until upstream adds it, both of these are looked up:
+1. the live card named by the head branch (`TOG-123-slug`), and
 2. the live card whose own assignee first posted the exact PR URL in a comment (Reviewer and `chat_channel` cards excluded).
 
-Measured against `issue_work_products` on 341 live PRs (2026-10-27): 302/326 linked PRs resolve to the same card, 17 resolve to none, 8 to another card.
+If both find a card and they differ, the wake is held as `ambiguous_card` (no comment, no wake). Otherwise the card either path found is the owner; none is `no_card` (retried as above).
+
+Measured against `issue_work_products` on 341 live PRs (2026-10-27): 302/326 linked PRs resolve to the same card, 17 resolve to none, 8 to another card. The `ambiguous_card` hold covers the wrong-card cases where both paths disagree; a single path that picks the wrong card is not detectable without `issue_work_products`.
 
 ## Config (per company)
 

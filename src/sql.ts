@@ -1,7 +1,7 @@
 /**
  * Every statement this plugin sends through ctx.db. Tests run each one through a verbatim copy of the
  * host validators (/app/server/src/services/plugin-database.ts validatePluginRuntimeQuery/Execute).
- * Core reads use only manifest coreReadTables `issues`, `issue_comments` and `heartbeat_runs`
+ * Core reads use only manifest coreReadTables `issues` and `issue_comments`
  * (PLUGIN_DATABASE_CORE_READ_TABLES in packages/shared/src/constants.ts:1442).
  */
 export function claimSql(ns: string): string {
@@ -33,8 +33,9 @@ where company_id = $1 and fingerprint = $2`;
 export const MAX_ATTEMPTS = 5;
 
 /**
- * Rows the sweep finishes: transient errors after 2 minutes, and rows still at 'claimed' after 10 minutes
- * (the worker stopped between claim and outcome).
+ * Rows the sweep finishes: transient errors after 2 minutes, rows still at 'claimed' after 10 minutes (the worker
+ * stopped between claim and outcome), and rows without a resolvable owning card yet (the doer's PR-link comment
+ * often lands after a fast check) with a growing backoff of 5, 10, 15, 20 minutes. All bounded by MAX_ATTEMPTS.
  */
 export function retryableSql(ns: string): string {
   return `select fingerprint, signal::text as signal, issue_id::text as issue_id,
@@ -42,7 +43,8 @@ comment_posted_at::text as comment_posted_at, wake_attempted_at::text as wake_at
 from ${ns}.wake_ledger
 where company_id = $1 and attempts < ${MAX_ATTEMPTS} and (
 (outcome = 'error' and updated_at < now() - interval '2 minutes')
-or (outcome = 'claimed' and updated_at < now() - interval '10 minutes'))
+or (outcome = 'claimed' and updated_at < now() - interval '10 minutes')
+or (outcome = 'no_card' and updated_at < now() - interval '5 minutes' * attempts))
 order by updated_at asc limit 20`;
 }
 
@@ -71,19 +73,6 @@ and c.company_id = $1 and c.author_agent_id = i.assignee_agent_id and c.deleted_
 and c.body ilike $2 and c.body ~* $3
 group by i.id, i.identifier, i.status, i.assignee_agent_id
 order by first_mention asc
-limit 1`;
-
-/**
- * A run this plugin's wake created on the card since the wake was attempted. The host does not dedupe plugin
- * wakes by idempotencyKey (heartbeat/queue.ts only checks it for execution-reconciliation keys), so a retry after
- * a lost reply looks here first. heartbeat_runs.issue_id comes from contextSnapshot.issueId and
- * (company_id, issue_id, created_at) is indexed (heartbeat_runs_company_issue_created_idx).
- */
-export const RUN_SINCE_SQL = `select r.id
-from public.heartbeat_runs r
-where r.company_id = $1 and r.issue_id = $2 and r.created_at >= $3::timestamptz
-and r.context_snapshot->>'source' = $4 and r.context_snapshot->>'wakeReason' = $5
-order by r.created_at asc
 limit 1`;
 
 /** The evidence comment is already on the card (posted, but the phase mark was lost). */

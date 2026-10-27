@@ -7,7 +7,6 @@ import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
-  RUN_SINCE_SQL,
   claimSql,
   markCommentPostedSql,
   markWakeAttemptedSql,
@@ -44,20 +43,21 @@ describe("host contract", () => {
       for (const s of statements) expect(() => validatePluginMigrationStatement(s, DB_NAMESPACE, core)).not.toThrow();
     }
   });
-  it("reads only issues, issue_comments and heartbeat_runs from core", () => {
-    expect([...core].sort()).toEqual(["heartbeat_runs", "issue_comments", "issues"]);
+  it("reads only issues and issue_comments from core", () => {
+    expect([...core].sort()).toEqual(["issue_comments", "issues"]);
   });
   it("runtime queries pass validatePluginRuntimeQuery with the declared core tables only", () => {
-    for (const q of [CARD_BY_IDENTIFIER_SQL, CARD_BY_COMMENT_SQL, COMMENT_EXISTS_SQL, RUN_SINCE_SQL, retryableSql(DB_NAMESPACE), seenSql(DB_NAMESPACE)]) {
+    for (const q of [CARD_BY_IDENTIFIER_SQL, CARD_BY_COMMENT_SQL, COMMENT_EXISTS_SQL, retryableSql(DB_NAMESPACE), seenSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeQuery(q, DB_NAMESPACE, core)).not.toThrow();
     }
     expect(() => validatePluginRuntimeQuery(CARD_BY_COMMENT_SQL, DB_NAMESPACE, ["issues"])).toThrow(/issue_comments/);
-    expect(() => validatePluginRuntimeQuery(RUN_SINCE_SQL, DB_NAMESPACE, ["issues", "issue_comments"])).toThrow(/heartbeat_runs/);
   });
-  it("retries both failed rows and rows stuck at claimed", () => {
+  it("retries failed rows, rows stuck at claimed and card-pending rows with a growing backoff", () => {
     const sql = retryableSql(DB_NAMESPACE);
     expect(sql).toMatch(/outcome = 'error'/);
     expect(sql).toMatch(/outcome = 'claimed' and updated_at < now\(\) - interval '10 minutes'/);
+    expect(sql).toMatch(/outcome = 'no_card' and updated_at < now\(\) - interval '5 minutes' \* attempts/);
+    expect(sql).toMatch(/attempts < 5/);
   });
   it("runtime writes pass validatePluginRuntimeExecute", () => {
     for (const q of [claimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), pruneSql(DB_NAMESPACE)]) {

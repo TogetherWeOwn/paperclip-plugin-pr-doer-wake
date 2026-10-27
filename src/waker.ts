@@ -6,7 +6,6 @@ import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
-  RUN_SINCE_SQL,
   claimSql,
   markCommentPostedSql,
   markWakeAttemptedSql,
@@ -27,11 +26,13 @@ export type Outcome =
   | SkipOutcome
   | "deferred"
   | "no_card"
+  | "ambiguous_card"
   | "held_status"
   | "held_blockers"
   | "shadow"
   | "woken"
   | "refused"
+  | "wake_unconfirmed"
   | "error";
 
 export interface WakeResult {
@@ -62,24 +63,31 @@ function namespace(ctx: PluginContext): string {
   return ctx.db.namespace || DB_NAMESPACE;
 }
 
-export async function resolveCard(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<CardRef | null> {
+export type CardResolution = { kind: "card"; card: CardRef } | { kind: "none" } | { kind: "ambiguous"; detail: string };
+
+/**
+ * The owning card from both interim paths (README "Card resolution"). When both find a card and they disagree,
+ * the owner is unknown: the wake is held rather than sent to a card that may be unrelated.
+ */
+export async function resolveCard(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<CardResolution> {
   const exclude = config.excludeAgentIds.join(",");
+  type Row = { id: string; identifier: string; status: string };
+  let byBranch: CardRef | null = null;
   if (signal.headRef) {
     const match = new RegExp(config.branchIdentifierPattern).exec(signal.headRef);
     if (match?.[1]) {
-      const rows = await ctx.db.query<{ id: string; identifier: string; status: string }>(CARD_BY_IDENTIFIER_SQL, [companyId, match[1], exclude]);
-      if (rows[0]) return { id: rows[0].id, identifier: rows[0].identifier, status: rows[0].status, via: "branch" };
+      const rows = await ctx.db.query<Row>(CARD_BY_IDENTIFIER_SQL, [companyId, match[1], exclude]);
+      if (rows[0]) byBranch = { id: rows[0].id, identifier: rows[0].identifier, status: rows[0].status, via: "branch" };
     }
   }
   const { like, regex } = prUrlPatterns(signal.repo, signal.number);
-  const rows = await ctx.db.query<{ id: string; identifier: string; status: string }>(CARD_BY_COMMENT_SQL, [companyId, like, regex, exclude]);
-  return rows[0] ? { id: rows[0].id, identifier: rows[0].identifier, status: rows[0].status, via: "comment" } : null;
-}
-
-/** A retry stays on the card the first attempt chose (it may already carry the evidence comment). */
-async function cardFromLedger(ctx: PluginContext, companyId: string, issueId: string): Promise<CardRef | null> {
-  const issue = await ctx.issues.get(issueId, companyId);
-  return issue ? { id: issue.id, identifier: issue.identifier ?? issue.id, status: issue.status, via: "ledger" } : null;
+  const rows = await ctx.db.query<Row>(CARD_BY_COMMENT_SQL, [companyId, like, regex, exclude]);
+  const byComment: CardRef | null = rows[0] ? { id: rows[0].id, identifier: rows[0].identifier, status: rows[0].status, via: "comment" } : null;
+  if (byBranch && byComment && byBranch.id !== byComment.id) {
+    return { kind: "ambiguous", detail: `branch:${byBranch.identifier} comment:${byComment.identifier}` };
+  }
+  const card = byBranch ?? byComment;
+  return card ? { kind: "card", card } : { kind: "none" };
 }
 
 export function evidenceComment(signal: Signal): string {
@@ -99,6 +107,17 @@ export function evidenceComment(signal: Signal): string {
 
 export async function recordOutcome(ctx: PluginContext, companyId: string, fp: string, outcome: string, issueId: string | null) {
   await ctx.db.execute(recordOutcomeSql(namespace(ctx)), [companyId, fp, outcome, issueId]);
+}
+
+/**
+ * requestWakeup was sent but its result is unknown (lost reply, timeout, worker stopped mid-call). The host may
+ * have queued, deferred or coalesced it, and plugins can neither have it dedupe by idempotencyKey nor read its
+ * receipt (agent_wakeup_requests is not a plugin core-read table), so it is never requested again: at most once.
+ */
+export async function markUnconfirmed(ctx: PluginContext, companyId: string, fp: string, issueId: string | null, detail: string): Promise<WakeResult> {
+  await recordOutcome(ctx, companyId, fp, "wake_unconfirmed", issueId);
+  ctx.logger.warn("pr-doer-wake: wake request outcome unknown; not repeated (at most once)", { fingerprint: fp, error: detail });
+  return { fingerprint: fp, outcome: "wake_unconfirmed", detail };
 }
 
 async function claim(ctx: PluginContext, companyId: string, fp: string, signal: Signal): Promise<boolean> {
@@ -122,10 +141,11 @@ export async function deferSignal(ctx: PluginContext, companyId: string, config:
 }
 
 /**
- * Wake the card that owns this PR exactly once per (PR, head SHA, state).
- * Order: state filter -> draft/trust gate -> atomic ledger claim -> card -> hold checks -> evidence comment -> requestWakeup.
- * requestWakeup stays the authority for terminal status, blockers, assignee and budget.
- * A retry (`opts.retry`) skips the claim and every phase the ledger says already happened.
+ * Wake the card that owns this PR at most once per (PR, head SHA, state).
+ * Order: state filter -> draft/trust gate -> atomic ledger claim -> card -> eligibility and hold checks ->
+ * evidence comment -> wake-attempt mark -> requestWakeup. requestWakeup stays the authority for terminal status,
+ * blockers, assignee and budget. A retry (`opts.retry`) skips the claim and every phase the ledger says already
+ * happened; once a wake was attempted it is never requested again (see markUnconfirmed).
  */
 export async function wakeForSignal(
   ctx: PluginContext,
@@ -142,17 +162,36 @@ export async function wakeForSignal(
   if (signal.draft === null) return { fingerprint: fp, outcome: "draft_unknown" };
 
   if (!retry && !(await claim(ctx, companyId, fp, signal))) return { fingerprint: fp, outcome: "duplicate" };
+  if (retry?.wakeAttemptedAt) return markUnconfirmed(ctx, companyId, fp, retry.issueId, "an earlier attempt already requested the wake");
 
   const ns = namespace(ctx);
   let card: CardRef | null = null;
   try {
-    card = (retry?.issueId ? await cardFromLedger(ctx, companyId, retry.issueId) : null) ?? (await resolveCard(ctx, companyId, config, signal));
-    if (!card) {
+    if (retry?.issueId) {
+      // A retry stays on the card the first attempt chose (it may already carry the evidence comment).
+      card = { id: retry.issueId, identifier: retry.issueId, status: "", via: "ledger" };
+    } else {
+      const resolved = await resolveCard(ctx, companyId, config, signal);
+      if (resolved.kind === "ambiguous") {
+        await recordOutcome(ctx, companyId, fp, `ambiguous_card:${resolved.detail}`.slice(0, 200), null);
+        ctx.logger.warn("pr-doer-wake: owning card is ambiguous; held", { fingerprint: fp, detail: resolved.detail });
+        return { fingerprint: fp, outcome: "ambiguous_card", detail: resolved.detail };
+      }
+      card = resolved.kind === "card" ? resolved.card : null;
+    }
+    // Pending, not terminal: the doer's PR-link comment often lands after a fast check. The sweep retries no_card
+    // with backoff (retryableSql), re-checking the same card if one was chosen.
+    const issue = card ? await ctx.issues.get(card.id, companyId) : null;
+    if (!card || !issue) {
       await recordOutcome(ctx, companyId, fp, "no_card", null);
       return { fingerprint: fp, outcome: "no_card" };
     }
-    const issue = await ctx.issues.get(card.id, companyId);
-    const status = issue?.status ?? card.status;
+    card = { ...card, identifier: issue.identifier ?? card.identifier, status: issue.status };
+    if (!issue.assigneeAgentId || config.excludeAgentIds.includes(issue.assigneeAgentId)) {
+      await recordOutcome(ctx, companyId, fp, "no_card", card.id);
+      return { fingerprint: fp, outcome: "no_card", card: card.identifier, detail: "assignee not eligible" };
+    }
+    const status = issue.status;
     if (["backlog", "done", "cancelled"].includes(status) || (config.skipBlockedStatus && status === "blocked")) {
       await recordOutcome(ctx, companyId, fp, `held_status:${status}`, card.id);
       return { fingerprint: fp, outcome: "held_status", card: card.identifier, detail: status };
@@ -175,14 +214,6 @@ export async function wakeForSignal(
       await ctx.db.execute(markCommentPostedSql(ns), [companyId, fp, card.id]);
     }
     const reason = `github_pr_${signal.state}`;
-    if (retry?.wakeAttemptedAt) {
-      // The earlier requestWakeup may have succeeded with its reply lost: look for the run it created.
-      const runs = await ctx.db.query<{ id: string }>(RUN_SINCE_SQL, [companyId, card.id, retry.wakeAttemptedAt, CONTEXT_SOURCE, reason]);
-      if (runs[0]) {
-        await recordOutcome(ctx, companyId, fp, `woken:${runs[0].id}`, card.id);
-        return { fingerprint: fp, outcome: "woken", card: card.identifier, detail: runs[0].id };
-      }
-    }
     await ctx.db.execute(markWakeAttemptedSql(ns), [companyId, fp, card.id]);
     try {
       const result = await ctx.issues.requestWakeup(card.id, companyId, {
@@ -198,7 +229,7 @@ export async function wakeForSignal(
         await recordOutcome(ctx, companyId, fp, `refused:${message.slice(0, 120)}`, card.id);
         return { fingerprint: fp, outcome: "refused", card: card.identifier, detail: message };
       }
-      throw error;
+      return { ...(await markUnconfirmed(ctx, companyId, fp, card.id, message)), card: card.identifier };
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

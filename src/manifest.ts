@@ -37,8 +37,7 @@ const manifest: PaperclipPluginManifestV1 = {
   database: {
     namespaceSlug: NAMESPACE_SLUG,
     migrationsDir: "migrations",
-    // heartbeat_runs: a retry checks whether the earlier, ambiguous requestWakeup already created a run.
-    coreReadTables: ["issues", "issue_comments", "heartbeat_runs"],
+    coreReadTables: ["issues", "issue_comments"],
   },
   webhooks: [
     {
@@ -53,7 +52,7 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: SWEEP_JOB_KEY,
       displayName: "Conflict sweep and wake retries",
       description:
-        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR and finishes wakes that failed or stalled; prunes the ledger after 30 days.",
+        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR and finishes wakes that failed, stalled or had no owning card yet (never one already requested); prunes the ledger after 30 days.",
       schedule: "*/5 * * * *",
     },
   ],

@@ -9,7 +9,6 @@ import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
   COMMENT_EXISTS_SQL,
-  RUN_SINCE_SQL,
   claimSql,
   markCommentPostedSql,
   markWakeAttemptedSql,
@@ -24,6 +23,7 @@ const DOER = "11111111-1111-4111-8111-111111111111";
 const REVIEWER = "68cba6b5-f816-4853-a3db-4389cd9ae8ca";
 const CARD = "aaaaaaaa-0000-4000-8000-000000000001";
 const BLOCKER = "aaaaaaaa-0000-4000-8000-000000000002";
+const OTHER = "aaaaaaaa-0000-4000-8000-000000000003"; // an unrelated live card
 const SECRET = "whsec-test";
 const HEAD = "c05b0b5d" + "0".repeat(32);
 const HEAD2 = "d15ea5e0" + "0".repeat(32);
@@ -44,8 +44,8 @@ let comments: Array<{ issueId: string; body: string }>;
 let graph: Graph | null;
 let graphFail: boolean;
 let graphCalls: number;
-let runs: Array<{ id: string; issueId: string; createdAt: string; source: string; reason: string }>;
 let failNext: Set<string>; // one-shot injected failures: "comment", "markComment"
+let hostWakeCalls: number; // requestWakeup calls that reached the host, whatever the reply
 
 function issue(id: string, identifier: string, status: string, extra: Record<string, unknown> = {}) {
   return { id, companyId: CID, identifier, title: identifier, status, assigneeAgentId: DOER, ...extra } as any;
@@ -84,10 +84,11 @@ const reviewFailed = (head = HEAD, ref = "feat/quality") => ({
   },
 });
 
-const ciFailed = (name: string, conclusion = "failure", head = HEAD) => ({
+const ciFailed = (name: string, conclusion = "failure", head = HEAD, number = 1903) => ({
   action: "completed",
-  check_run: { name, conclusion, head_sha: head, html_url: "https://github.com/x/runs/2", output: {}, pull_requests: [{ number: 1903, head: { sha: head, ref: "feat/quality" }, base: { ref: "main" } }] },
+  check_run: { name, conclusion, head_sha: head, html_url: "https://github.com/x/runs/2", output: {}, pull_requests: [{ number, head: { sha: head, ref: "feat/quality" }, base: { ref: "main" } }] },
 });
+const row = (number = 1903, state = "ci_red", head = HEAD) => ledger.get(`${CID}|togetherweown/two-web-next#${number}@${head}:${state}`);
 
 function setup(config: Record<string, unknown> = {}) {
   harness = createTestHarness({
@@ -101,7 +102,7 @@ function setup(config: Record<string, unknown> = {}) {
   });
   harness.seed({
     companies: [{ id: CID, name: "TogetherWeOwn" } as any],
-    issues: [issue(CARD, "TOG-43084", "in_review"), issue(BLOCKER, "TOG-1", "in_progress")],
+    issues: [issue(CARD, "TOG-43084", "in_review"), issue(BLOCKER, "TOG-1", "in_progress"), issue(OTHER, "TOG-777", "in_progress")],
   });
   ledger = new Map();
   commentCards = new Map([["github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", CARD]]);
@@ -110,8 +111,8 @@ function setup(config: Record<string, unknown> = {}) {
   graph = { mergeable: "MERGEABLE", isDraft: false }; // what GitHub currently says about PR 1903
   graphFail = false;
   graphCalls = 0;
-  runs = [];
   failNext = new Set();
+  hostWakeCalls = 0;
   const ctx = harness.ctx as any;
   ctx.secrets.resolve = async (ref: { secretId: string }) => (ref.secretId.endsWith("1") ? SECRET : "gh-token");
   // In-memory stand-in for the plugin namespace + the whitelisted core reads.
@@ -142,30 +143,26 @@ function setup(config: Record<string, unknown> = {}) {
   };
   ctx.db.query = async (sql: string, params: unknown[] = []) => {
     const exclude = String(params[params.length - 1] ?? "").split(",");
-    const issues = [...[CARD, BLOCKER].map((id) => harness.ctx.issues.get(id, CID))];
+    const issues = [...[CARD, BLOCKER, OTHER].map((id) => harness.ctx.issues.get(id, CID))];
     const rows = (await Promise.all(issues)).filter(Boolean) as any[];
     const live = rows.filter((r) => !["done", "cancelled"].includes(r.status) && !exclude.includes(r.assigneeAgentId));
     if (sql === CARD_BY_IDENTIFIER_SQL) return live.filter((r) => r.identifier === params[1]);
     if (sql === CARD_BY_COMMENT_SQL) return live.filter((r) => commentCards.get(String(params[2])) === r.id);
     if (sql === seenSql(DB_NAMESPACE)) return ledger.has(`${params[0]}|${params[1]}`) ? [{ fingerprint: params[1] }] : [];
     if (sql === COMMENT_EXISTS_SQL) return comments.filter((c) => c.issueId === params[1] && c.body === params[2]).map(() => ({ id: "c" }));
-    if (sql === RUN_SINCE_SQL) {
-      return runs
-        .filter((r) => r.issueId === params[1] && r.createdAt >= String(params[2]) && r.source === params[3] && r.reason === params[4])
-        .map((r) => ({ id: r.id }));
-    }
     if (sql === retryableSql(DB_NAMESPACE)) {
       return [...ledger.entries()]
-        .filter(([, r]) => (r.outcome === "error" || (r.outcome === "claimed" && r.stale)) && r.attempts < 5)
+        .filter(([, r]) => (["error", "no_card"].includes(r.outcome) || (r.outcome === "claimed" && r.stale)) && r.attempts < 5) // time windows: see sql.test
         .map(([k, r]) => ({ fingerprint: k.split("|")[1], signal: r.signal, issue_id: r.issueId, comment_posted_at: r.commentPostedAt, wake_attempted_at: r.wakeAttemptedAt }));
     }
     throw new Error(`unexpected query ${sql}`);
   };
-  ctx.http.fetch = async () => {
+  ctx.http.fetch = async (_url: string, init?: { body?: string }) => {
     graphCalls += 1;
     if (graphFail) return new Response("bad gateway", { status: 502 });
+    const n = Number(JSON.parse(init?.body ?? "{}").variables?.n ?? 1903);
     const nodes = graph ? [{
-      number: 1903, url: "https://github.com/TogetherWeOwn/two-web-next/pull/1903", state: graph.state ?? "OPEN", isDraft: graph.isDraft,
+      number: n, url: `https://github.com/TogetherWeOwn/two-web-next/pull/${n}`, state: graph.state ?? "OPEN", isDraft: graph.isDraft,
       isCrossRepository: graph.cross ?? false, authorAssociation: graph.association ?? "MEMBER", author: { login: graph.login ?? "doer" },
       headRefOid: graph.head ?? HEAD, headRefName: graph.ref ?? "feat/quality", baseRefName: "main", mergeable: graph.mergeable, updatedAt: graph.updatedAt ?? new Date().toISOString(),
     }] : [];
@@ -173,9 +170,9 @@ function setup(config: Record<string, unknown> = {}) {
   };
   const realWake = ctx.issues.requestWakeup.bind(ctx.issues);
   ctx.issues.requestWakeup = vi.fn(async (issueId: string, companyId: string, options: any) => {
+    hostWakeCalls += 1;
     const result = await realWake(issueId, companyId, options); // harness mirrors the host guards (terminal status, blockers, assignee)
     wakes.push(`${issueId}:${options.reason}:${options.idempotencyKey}`);
-    runs.push({ id: result.runId!, issueId, createdAt: new Date().toISOString(), source: options.contextSource, reason: options.reason });
     return result;
   });
   const realComment = ctx.issues.createComment.bind(ctx.issues);
@@ -190,6 +187,72 @@ function setup(config: Record<string, unknown> = {}) {
 describe("pr-doer-wake end to end (SDK test harness)", () => {
   beforeEach(async () => {
     await setup();
+  });
+
+  it("an accepted wake whose reply was lost (deferred: no heartbeat run) is never requested again", async () => {
+    const ctx = harness.ctx as any;
+    const original = ctx.issues.requestWakeup;
+    ctx.issues.requestWakeup = vi.fn(async () => {
+      hostWakeCalls += 1; // the host persisted a deferred wake request without a run...
+      throw new Error("worker RPC timeout"); // ...and the reply never arrived
+    });
+    await deliver("check_run", ciFailed("build"));
+    ctx.issues.requestWakeup = original;
+    await harness.runJob(SWEEP_JOB_KEY);
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(hostWakeCalls).toBe(1);
+    expect(row()!.outcome).toBe("wake_unconfirmed");
+  });
+
+  it("a retry is never credited with another fingerprint's wake on the same card", async () => {
+    commentCards.set("github\\.com/togetherweown/two-web-next/pull/1904([^0-9]|$)", CARD);
+    const ctx = harness.ctx as any;
+    const original = ctx.issues.requestWakeup;
+    ctx.issues.requestWakeup = vi.fn(async () => { throw new Error("worker RPC timeout"); });
+    await deliver("check_run", ciFailed("build", "failure", HEAD, 1903));
+    ctx.issues.requestWakeup = original;
+    await deliver("check_run", ciFailed("build", "failure", HEAD, 1904)); // same card, woken
+    expect(wakes).toHaveLength(1);
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(row(1904)!.outcome).toMatch(/^woken:/);
+    expect(row(1903)!.outcome).not.toBe(row(1904)!.outcome); // 1904's run is not 1903's receipt
+    expect(row(1903)!.outcome).toBe("wake_unconfirmed");
+  });
+
+  it("a ledger retry re-checks the card's current assignee against excludeAgentIds", async () => {
+    failNext.add("comment"); // transient failure after the card was chosen, before any wake
+    await deliver("check_run", reviewFailed());
+    expect(row(1903, "review_findings")!.outcome).toBe("error");
+    harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review", { assigneeAgentId: REVIEWER })] }); // handed to review
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(row(1903, "review_findings")!.outcome).toBe("no_card");
+    harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review")] }); // back with the doer
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("a check that arrives before the owning card links the PR stays pending and wakes once the link exists", async () => {
+    commentCards.clear();
+    await deliver("check_run", ciFailed("build"));
+    expect(row()!.outcome).toBe("no_card");
+    commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", CARD); // the doer posts the PR URL
+    await deliver("check_run", ciFailed("build")); // redelivery: already claimed
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes).toHaveLength(1);
+    expect(row()!.outcome).toMatch(/^woken:/);
+  });
+
+  it("holds the wake when the branch and the PR-link comment name different cards", async () => {
+    commentCards.set("github\\.com/togetherweown/two-web-next/pull/1903([^0-9]|$)", OTHER);
+    graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
+    await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
+    expect(wakes).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(row(1903, "review_findings")!.outcome).toMatch(/^ambiguous_card/);
+    await harness.runJob(SWEEP_JOB_KEY); // a hold, not retried
+    expect(wakes).toEqual([]);
   });
 
   it("requires githubTokenSecretRef when enabled: every wake is revalidated against GitHub", async () => {
@@ -375,29 +438,23 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toEqual([]);
   });
 
-  it("retries a transient wake failure from the sweep job without a second comment", async () => {
+  it("a requestWakeup error is never retried: without a host receipt a second request could double-wake", async () => {
     const ctx = harness.ctx as any;
     const original = ctx.issues.requestWakeup;
     ctx.issues.requestWakeup = vi.fn(async () => { throw new Error("worker RPC timeout"); });
-    await deliver("pull_request", prEvent());
     await deliver("check_run", reviewFailed());
-    expect([...ledger.values()][0]!.outcome).toBe("error");
+    expect([...ledger.values()][0]!.outcome).toBe("wake_unconfirmed");
     ctx.issues.requestWakeup = original;
-    graph = { mergeable: "MERGEABLE", isDraft: false };
     await harness.runJob(SWEEP_JOB_KEY);
-    expect(wakes).toHaveLength(1);
+    expect(wakes).toEqual([]);
     expect(comments).toHaveLength(1);
-    expect([...ledger.values()][0]!.outcome).toMatch(/^woken:/);
   });
 
   async function failFirstWake() {
-    const ctx = harness.ctx as any;
-    const original = ctx.issues.requestWakeup;
-    ctx.issues.requestWakeup = vi.fn(async () => { throw new Error("worker RPC timeout"); });
+    failNext.add("comment"); // fails before any wake was requested: retryable
     await deliver("pull_request", prEvent());
     await deliver("check_run", reviewFailed());
     expect([...ledger.values()][0]!.outcome).toBe("error");
-    ctx.issues.requestWakeup = original;
   }
 
   for (const [label, current, outcome] of [
@@ -427,13 +484,12 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     await deliver("pull_request", prEvent());
     await deliver("check_run", reviewFailed());
     expect(wakes).toHaveLength(1);
-    expect([...ledger.values()][0]!.outcome).toBe("error");
+    expect([...ledger.values()][0]!.outcome).toBe("wake_unconfirmed");
     ctx.issues.requestWakeup = original;
-    graph = { mergeable: "MERGEABLE", isDraft: false };
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
     expect(comments).toHaveLength(1);
-    expect([...ledger.values()][0]!.outcome).toBe(`woken:${runs[0]!.id}`);
+    expect([...ledger.values()][0]!.outcome).toBe("wake_unconfirmed");
   });
 
   it("fork PRs and outsider authors never wake, even with a card-shaped head branch", async () => {
@@ -459,6 +515,15 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     graph = { mergeable: "CONFLICTING", isDraft: false, cross: true };
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toEqual([]);
+  });
+
+  it("a row stuck at 'claimed' after the wake was requested (worker died mid-call) is not requested again", async () => {
+    const signal = { repo: "togetherweown/two-web-next", number: 1903, head: HEAD, state: "ci_red", url: "u", headRef: "feat/quality", draft: false, trusted: true, detail: {} };
+    ledger.set(`${CID}|togetherweown/two-web-next#1903@${HEAD}:ci_red`, { outcome: "claimed", issueId: CARD, attempts: 0, signal: JSON.stringify(signal), commentPostedAt: new Date().toISOString(), wakeAttemptedAt: new Date().toISOString(), stale: true });
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes).toEqual([]);
+    expect(graphCalls).toBe(0);
+    expect(row()!.outcome).toBe("wake_unconfirmed");
   });
 
   it("recovers a ledger row stuck at 'claimed' (worker died between claim and outcome)", async () => {
