@@ -8,11 +8,11 @@ import { DB_NAMESPACE, SWEEP_JOB_KEY } from "../src/constants.js";
 import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
+  clearClosedSql,
   COMMENT_EXISTS_SQL,
   claimSql,
   compactSql,
   forgetSql,
-  markCommentPostedSql,
   markWakeAttemptedSql,
   reclaimSql,
   recordOutcomeSql,
@@ -68,7 +68,7 @@ let comments: Array<{ issueId: string; body: string }>;
 let graph: Graph | null;
 let graphFail: boolean;
 let graphCalls: number;
-let failNext: Set<string>; // one-shot injected failures: "comment", "markComment", "markWakeLostReply", "takenDuringComment", "recordWoken"
+let failNext: Set<string>; // one-shot faults at the wake mark and outcome write
 let hostWakeCalls: number; // requestWakeup calls that reached the host, whatever the reply
 let baseConfig: Record<string, unknown>;
 let tick: number; // monotonic stand-in for updated_at
@@ -178,6 +178,16 @@ function setup(config: Record<string, unknown> = {}) {
   ctx.db.namespace = DB_NAMESPACE;
   ctx.db.execute = async (sql: string, params: unknown[] = []) => {
     const key = `${params[0]}|${params[1]}`;
+    if (sql === clearClosedSql(DB_NAMESPACE)) {
+      let count = 0;
+      for (const [key, row] of ledger) {
+        const signal = JSON.parse(row.signal);
+        if (key.startsWith(`${params[0]}|`) && signal.repo === params[1] && signal.number === params[2] && !row.wakeAttemptedAt) {
+          ledger.delete(key); count++;
+        }
+      }
+      return { rowCount: count };
+    }
     if (sql === claimSql(DB_NAMESPACE)) {
       if (ledger.has(key)) return { rowCount: 0 };
       ledger.set(key, { outcome: "claimed", issueId: null, attempts: 0, signal: String(params[6]), commentPostedAt: null, wakeAttemptedAt: null, updatedAt: touch(), createdAt: String(params[7]) });
@@ -204,14 +214,13 @@ function setup(config: Record<string, unknown> = {}) {
       Object.assign(row, { outcome: params[2], issueId: params[3], updatedAt: touch() });
       return { rowCount: 1 };
     }
-    if (sql === markCommentPostedSql(DB_NAMESPACE)) {
-      if (failNext.delete("markComment")) throw new Error("db connection reset");
-      const row = ledger.get(key);
-      if (!row || !holds(row, params[3], params[4])) return { rowCount: 0 };
-      Object.assign(row, { commentPostedAt: new Date().toISOString(), issueId: params[2], updatedAt: touch() });
-      return { rowCount: 1 };
-    }
     if (sql === markWakeAttemptedSql(DB_NAMESPACE)) {
+      if (failNext.delete("beforeWakeMark")) throw new Error("db connection reset before wake mark");
+      if (failNext.delete("takenBeforeWakeMark")) {
+        const taken = ledger.get(key)!;
+        if (failNext.delete("forgotten")) ledger.delete(key);
+        else taken.wakeAttemptedAt = "2026-10-27T05:00:00.000Z";
+      }
       const row = ledger.get(key);
       if (!row || row.wakeAttemptedAt || !holds(row, params[4], params[5])) return { rowCount: 0 }; // only the claim holder, only once
       Object.assign(row, { wakeAttemptedAt: String(params[3]), issueId: params[2], updatedAt: touch() });
@@ -321,14 +330,6 @@ function setup(config: Record<string, unknown> = {}) {
   });
   const realComment = ctx.issues.createComment.bind(ctx.issues);
   ctx.issues.createComment = async (issueId: string, body: string, companyId: string, opts?: unknown) => {
-    if (failNext.delete("comment")) throw new Error("worker RPC timeout");
-    if (failNext.delete("takenDuringComment")) {
-      // This attempt stalled here; meanwhile another attempt took the row (a sweep after 10 minutes): it either
-      // forgot it or requested the wake itself.
-      const [key, taken] = [...ledger.entries()][0]!;
-      if (failNext.delete("forgotten")) ledger.delete(key);
-      else taken.wakeAttemptedAt = "2026-10-27T05:00:00.000Z";
-    }
     comments.push({ issueId, body });
     return realComment(issueId, body, companyId, opts);
   };
@@ -338,6 +339,40 @@ function setup(config: Record<string, unknown> = {}) {
 describe("pr-doer-wake end to end (SDK test harness)", () => {
   beforeEach(async () => {
     await setup();
+  });
+
+  it("wakes without posting even with legacy postEvidenceComment enabled", async () => {
+    await setup({ postEvidenceComment: true });
+    await deliver("check_run", ciFailed("build"));
+    expect(wakes).toHaveLength(1);
+    expect(comments).toEqual([]);
+  });
+
+  it("closed clears never-woken retry state without erasing wake dedupe", async () => {
+    graphFail = true;
+    await deliver("check_run", ciFailed("build"));
+    expect(row()?.outcome).toBe("error");
+    graphFail = false;
+    graph = { mergeable: "MERGEABLE", isDraft: false, state: "CLOSED" };
+    await deliver("pull_request", prEvent({ action: "closed", extra: { state: "closed" } }));
+    expect(row()).toBeUndefined();
+    graph = { mergeable: "MERGEABLE", isDraft: false };
+    await deliver("check_run", ciFailed("build"));
+    expect(wakes).toHaveLength(1);
+    graph = { mergeable: "MERGEABLE", isDraft: false, state: "CLOSED" };
+    await deliver("pull_request", prEvent({ action: "closed", extra: { state: "closed" } }));
+    graph = { mergeable: "MERGEABLE", isDraft: false };
+    await deliver("check_run", ciFailed("build"));
+    expect(wakes).toHaveLength(1);
+  });
+
+  it("ignores a delayed close when the PR has since reopened", async () => {
+    graphFail = true;
+    await deliver("check_run", ciFailed("build"));
+    graphFail = false;
+    graph = { mergeable: "MERGEABLE", isDraft: false, state: "OPEN" };
+    await deliver("pull_request", prEvent({ action: "closed", extra: { state: "closed" } }));
+    expect(row()?.outcome).toBe("error");
   });
 
   it("an accepted wake whose reply was lost (deferred: no heartbeat run) is never requested again", async () => {
@@ -371,7 +406,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   });
 
   it("a ledger retry re-checks the card's current assignee against excludeAgentIds", async () => {
-    failNext.add("comment"); // transient failure after the card was chosen, before any wake
+    failNext.add("beforeWakeMark"); // transient failure after the card was chosen, before any wake
     await deliver("check_run", reviewFailed());
     expect(row(1903, "review_findings")!.outcome).toBe("error");
     harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review", { assigneeAgentId: REVIEWER })] }); // handed to review
@@ -462,12 +497,11 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     }
   });
 
-  it("wakes the owning card once with evidence when Paperclip Review fails", async () => {
+  it("wakes the owning card once without creating a comment when Paperclip Review fails", async () => {
     await deliver("pull_request", prEvent());
     await deliver("check_run", reviewFailed());
     expect(wakes).toEqual([`${CARD}:github_pr_review_findings:pr-doer-wake:togetherweown/two-web-next#1903@${HEAD}:review_findings`]);
-    expect(comments).toHaveLength(1);
-    expect(comments[0]!.body).toContain("Paperclip Review scored 3/5");
+    expect(comments).toEqual([]);
     expect(ledger.get(`${CID}|togetherweown/two-web-next#1903@${HEAD}:review_findings`)!.outcome).toMatch(/^woken:/);
   });
 
@@ -504,8 +538,8 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(graphCalls).toBe(1);
     expect(wakes).toEqual([]);
     graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun()] };
-    await deliver("pull_request", prEvent({ action: "ready_for_review" })); // the head's build is still red: wakes now
-    expect(wakes).toHaveLength(1);
+    await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+    expect(wakes).toHaveLength(0);
     await deliver("check_run", ciFailed("build")); // redelivery: same (PR, head, state)
     expect(wakes).toHaveLength(1);
   });
@@ -566,27 +600,18 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect([...ledger.values()][0]!.outcome).toBe("shadow:TOG-43084");
   });
 
-  it("conflict sweep: a push to main marks the repo; the job wakes owners of conflicting non-draft PRs once", async () => {
-    await deliver("pull_request", prEvent());
+  it("push does not schedule a conflict sweep", async () => {
+    graph = { mergeable: "CONFLICTING", isDraft: false };
     await deliver("push", { ref: "refs/heads/main" });
-    graph = { mergeable: "UNKNOWN", isDraft: false };
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toEqual([]);
-    graph = { mergeable: "CONFLICTING", isDraft: false };
-    await harness.runJob(SWEEP_JOB_KEY); // repo stayed marked because mergeability was UNKNOWN
-    expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
-    await deliver("push", { ref: "refs/heads/main" });
-    await harness.runJob(SWEEP_JOB_KEY);
-    expect(wakes).toHaveLength(1); // same head, same state: exactly once
-    const calls = graphCalls;
-    await harness.runJob(SWEEP_JOB_KEY); // nothing marked: no GitHub call
-    expect(graphCalls).toBe(calls);
+    expect(graphCalls).toBe(0);
   });
 
-  it("conflict sweep ignores draft PRs", async () => {
-    await deliver("push", { ref: "refs/heads/main" });
+  it("a conflict synchronize never wakes a PR that GitHub reports as draft", async () => {
     graph = { mergeable: "CONFLICTING", isDraft: true };
-    await harness.runJob(SWEEP_JOB_KEY);
+    await deliver("pull_request", prEvent());
+    expect(graphCalls).toBe(1);
     expect(wakes).toEqual([]);
   });
 
@@ -599,11 +624,11 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     ctx.issues.requestWakeup = original;
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toEqual([]);
-    expect(comments).toHaveLength(1);
+    expect(comments).toEqual([]);
   });
 
   async function failFirstWake() {
-    failNext.add("comment"); // fails before any wake was requested: retryable
+    failNext.add("beforeWakeMark"); // fails before any wake was requested: retryable
     await deliver("pull_request", prEvent());
     await deliver("check_run", reviewFailed());
     expect([...ledger.values()][0]!.outcome).toBe("error");
@@ -640,7 +665,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     ctx.issues.requestWakeup = original;
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
-    expect(comments).toHaveLength(1);
+    expect(comments).toEqual([]);
     expect([...ledger.values()][0]!.outcome).toBe("wake_unconfirmed");
   });
 
@@ -662,10 +687,10 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toHaveLength(1);
   });
 
-  it("the conflict sweep ignores fork PRs", async () => {
-    await deliver("push", { ref: "refs/heads/main" });
+  it("a conflict synchronize never wakes a fork PR", async () => {
     graph = { mergeable: "CONFLICTING", isDraft: false, cross: true };
-    await harness.runJob(SWEEP_JOB_KEY);
+    await deliver("pull_request", prEvent());
+    expect(graphCalls).toBe(1);
     expect(wakes).toEqual([]);
   });
 
@@ -684,7 +709,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     graph = { mergeable: "MERGEABLE", isDraft: false };
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
-    expect(comments).toHaveLength(1);
+    expect(comments).toEqual([]);
     expect([...ledger.values()][0]!.outcome).toMatch(/^woken:/);
   });
 
@@ -751,18 +776,14 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
   });
 
-  it("a newly opened conflicting PR wakes even though the payload's mergeability is not computed yet", async () => {
+  it("an opened PR does not wake, even if conflicting", async () => {
     graph = { mergeable: "CONFLICTING", isDraft: false };
     await deliver("pull_request", prEvent({ action: "opened", extra: { mergeable_state: "unknown", mergeable: null } }));
-    expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
+    expect(wakes).toEqual([]);
+    expect(graphCalls).toBe(0);
   });
 
-  it("a conflicting head update after a completed clean sweep wakes via the UNKNOWN retry path", async () => {
-    await deliver("push", { ref: "refs/heads/main" });
-    await harness.runJob(SWEEP_JOB_KEY); // clean read: the repo mark is cleared
-    const calls = graphCalls;
-    await harness.runJob(SWEEP_JOB_KEY);
-    expect(graphCalls).toBe(calls); // nothing left for the sweep to discover on its own
+  it("a conflicting head update wakes via the UNKNOWN retry path", async () => {
     graph = { mergeable: "UNKNOWN", isDraft: false, head: HEAD2 };
     await deliver("pull_request", prEvent({ head: HEAD2, extra: { mergeable_state: "unknown", mergeable: null } }));
     expect(wakes).toEqual([]);
@@ -770,7 +791,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     graph = { mergeable: "CONFLICTING", isDraft: false, head: HEAD2 };
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
-    await deliver("pull_request", prEvent({ head: HEAD2, action: "edited" }));
+    await deliver("pull_request", prEvent({ head: HEAD2, action: "synchronize" }));
     expect(wakes).toHaveLength(1); // same head, same state: at most once
   });
 
@@ -779,7 +800,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(wakes).toEqual([]);
     expect(row(1903, "conflict")).toBeUndefined(); // not_conflicting: nothing kept
     graph = { mergeable: "CONFLICTING", isDraft: false };
-    await deliver("pull_request", prEvent({ action: "edited" }));
+    await deliver("pull_request", prEvent({ action: "synchronize" }));
     expect(wakes).toHaveLength(1);
   });
 
@@ -791,27 +812,16 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(graphCalls).toBe(2); // the first delivery only: one PR read plus one read of the head suites
   });
 
-  it("a retry posts the evidence comment that the first attempt never posted", async () => {
-    failNext.add("comment");
-    await deliver("pull_request", prEvent());
+  it("retries a failure before the wake mark without creating comments", async () => {
+    failNext.add("beforeWakeMark");
     await deliver("check_run", reviewFailed());
     expect(comments).toEqual([]);
     expect(wakes).toEqual([]);
-    graph = { mergeable: "MERGEABLE", isDraft: false };
+    expect(row(1903, "review_findings")!.outcome).toBe("error");
     await harness.runJob(SWEEP_JOB_KEY);
-    expect(comments).toHaveLength(1);
+    expect(comments).toEqual([]);
     expect(wakes).toHaveLength(1);
-  });
-
-  it("a retry does not repeat a comment that was posted when only the phase mark was lost", async () => {
-    failNext.add("markComment");
-    await deliver("pull_request", prEvent());
-    await deliver("check_run", reviewFailed());
-    expect(comments).toHaveLength(1);
-    expect(wakes).toEqual([]);
-    graph = { mergeable: "MERGEABLE", isDraft: false };
     await harness.runJob(SWEEP_JOB_KEY);
-    expect(comments).toHaveLength(1);
     expect(wakes).toHaveLength(1);
   });
 
@@ -826,32 +836,11 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     }
   });
 
-  it("the conflict sweep continues past the page cap on the next tick via the saved cursor", async () => {
-    await setup({ sweepMaxPages: 2 });
-    const ctx = harness.ctx as any;
-    const cursors: Array<string | null> = [];
-    ctx.http.fetch = async (_url: string, init: { body: string }) => {
-      const { variables } = JSON.parse(init.body);
-      cursors.push(variables.cursor);
-      const page = cursors.length;
-      const node = { number: page, url: `https://github.com/TogetherWeOwn/two-web-next/pull/${page}`, state: "OPEN", isDraft: false, isCrossRepository: false, authorAssociation: "MEMBER", author: { login: "doer" }, headRefOid: HEAD, headRefName: "x", baseRefName: "main", mergeable: "MERGEABLE", updatedAt: new Date().toISOString() };
-      return new Response(JSON.stringify({ data: { repository: { pullRequests: { pageInfo: { hasNextPage: page < 3, endCursor: `c${page}` }, nodes: [node] } } } }), { status: 200 });
-    };
-    await deliver("push", { ref: "refs/heads/main" });
-    await harness.runJob(SWEEP_JOB_KEY);
-    expect(cursors).toEqual([null, "c1"]);
-    await harness.runJob(SWEEP_JOB_KEY);
-    expect(cursors).toEqual([null, "c1", "c2"]);
-    await harness.runJob(SWEEP_JOB_KEY); // finished: nothing left to read
-    expect(cursors).toHaveLength(3);
-  });
-
   // --- review round 3 ---------------------------------------------------------------------------------------------
 
   describe("retries are single-flight and re-claimed atomically", () => {
     it("a second sweep while one is still running (host job timeout < sweep time) does not run again", async () => {
       await failFirstWake();
-      await deliver("push", { ref: "refs/heads/main" }); // a marked repo too
       let open!: () => void;
       fetchGate = new Promise<void>((r) => { open = r; });
       const calls = graphCalls;
@@ -863,7 +852,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       open();
       await first;
       expect(wakes).toHaveLength(1);
-      expect(comments).toHaveLength(1);
+      expect(comments).toEqual([]);
       expect(await runSweep()).toBeDefined(); // released afterwards
     });
 
@@ -1009,19 +998,18 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       ctx.issues.requestWakeup = original;
       await harness.runJob(SWEEP_JOB_KEY);
       expect(wakes).toHaveLength(1);
-      expect(comments).toHaveLength(1);
+      expect(comments).toEqual([]);
     });
   });
 
   it("ledger retention keeps a compact dedupe tombstone: an aged wake for a still-open PR never wakes again", async () => {
-    await deliver("push", { ref: "refs/heads/main" });
     graph = { mergeable: "CONFLICTING", isDraft: false };
-    await harness.runJob(SWEEP_JOB_KEY);
+    await deliver("pull_request", prEvent());
     expect(wakes).toHaveLength(1);
     for (const r of ledger.values()) r.aged = true; // 30 days later
     await harness.runJob(SWEEP_JOB_KEY);
     expect([...ledger.values()].map((r) => r.signal)).toEqual(["{}"]);
-    await deliver("push", { ref: "refs/heads/main" }); // same PR, same head, still conflicting
+    await deliver("pull_request", prEvent()); // same PR, same head, still conflicting
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
   });
@@ -1040,13 +1028,18 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(row()).toBeUndefined(); // never woken: forgotten
     });
 
-    it("a pending conflict sweep for a repo stopped after the push never wakes or reads GitHub", async () => {
-      await deliver("push", { ref: "refs/heads/main" });
+    it("a pending conflict retry for a repo stopped after synchronize never wakes or rereads GitHub", async () => {
+      graphFail = true;
+      await deliver("pull_request", prEvent());
+      expect(row(1903, "conflict")!.outcome).toBe("error");
+      graphFail = false;
+      const calls = graphCalls;
       harness.setConfig({ ...baseConfig, stoppedRepos: ["togetherweown/two-web-next"] });
       graph = { mergeable: "CONFLICTING", isDraft: false };
       await harness.runJob(SWEEP_JOB_KEY);
       expect(wakes).toEqual([]);
-      expect(graphCalls).toBe(0);
+      expect(graphCalls).toBe(calls);
+      expect(row(1903, "conflict")).toBeUndefined();
     });
 
     it("the final guard in wakeForSignal refuses a stopped repo whatever the caller", async () => {
@@ -1110,7 +1103,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       await harness.runJob(SWEEP_JOB_KEY);
       expect(row(1903, "conflict")).toBeUndefined();
       graph = { mergeable: "CONFLICTING", isDraft: false };
-      await deliver("push", { ref: "refs/heads/main" });
+      await deliver("pull_request", prEvent());
       await harness.runJob(SWEEP_JOB_KEY);
       expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
     });
@@ -1177,7 +1170,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     };
     await harness.runJob(SWEEP_JOB_KEY);
     expect(wakes).toHaveLength(1);
-    expect(comments[0]!.body).toContain("`test` failure");
+    expect(comments).toEqual([]);
   });
 
   describe("a signal that meets an attempt in flight is never acknowledged as settled", () => {
@@ -1208,7 +1201,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       graph = { mergeable: "MERGEABLE", isDraft: false, checks: [green, testRed] };
       await harness.runJob(SWEEP_JOB_KEY);
       expect(wakes).toHaveLength(1);
-      expect(comments[0]!.body).toContain("`test` failure");
+      expect(comments).toEqual([]);
       await deliver("check_run", ciFailed("test", "failure", HEAD, 1903, { nodeId: "CR_kwDOtest1" }));
       await harness.runJob(SWEEP_JOB_KEY);
       expect(wakes).toHaveLength(1);
@@ -1231,14 +1224,16 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(wakes).toHaveLength(1);
     });
 
-    it("a head-level ready_for_review folded into an attempt keeps the delivered run's identity", async () => {
+    it("a redelivery folded into an attempt keeps the delivered run's identity", async () => {
       await setup({ wakeStates: ["ci_red"] });
       graphFail = true;
       await deliver("check_run", ciFailed("build"));
       graphFail = false;
       graph = { mergeable: "MERGEABLE", isDraft: false, checks: [] }; // GitHub does not list the delivered run yet
       const { sweep, open } = await sweepHeldOnGithub();
-      await deliver("pull_request", prEvent({ action: "ready_for_review" })); // folded: no GitHub read of its own
+      const priorVersion = row()!.updatedAt;
+      await deliver("check_run", ciFailed("build")); // folded: no GitHub read of its own
+      expect(row()!.updatedAt).not.toBe(priorVersion);
       open();
       await sweep;
       expect(JSON.parse(row()!.signal).detail).toMatchObject({ checkName: "build", checkRunId: RUN_ID });
@@ -1300,7 +1295,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   describe("only one attempt may request a wake (conditional wake mark)", () => {
     for (const forgotten of [true, false]) {
       it(`a stalled attempt whose row another attempt ${forgotten ? "forgot" : "already marked"} never requests the wake`, async () => {
-        failNext.add("takenDuringComment");
+        failNext.add("takenBeforeWakeMark");
         if (forgotten) failNext.add("forgotten");
         await deliver("check_run", ciFailed("build"));
         expect(hostWakeCalls).toBe(0);
@@ -1393,7 +1388,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     it("a retry re-resolves ownership and holds when new evidence conflicts with the card it chose", async () => {
       commentCards.clear(); // only the branch names the card
       graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-quality" };
-      failNext.add("comment");
+      failNext.add("beforeWakeMark");
       await deliver("check_run", reviewFailed(HEAD, "TOG-43084-quality"));
       expect(row(1903, "review_findings")!).toMatchObject({ outcome: "error", issueId: CARD });
       commentCards.set(PR, OTHER); // another card now carries a qualifying PR-link comment
@@ -1404,7 +1399,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     });
 
     it("a retry holds when the card it chose no longer resolves as the owner", async () => {
-      failNext.add("comment");
+      failNext.add("beforeWakeMark");
       await deliver("check_run", reviewFailed());
       expect(row(1903, "review_findings")!).toMatchObject({ outcome: "error", issueId: CARD });
       commentCards.set(PR, OTHER); // the evidence now points at another card only
@@ -1414,31 +1409,29 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     });
   });
 
-  describe("pending conflict sweeps survive any outage", () => {
-    it("a GitHub outage longer than six sweep ticks does not drop the repo's pending sweep", async () => {
-      await deliver("push", { ref: "refs/heads/main" });
+  describe("pending conflict retries survive outages", () => {
+    it("retries a synchronize signal throughout a prolonged GitHub outage", async () => {
       graphFail = true;
+      await deliver("pull_request", prEvent());
       for (let i = 0; i < 10; i += 1) await harness.runJob(SWEEP_JOB_KEY);
+      expect(row(1903, "conflict")!.outcome).toBe("error");
       graphFail = false;
       graph = { mergeable: "CONFLICTING", isDraft: false };
       await harness.runJob(SWEEP_JOB_KEY);
       expect(wakes.map((w) => w.split(":")[1])).toEqual(["github_pr_conflict"]);
-      const calls = graphCalls;
-      await harness.runJob(SWEEP_JOB_KEY); // done: the mark is gone
-      expect(graphCalls).toBe(calls);
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
     });
-
-    it("mergeability that stays UNKNOWN for more than six ticks keeps the repo marked", async () => {
-      await deliver("push", { ref: "refs/heads/main" });
+    it("keeps a synchronize signal pending while mergeability is unknown", async () => {
       graph = { mergeable: "UNKNOWN", isDraft: false };
+      await deliver("pull_request", prEvent());
       for (let i = 0; i < 10; i += 1) await harness.runJob(SWEEP_JOB_KEY);
+      expect(row(1903, "conflict")!.outcome).toBe("error");
       graph = { mergeable: "CONFLICTING", isDraft: false };
       await harness.runJob(SWEEP_JOB_KEY);
       expect(wakes).toHaveLength(1);
     });
   });
-
-  // --- review round 5 ---------------------------------------------------------------------------------------------
 
   describe("host refusals are recognised by the host's exact pre-queue messages", () => {
     /** What the SDK rejects with when the host handler threw (JsonRpcCallError, INTERNAL_ERROR -32603). */
@@ -1564,11 +1557,12 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(wakes).toHaveLength(1);
     });
 
-    it("a conflict sweep mark for a repository the token cannot see is kept and finished once it can", async () => {
-      await deliver("push", { ref: "refs/heads/main" });
+    it("a pending conflict is kept when the repository is invisible and wakes once it becomes visible", async () => {
       githubBody = repoGone;
+      await deliver("pull_request", prEvent());
       await harness.runJob(SWEEP_JOB_KEY);
-      expect(tokenErrors()).toHaveLength(1);
+      expect(tokenErrors().length).toBeGreaterThan(0);
+      expect(row(1903, "conflict")!.outcome).toBe("error");
       githubBody = undefined;
       graph = { mergeable: "CONFLICTING", isDraft: false };
       await harness.runJob(SWEEP_JOB_KEY);
@@ -1589,28 +1583,30 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
   });
 
   describe("a superseded attempt never overrides the attempt that took its row", () => {
-    /** Deliver a red check and stall its attempt inside createComment; returns the delivery and the resume handle. */
-    async function stallInComment(): Promise<{ delivery: Promise<void>; resume: () => void }> {
+    /** Stall immediately before the conditional wake mark, allowing a retry to take the claim. */
+    async function stallBeforeWakeMark(): Promise<{ delivery: Promise<void>; resume: () => void }> {
       const ctx = harness.ctx as any;
-      const realComment = ctx.issues.createComment;
+      const execute = ctx.db.execute;
       let resume!: () => void;
       const gate = new Promise<void>((r) => { resume = r; });
       let entered!: () => void;
       const inside = new Promise<void>((r) => { entered = r; });
-      ctx.issues.createComment = async (...args: unknown[]) => {
-        ctx.issues.createComment = realComment;
-        entered();
-        await gate;
-        return realComment(...args);
+      ctx.db.execute = async (sql: string, ...args: unknown[]) => {
+        if (sql === markWakeAttemptedSql(DB_NAMESPACE)) {
+          ctx.db.execute = execute;
+          entered();
+          await gate;
+        }
+        return execute(sql, ...args);
       };
       const delivery = deliver("check_run", ciFailed("build"));
       await inside;
-      row()!.stale = true; // ten minutes later the sweep may take the stuck claim
+      row()!.stale = true;
       return { delivery, resume };
     }
 
     it("a stalled attempt resumed after the sweep held the row as ambiguous_card never wakes", async () => {
-      const { delivery, resume } = await stallInComment();
+      const { delivery, resume } = await stallBeforeWakeMark();
       laterMentions.push({ body: link(1903), cardId: OTHER, author: DOER }); // ownership becomes ambiguous
       await harness.runJob(SWEEP_JOB_KEY);
       expect(row()!.outcome).toMatch(/^ambiguous_card/);
@@ -1622,7 +1618,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     });
 
     it("a stalled attempt never acts on a newer row for the same fingerprint (forgotten, then claimed again)", async () => {
-      const { delivery, resume } = await stallInComment();
+      const { delivery, resume } = await stallBeforeWakeMark();
       graph = { mergeable: "MERGEABLE", isDraft: true };
       await harness.runJob(SWEEP_JOB_KEY); // the sweep finds a draft and forgets the never-woken row
       expect(row()).toBeUndefined();
@@ -1727,15 +1723,15 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       await deliver("check_run", ciFailed("build", "failure", HEAD, 1903, rerun));
       expect(wakes).toHaveLength(1);
       expect(hostWakeCalls).toBe(2);
-      expect(comments).toHaveLength(1); // the evidence comment of the refused attempt is not repeated
+      expect(comments).toEqual([]); // no evidence comments are created
     });
   });
 
-  describe("ready_for_review and reopened re-evaluate the head's checks", () => {
+  describe("ready_for_review and reopened do not re-evaluate checks", () => {
     const reasons = () => wakes.map((w) => w.split(":")[1]).sort();
 
     for (const action of ["ready_for_review", "reopened"]) {
-      it(`a check that failed while the PR was ${action === "reopened" ? "closed" : "a draft"} wakes on ${action} while the head is still red`, async () => {
+      it(`a check that failed while ${action === "reopened" ? "closed" : "draft"} waits for a new check delivery after ${action}`, async () => {
         graph = action === "reopened" ? { mergeable: "MERGEABLE", isDraft: false, state: "CLOSED" } : { mergeable: "MERGEABLE", isDraft: true };
         await deliver("check_run", ciFailed("build"));
         await deliver("check_run", reviewFailed());
@@ -1743,20 +1739,20 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
         expect(ledger.size).toBe(0); // the skip burned nothing
         graph = { mergeable: "MERGEABLE", isDraft: false }; // GitHub still lists the failed build and review on this head
         await deliver("pull_request", prEvent({ action }));
-        expect(reasons()).toEqual(["github_pr_ci_red", "github_pr_review_findings"]);
-        expect(row(1903, "ci_red")!.outcome).toMatch(/^woken:/);
-        expect(comments.some((c) => c.body.includes("`build` failure"))).toBe(true); // GitHub's red run is the evidence
+        expect(reasons()).toEqual([]);
         await deliver("pull_request", prEvent({ action })); // redelivered
         await deliver("check_run", ciFailed("build"));
+        await deliver("check_run", reviewFailed());
         await harness.runJob(SWEEP_JOB_KEY);
         expect(wakes).toHaveLength(2); // at most once per (PR, head, state)
       });
     }
 
-    it("judges every gating check on the head, not only one delivered name", async () => {
+    it("does not recheck gating checks on ready_for_review", async () => {
       graph = { mergeable: "MERGEABLE", isDraft: false, checks: [{ id: "CR_t", name: "test", status: "COMPLETED", conclusion: "TIMED_OUT", startedAt: RUN_STARTED }] };
       await deliver("pull_request", prEvent({ action: "ready_for_review" }));
-      expect(reasons()).toEqual(["github_pr_ci_red"]);
+      expect(reasons()).toEqual([]);
+      expect(graphCalls).toBe(0);
     });
 
     it("a head with nothing red ends at once without a ledger row (never deferred forever)", async () => {
@@ -1772,10 +1768,10 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
 
     it("honours wakeStates and stoppedRepos", async () => {
       await setup({ wakeStates: ["conflict"] });
-      await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+      await deliver("check_run", ciFailed("build"));
       expect(wakes).toEqual([]);
       await setup({ stoppedRepos: ["togetherweown/two-web-next"] });
-      await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+      await deliver("check_run", ciFailed("build"));
       expect(wakes).toEqual([]);
       expect(graphCalls).toBe(0);
     });
@@ -1788,8 +1784,9 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
         { mergeable: "MERGEABLE", isDraft: false, head: HEAD2 },
       ]) {
         graph = current;
-        await deliver("pull_request", prEvent({ action: "ready_for_review" }));
+        await deliver("check_run", ciFailed("build"));
       }
+      expect(graphCalls).toBeGreaterThan(0);
       expect(wakes).toEqual([]);
       expect(ledger.size).toBe(0);
     });
@@ -1800,7 +1797,7 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(row()!.outcome).toBe("error");
       graphFail = false;
       graph = { mergeable: "MERGEABLE", isDraft: false, checks: [] }; // GitHub does not list the delivered run yet
-      await deliver("pull_request", prEvent({ action: "reopened" }));
+      await harness.runJob(SWEEP_JOB_KEY);
       expect(row()!.outcome).toBe("error"); // kept: the read lags the delivered run
       graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun()] };
       await harness.runJob(SWEEP_JOB_KEY);

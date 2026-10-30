@@ -6,10 +6,8 @@ import { fingerprint, policySkip, type Signal, type SkipOutcome } from "./github
 import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
-  COMMENT_EXISTS_SQL,
   claimSql,
   forgetSql,
-  markCommentPostedSql,
   markWakeAttemptedSql,
   prUrlPatterns,
   recordOutcomeSql,
@@ -20,7 +18,7 @@ export interface CardRef {
   id: string;
   identifier: string;
   status: string;
-  via: "branch" | "comment";
+  via: "branch" | "comment" | "description";
 }
 
 export type Outcome =
@@ -136,6 +134,36 @@ export async function resolveCard(ctx: PluginContext, companyId: string, config:
   for (const row of await ctx.db.query<Row>(CARD_BY_COMMENT_SQL, [companyId, like, regex, exclude])) {
     if (!candidates.has(row.id)) candidates.set(row.id, { id: row.id, identifier: row.identifier, status: row.status, via: "comment" });
   }
+  // The SDK has no text search. Resolve the repo from project workspace URLs and scan only open
+  // issues in matching projects. Fail closed if the complete scan would exceed the budget.
+  const projects = await ctx.projects.list({ companyId, limit: 201 });
+  if (projects.length > 200) return { kind: "ambiguous", detail: "project scan exceeds 200 projects" };
+  const urlPattern = new RegExp(regex, "i");
+  const summaries = [];
+  const openStatuses = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+  for (const project of projects) {
+    const workspaces = await ctx.projects.listWorkspaces(project.id, companyId);
+    const matchesRepo = workspaces.some(({ repoUrl }) => {
+      if (!repoUrl) return false;
+      const normalized = repoUrl.toLowerCase().replace(/\.git\/?$/, "").replace(/\/$/, "");
+      return normalized === `https://github.com/${signal.repo.toLowerCase()}` || normalized === `git@github.com:${signal.repo.toLowerCase()}` || normalized === `ssh://git@github.com/${signal.repo.toLowerCase()}`;
+    });
+    if (!matchesRepo) continue;
+    for (const status of openStatuses) {
+      const remaining = 200 - summaries.length;
+      const page = await ctx.issues.list({ companyId, projectId: project.id, status, limit: remaining + 1 });
+      if (page.length > remaining) return { kind: "ambiguous", detail: "project issue scan exceeds 200 open issues" };
+      summaries.push(...page);
+    }
+  }
+  for (const summary of summaries) {
+    if (summary.originKind === "chat_channel") continue;
+    const issue = await ctx.issues.get(summary.id, companyId);
+    if (!issue || issue.originKind === "chat_channel") continue;
+    if (urlPattern.test(issue.title ?? "") || urlPattern.test(issue.description ?? "")) {
+      if (!candidates.has(issue.id)) candidates.set(issue.id, { id: issue.id, identifier: issue.identifier ?? issue.id, status: issue.status, via: "description" });
+    }
+  }
   const cards = [...candidates.values()];
   if (cards.length > 1) return { kind: "ambiguous", detail: cards.map((c) => `${c.via}:${c.identifier}`).join(" ") };
   return cards[0] ? { kind: "card", card: cards[0] } : { kind: "none" };
@@ -231,7 +259,7 @@ export async function deferSignal(ctx: PluginContext, companyId: string, config:
 /**
  * Wake the card that owns this PR at most once per (PR, head SHA, state).
  * Order: repo policy (stoppedRepos, wakeStates) -> draft/trust gate -> atomic ledger claim -> owning card ->
- * eligibility and hold checks -> evidence comment -> wake-attempt mark -> requestWakeup. requestWakeup stays the
+ * eligibility and hold checks -> wake-attempt mark -> requestWakeup. requestWakeup stays the
  * authority for terminal status, blockers, assignee, agent state and budget. A retry (`opts.retry`, already re-claimed
  * by the sweep or a redelivery) skips the claim and every phase the ledger says already happened, and re-resolves the
  * owner: if the current evidence no longer names exactly the card an earlier attempt chose, it holds (never
@@ -271,7 +299,7 @@ export async function wakeForSignal(
     const resolved = await resolveCard(ctx, companyId, config, signal);
     let ambiguous = resolved.kind === "ambiguous" ? resolved.detail : null;
     if (!ambiguous && retry?.issueId && (resolved.kind !== "card" || resolved.card.id !== retry.issueId)) {
-      // An earlier attempt chose (and may have commented on) another card than the evidence names now.
+      // An earlier attempt chose another card than the evidence names now.
       ambiguous = `ledger:${retry.issueId} now:${resolved.kind === "card" ? resolved.card.identifier : "none"}`;
     }
     if (ambiguous) {
@@ -303,14 +331,6 @@ export async function wakeForSignal(
       const result = await decide(`shadow:${card.identifier}`, card.id, { fingerprint: fp, outcome: "shadow", card: card.identifier });
       if (result.outcome === "shadow") ctx.logger.info("pr-doer-wake shadow: would wake", { fingerprint: fp, card: card.identifier, via: card.via });
       return result;
-    }
-    if (config.postEvidenceComment && !retry?.commentPostedAt) {
-      const body = evidenceComment(signal);
-      const posted = retry ? (await ctx.db.query(COMMENT_EXISTS_SQL, [companyId, card.id, body])).length > 0 : false;
-      if (!posted) await ctx.issues.createComment(card.id, body, companyId);
-      // Superseded while it commented (it stalled past the stuck window): the attempt holding the row decides.
-      const marked = await ctx.db.execute(markCommentPostedSql(ns), [companyId, fp, card.id, held.createdAt, held.attempts]);
-      if (marked.rowCount !== 1) return superseded(card);
     }
     const reason = `github_pr_${signal.state}`;
     const mark = new Date().toISOString();

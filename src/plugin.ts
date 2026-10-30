@@ -9,6 +9,7 @@ import {
   OPEN_PRS_QUERY,
   mayAct,
   ownerOf,
+  repoOf,
   parseEvent,
   policySkip,
   prStateFromGraph,
@@ -25,7 +26,7 @@ import {
   type Signal,
 } from "./github.js";
 import { SecretCache } from "./secrets.js";
-import { compactSql, reclaimSql, retryableSql, seenSql, touchSql } from "./sql.js";
+import { clearClosedSql, compactSql, reclaimSql, retryableSql, seenSql, touchSql } from "./sql.js";
 import { CLAIM_TAKEN, claimToken, deferSignal, forget, markUnconfirmed, recordOutcome, SUPERSEDED, wakeForSignal, type Claim, type Outcome, type WakeResult } from "./waker.js";
 
 let ctxRef: PluginContext | null = null;
@@ -341,6 +342,19 @@ async function processSignal(ctx: PluginContext, companyId: string, config: Doer
 
 export async function handleGithubEvent(eventName: string, payload: Record<string, any>, companyId: string, config: DoerWakeConfig): Promise<WakeResult[]> {
   const ctx = requireCtx();
+  if (eventName === "pull_request" && payload.action === "closed") {
+    const repo = repoOf(payload);
+    const pr = payload.pull_request;
+    if (!repo || !Number.isInteger(pr?.number) || !pr?.head?.sha || config.stoppedRepos.includes(repo)) return [];
+    const signal: Signal = { repo, number: pr.number, head: pr.head.sha, headRef: pr.head.ref ?? null,
+      state: "conflict", url: pr.html_url ?? "", draft: null, trusted: null, detail: {} };
+    // A delayed closed event must not erase retry state for a PR that has since reopened.
+    const current = await currentPrState(ctx, companyId, config, signal);
+    if (current.kind === "skip" && current.outcome === "skipped_closed") {
+      await ctx.db.execute(clearClosedSql(ctx.db.namespace || DB_NAMESPACE), [companyId, repo, pr.number]);
+    }
+    return [];
+  }
   const parsed = parseEvent(eventName, payload, config);
   if (parsed.sweepRepos.length > 0) {
     await serialized(async () => {
@@ -454,7 +468,7 @@ export function runSweep(): Promise<WakeResult[]> {
   const run = (async () => {
     const results: WakeResult[] = [];
     const configs = new Map((await companiesFor(ctx, null)).map((c) => [c.companyId, c.config]));
-    await sweepConflicts(ctx, configs, results);
+    // Push deliveries are no longer subscribed; do not revive old conflict-sweep marks.
     await retryWakes(ctx, configs, results);
     for (const r of results) if (r.outcome !== "duplicate" || r.detail) ctx.logger.info("pr-doer-wake sweep", { ...r });
     return results;

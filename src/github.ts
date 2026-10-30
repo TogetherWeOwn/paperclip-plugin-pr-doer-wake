@@ -69,7 +69,7 @@ export interface ParsedEvent {
  * The only GitHub events this plugin consumes. Subscribe the org webhook to exactly these: the host stores every
  * delivery in plugin_webhook_deliveries and never prunes it (README "Webhook events").
  */
-export const SUBSCRIBED_EVENTS = new Set(["pull_request", "check_run", "push"]);
+export const SUBSCRIBED_EVENTS = new Set(["pull_request", "check_run"]);
 
 /** Shape of GitHub's X-Hub-Signature-256 header; anything else is rejected before any company or secret work. */
 export const SIGNATURE_RE = /^sha256=[0-9a-f]{64}$/;
@@ -77,27 +77,13 @@ export const SIGNATURE_RE = /^sha256=[0-9a-f]{64}$/;
 /** author_association values trusted to name a card by branch (GitHub REST/GraphQL CommentAuthorAssociation). */
 export const TRUSTED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
-/** Conclusions that mean the check really failed. cancelled/stale/skipped/neutral/action_required never wake. */
-export const RED_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure"]);
-/** The only Paperclip Review conclusion that is a finding (see parseEvent). */
-export const REVIEW_RED_CONCLUSIONS = new Set(["failure"]);
+/** Conclusions that trigger a wake. cancelled, stale, skipped, neutral and startup_failure do not. */
+export const RED_CONCLUSIONS = new Set(["failure", "timed_out", "action_required"]);
+/** The same accepted conclusions apply to the review check. */
+export const REVIEW_RED_CONCLUSIONS = new Set(["failure", "timed_out", "action_required"]);
 
-/**
- * pull_request actions after which the PR may conflict (new or reopened PR, new head, base changed by an edit). The
- * payload's `mergeable_state` is not consulted: GitHub computes it lazily, so an opened or synchronize payload usually
- * says `unknown` with `mergeable: null` even when the PR conflicts. The authoritative lookup (evaluate) decides, and
- * UNKNOWN there is deferred and read again by the sweep.
- */
-export const CONFLICT_PR_ACTIONS = new Set(["opened", "reopened", "synchronize", "ready_for_review", "edited"]);
-
-/**
- * pull_request actions after which a head that was not eligible may now wake for its checks: a check that failed while
- * the PR was a draft or closed was skipped (skipped_draft, skipped_closed) and left no ledger row, and GitHub sends no
- * new check_run for it. These also emit head-level ci_red and review_findings signals (no delivered run), which
- * checkVerdict judges against every relevant check on the head. A new head (opened, synchronize) gets its own check
- * deliveries; an edit does not change the head.
- */
-export const RECHECK_PR_ACTIONS = new Set(["reopened", "ready_for_review"]);
+/** A synchronize delivery is a candidate; the GitHub lookup decides mergeability. */
+export const CONFLICT_PR_ACTIONS = new Set(["synchronize"]);
 
 /**
  * Cheap pre-filter run BEFORE signature verification. Most org deliveries (check_run created/success,
@@ -108,13 +94,9 @@ export const RECHECK_PR_ACTIONS = new Set(["reopened", "ready_for_review"]);
 export function mayAct(eventName: string, payload: Json): boolean {
   switch (eventName) {
     case "pull_request":
-      return CONFLICT_PR_ACTIONS.has(String(payload?.action ?? "")) && isOpenNonDraftPr(payload?.pull_request);
+      return payload?.action === "closed" || (CONFLICT_PR_ACTIONS.has(String(payload?.action ?? "")) && isOpenNonDraftPr(payload?.pull_request));
     case "check_run":
       return payload?.action === "completed" && RED_CONCLUSIONS.has(String(payload?.check_run?.conclusion ?? ""));
-    case "push": {
-      const defaultBranch = payload?.repository?.default_branch;
-      return typeof defaultBranch === "string" && payload?.ref === `refs/heads/${defaultBranch}` && payload?.deleted !== true;
-    }
     default:
       return false;
   }
@@ -193,7 +175,7 @@ export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal, 
   // there is no delivered run whose absence could mean read lag, so not red now is check_not_red at once.
   const review = signal.state === "review_findings";
   const own = signal.detail.checkName ?? (review ? config.reviewCheckName : undefined);
-  const relevant = (name: string) => (review ? name === own : name !== config.reviewCheckName && isGatingCheck(config, signal.repo, name));
+  const relevant = (name: string) => isGatingCheck(config, signal.repo, name) && (review ? name === own : name !== config.reviewCheckName);
   const red = review ? REVIEW_RED_CONCLUSIONS : RED_CONCLUSIONS;
   const latest = new Map<string, CheckRunState>(); // per (suite, name)
   for (const run of runs) {
@@ -271,11 +253,10 @@ export function ownerOf(payload: Json): string | null {
   return typeof login === "string" ? login : null;
 }
 
-/** A check name gates the PR when it is not ignored and, if the repo lists required checks, is one of them. */
+/** Any check not in the explicit ignore list is actionable. */
 export function isGatingCheck(config: DoerWakeConfig, repo: string, name: string): boolean {
   if (config.ignoreChecks.includes(name)) return false;
-  const required = config.requiredChecks[repo];
-  return !required || required.length === 0 || required.includes(name);
+  return true;
 }
 
 /** Score from the Paperclip Review check title (`3/5`), set in chat-github-reviews.ts ~line 1307. */
@@ -294,7 +275,7 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
     // A candidate only: the authoritative lookup decides open, draft, trust, head and mergeability.
     const pr = payload.pull_request as Json | undefined;
     if (!pr || typeof pr.number !== "number" || !CONFLICT_PR_ACTIONS.has(String(payload.action)) || !isOpenNonDraftPr(pr)) return out;
-    const states: WakeState[] = RECHECK_PR_ACTIONS.has(String(payload.action)) ? ["conflict", "ci_red", "review_findings"] : ["conflict"];
+    const states: WakeState[] = ["conflict"];
     for (const state of states) {
       out.signals.push({
         repo,
@@ -316,13 +297,12 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
     if (!run || payload.action !== "completed") return out;
     const name = String(run.name ?? "");
     const conclusion = String(run.conclusion ?? "");
+    if (!isGatingCheck(config, repo, name)) return out;
     const isReview = name === config.reviewCheckName;
     let state: WakeState | null = null;
     let score: number | null = null;
     if (isReview) {
-      // githubReviewConclusion (chat-github-review-policy.ts:229): "failure" only for a complete
-      // assessment below ratingThreshold. action_required = admission refusal/incomplete: never a finding.
-      if (conclusion === "failure") {
+      if (REVIEW_RED_CONCLUSIONS.has(conclusion)) {
         state = "review_findings";
         score = reviewScore(run.output?.title);
       }
@@ -356,13 +336,6 @@ export function parseEvent(eventName: string, payload: Json, config: DoerWakeCon
     return out;
   }
 
-  if (eventName === "push") {
-    const defaultBranch = payload.repository?.default_branch;
-    if (typeof defaultBranch === "string" && payload.ref === `refs/heads/${defaultBranch}` && payload.deleted !== true) {
-      out.sweepRepos.push(repo);
-    }
-    return out;
-  }
 
   return out;
 }

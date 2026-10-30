@@ -225,13 +225,13 @@ describe("secret-resolution budget (host limit 30/min)", () => {
     });
   }
 
-  it("one sweep over many marked repos and pages resolves the token once", async () => {
+  it("pushes do not cause GitHub token resolution or a conflict sweep", async () => {
     const { calls } = await boot();
     for (let i = 0; i < 12; i += 1) await deliver("push", { ref: "refs/heads/main", repository: { ...repository, full_name: `TogetherWeOwn/r${i}` } });
     const before = calls.resolves;
     await runSweep();
-    expect(calls.fetches).toBeGreaterThan(12);
-    expect(calls.resolves - before).toBe(1);
+    expect(calls.fetches).toBe(0);
+    expect(calls.resolves - before).toBe(0);
   });
 
   it("a deactivated webhook secret stops verifying once its re-resolution fails (fails closed)", async () => {
@@ -283,7 +283,7 @@ describe("secret-resolution budget (host limit 30/min)", () => {
   it("mayAct classification", () => {
     expect(mayAct("ping", {})).toBe(false);
     expect(mayAct("check_run", run("completed", "timed_out"))).toBe(true);
-    expect(mayAct("check_run", run("completed", "action_required"))).toBe(false);
+    expect(mayAct("check_run", run("completed", "action_required"))).toBe(true);
     expect(mayAct("status", { state: "pending" })).toBe(false);
     expect(mayAct("status", { state: "error" })).toBe(false); // status is not subscribed (README "Webhook events")
     expect(mayAct("pull_request", { action: "labeled", pull_request: { state: "open", draft: false } })).toBe(false);

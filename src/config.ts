@@ -15,8 +15,6 @@ export interface DoerWakeConfig {
   /** Required when enabled: every wake candidate is revalidated against GitHub (open, non-draft, head, trust). */
   githubTokenSecretRef: SecretRef | null;
   reviewCheckName: string;
-  /** Lowercase "org/repo" -> required check names. Repos without an entry treat every check as a gate. */
-  requiredChecks: Record<string, string[]>;
   ignoreChecks: string[];
   /** Lowercase "org/repo" entries that never wake. */
   stoppedRepos: string[];
@@ -25,8 +23,6 @@ export interface DoerWakeConfig {
   wakeStates: WakeState[];
   /** Cards whose own status is `blocked` are held even without a blocker edge (pr-controller parity). */
   skipBlockedStatus: boolean;
-  /** One plugin-authored comment with the evidence link before the wake. Plugin comments never wake anyone. */
-  postEvidenceComment: boolean;
   /** Head-branch prefix that names the owning card, e.g. `TOG-123-slug`. */
   branchIdentifierPattern: string;
   /**
@@ -49,13 +45,11 @@ export const DEFAULT_CONFIG: DoerWakeConfig = {
   webhookSecretRef: null,
   githubTokenSecretRef: null,
   reviewCheckName: "Paperclip Review",
-  requiredChecks: {},
   ignoreChecks: [],
-  stoppedRepos: [],
+  stoppedRepos: ["togetherweown/nntune"],
   excludeAgentIds: [],
   wakeStates: [...WAKE_STATES],
   skipBlockedStatus: true,
-  postEvidenceComment: true,
   branchIdentifierPattern: "^([A-Z][A-Z0-9]*-[0-9]+)-",
   trustedAuthors: [],
   sweepMaxPages: 4,
@@ -75,12 +69,6 @@ function stringList(value: unknown, lower = false): string[] {
 
 export function parseConfig(raw: Record<string, unknown> | null | undefined): DoerWakeConfig {
   const value = raw ?? {};
-  const required: Record<string, string[]> = {};
-  if (value.requiredChecks && typeof value.requiredChecks === "object" && !Array.isArray(value.requiredChecks)) {
-    for (const [repo, names] of Object.entries(value.requiredChecks as Record<string, unknown>)) {
-      required[repo.toLowerCase()] = stringList(names);
-    }
-  }
   const states = stringList(value.wakeStates).filter((s): s is WakeState => (WAKE_STATES as readonly string[]).includes(s));
   return {
     enabled: value.enabled === true,
@@ -89,13 +77,11 @@ export function parseConfig(raw: Record<string, unknown> | null | undefined): Do
     webhookSecretRef: asSecretRef(value.webhookSecretRef),
     githubTokenSecretRef: asSecretRef(value.githubTokenSecretRef),
     reviewCheckName: typeof value.reviewCheckName === "string" && value.reviewCheckName ? value.reviewCheckName : DEFAULT_CONFIG.reviewCheckName,
-    requiredChecks: required,
     ignoreChecks: stringList(value.ignoreChecks),
-    stoppedRepos: stringList(value.stoppedRepos, true),
+    stoppedRepos: value.stoppedRepos === undefined ? [...DEFAULT_CONFIG.stoppedRepos] : stringList(value.stoppedRepos, true),
     excludeAgentIds: stringList(value.excludeAgentIds),
     wakeStates: Array.isArray(value.wakeStates) ? states : [...DEFAULT_CONFIG.wakeStates],
     skipBlockedStatus: value.skipBlockedStatus === undefined ? true : value.skipBlockedStatus === true,
-    postEvidenceComment: value.postEvidenceComment === undefined ? true : value.postEvidenceComment === true,
     branchIdentifierPattern:
       typeof value.branchIdentifierPattern === "string" && value.branchIdentifierPattern
         ? value.branchIdentifierPattern

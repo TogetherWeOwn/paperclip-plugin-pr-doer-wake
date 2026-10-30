@@ -204,3 +204,8 @@ export function prUrlPatterns(repo: string, number: number): { like: string; reg
   const url = `https://github.com/${repo}/pull/${number}`;
   return { like: `%${escapeLike(url)}%`, regex: `${URL_TOKEN_START}${escapeRegex(url)}([^0-9]|$)` };
 }
+
+/** Clear only never-attempted state: wake marks remain permanent dedupe tombstones. */
+export function clearClosedSql(ns: string): string {
+  return `delete from ${ns}.wake_ledger where company_id = $1 and repo = $2 and pull_number = $3 and wake_attempted_at is null`;
+}

@@ -23,14 +23,15 @@ const manifest: PaperclipPluginManifestV1 = {
   version: PLUGIN_VERSION,
   displayName: "PR doer wake",
   description:
-    "Wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when its Paperclip Review lands below threshold, a gating check really fails or a merge conflict appears; ready_for_review and reopened re-check the head. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
+    "Wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when a check fails or a merge conflict appears on synchronize. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
     "companies.read",
+    "projects.read",
+    "project.workspaces.read",
     "issues.read",
     "issue.relations.read",
-    "issue.comments.create",
     "issues.wakeup",
     "plugin.state.read",
     "plugin.state.write",
@@ -53,15 +54,15 @@ const manifest: PaperclipPluginManifestV1 = {
       endpointKey: WEBHOOK_KEY,
       displayName: "GitHub organization webhook",
       description:
-        "GitHub org webhook (content type application/json), events pull_request, check_run and push only, signed with the configured webhook secret. The host stores every delivery, so subscribe to nothing else.",
+        "GitHub org webhook (content type application/json), events pull_request and check_run only, signed with the configured webhook secret. The host stores every delivery, so subscribe to nothing else.",
     },
   ],
   jobs: [
     {
       jobKey: SWEEP_JOB_KEY,
-      displayName: "Conflict sweep and wake retries",
+      displayName: "Wake retries",
       description:
-        "For repos whose default branch moved, reads open PR mergeability (up to sweepMaxPages GraphQL pages per repo per tick, resuming from the cursor) and wakes owners of newly conflicting non-draft PRs; re-reads the PR (and its failing checks) and finishes wakes that failed, stalled or had no eligible owning card yet, with backoff (never one that may already have reached the host); compacts ledger rows older than 30 days into dedupe tombstones.",
+        "Re-reads the PR and finishes wakes that failed, stalled or had no eligible owning card yet, with backoff; never repeats a wake that may already have reached the host. Compacts old settled rows into dedupe tombstones.",
       schedule: "*/5 * * * *",
     },
   ],
@@ -75,21 +76,14 @@ const manifest: PaperclipPluginManifestV1 = {
       githubTokenSecretRef: {
         ...secretRef,
         description:
-          "Required when enabled. Paperclip secret with a GitHub token that can read pull requests and check runs in githubOrg: a classic token (no scope for public repos, repo for private ones) or a token with Pull requests: read and Checks: read. Fine-grained personal access tokens cannot read check runs. Every wake is revalidated against GitHub first, and the conflict sweep reads mergeability with it.",
+          "Required when enabled. Paperclip secret with a GitHub token that can read pull requests and check runs in githubOrg: a classic token (no scope for public repos, repo for private ones) or a token with Pull requests: read and Checks: read. Fine-grained personal access tokens cannot read check runs. Every wake is revalidated against GitHub first,.",
       },
       reviewCheckName: { type: "string", default: "Paperclip Review" },
-      requiredChecks: {
-        type: "object",
-        additionalProperties: { type: "array", items: { type: "string" } },
-        default: {},
-        description: "Lowercase org/repo -> check names that gate it. Repos without an entry treat every check except ignoreChecks as gating.",
-      },
       ignoreChecks: { type: "array", items: { type: "string" }, default: [] },
-      stoppedRepos: { type: "array", items: { type: "string" }, default: [], description: "Lowercase org/repo that never wake." },
+      stoppedRepos: { type: "array", items: { type: "string" }, default: ["togetherweown/nntune"], description: "Lowercase org/repo that never wake." },
       excludeAgentIds: { type: "array", items: { type: "string" }, default: [], description: "Agents whose cards never own a PR (the Reviewer)." },
       wakeStates: { type: "array", items: { type: "string", enum: [...WAKE_STATES] }, default: [...WAKE_STATES] },
       skipBlockedStatus: { type: "boolean", default: true },
-      postEvidenceComment: { type: "boolean", default: true },
       branchIdentifierPattern: { type: "string", default: "^([A-Z][A-Z0-9]*-[0-9]+)-" },
       trustedAuthors: {
         type: "array",
@@ -97,7 +91,6 @@ const manifest: PaperclipPluginManifestV1 = {
         default: [],
         description: "PR author logins trusted besides OWNER/MEMBER/COLLABORATOR, e.g. the agents' GitHub App bot. Fork PRs are never trusted.",
       },
-      sweepMaxPages: { type: "integer", minimum: 1, maximum: 20, default: 4, description: "Open-PR pages (50 each) the conflict sweep reads per repo per tick." },
     },
   },
 };

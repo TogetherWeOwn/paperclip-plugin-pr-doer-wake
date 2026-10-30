@@ -6,6 +6,7 @@ import { DB_NAMESPACE, NAMESPACE_SLUG, PLUGIN_ID } from "../src/constants.js";
 import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
+  clearClosedSql,
   COMMENT_EXISTS_SQL,
   claimSql,
   compactSql,
@@ -116,7 +117,7 @@ describe("host contract", () => {
     expect(CARD_BY_COMMENT_SQL).not.toMatch(/first_mention|min\(/);
   });
   it("runtime writes pass validatePluginRuntimeExecute", () => {
-    for (const q of [claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), forgetSql(DB_NAMESPACE), touchSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {
+    for (const q of [clearClosedSql(DB_NAMESPACE), claimSql(DB_NAMESPACE), reclaimSql(DB_NAMESPACE), recordOutcomeSql(DB_NAMESPACE), markCommentPostedSql(DB_NAMESPACE), markWakeAttemptedSql(DB_NAMESPACE), releaseWakeAttemptSql(DB_NAMESPACE), forgetSql(DB_NAMESPACE), touchSql(DB_NAMESPACE), compactSql(DB_NAMESPACE)]) {
       expect(() => validatePluginRuntimeExecute(q, DB_NAMESPACE)).not.toThrow();
     }
   });

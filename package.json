@@ -1,7 +1,7 @@
 {
   "name": "@togetherweown/paperclip-plugin-pr-doer-wake",
   "version": "0.1.2",
-  "description": "Paperclip plugin: wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when its Paperclip Review fails, a gating check fails or a merge conflict appears, and re-checks the head on ready_for_review and reopened. Never wakes drafts, closed or merged PRs, forks, outsiders, stopped repos or a card whose ownership is ambiguous. A lost host reply can miss a wake (counted as wake_unconfirmed); it never wakes twice.",
+  "description": "Paperclip plugin: wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when a non-ignored check fails or a synchronize event reveals a merge conflict. Never wakes drafts, closed or merged PRs, forks, outsiders, stopped repos or a card whose ownership is ambiguous. A lost host reply can miss a wake (counted as wake_unconfirmed); it never wakes twice.",
   "license": "MIT",
   "type": "module",
   "private": true,
