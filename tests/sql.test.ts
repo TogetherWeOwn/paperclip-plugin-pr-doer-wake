@@ -18,6 +18,7 @@ import {
   recordOutcomeSql,
   releaseWakeAttemptSql,
   retryableSql,
+  NO_CARD_RETRY_ATTEMPTS,
   seenSql,
   SETTLED_OUTCOMES,
   touchSql,
@@ -61,11 +62,12 @@ describe("host contract", () => {
   });
   it("retries failed and card-pending rows with exponential backoff (2..60 minutes) and rows stuck at claimed or retrying", () => {
     const sql = retryableSql(DB_NAMESPACE);
-    // The exponent is capped too: retries never end, and power(2, attempts) overflows float8 past ~1023 attempts.
-    expect(sql).toMatch(/outcome in \('error', 'no_card'\) and updated_at < now\(\) - interval '1 minute' \* least\(power\(2, least\(attempts, 5\) \+ 1\), 60\)/);
+    // The exponent is capped too: error retries never end, and power(2, attempts) overflows float8 past ~1023 attempts.
+    expect(sql).toMatch(/\(\(outcome = 'error' or \(outcome = 'no_card' and attempts < 8\)\)\s+and updated_at < now\(\) - interval '1 minute' \* least\(power\(2, least\(attempts, 5\) \+ 1\), 60\)\)/);
     expect(sql).toMatch(/outcome in \('claimed', 'retrying'\) and updated_at < now\(\) - interval '10 minutes'/);
-    // No attempt cap: a pending row is retried hourly until GitHub answers, never dropped (plugin.ts retryRow).
-    expect(sql).not.toMatch(/attempts </);
+    // Only no_card is capped (finding M1): an error row is retried hourly until GitHub answers, never dropped.
+    expect(sql.match(/attempts </g)).toHaveLength(1);
+    expect(NO_CARD_RETRY_ATTEMPTS).toBe(8);
     expect(sql).toMatch(/signal <> '\{\}'::jsonb/); // compacted tombstones are never retried
     expect(sql).toMatch(/updated_at::text as updated_at/);
   });
@@ -105,6 +107,9 @@ describe("host contract", () => {
     expect(markCommentPostedSql(DB_NAMESPACE)).toMatch(/where company_id = \$1 and fingerprint = \$2 and created_at = \$4::timestamptz and attempts = \$5$/);
     // A signal folded into the attempt (touchSql) changes neither column, so it never stops the attempt.
     expect(touchSql(DB_NAMESPACE)).not.toMatch(/created_at|attempts/);
+  });
+  it("the branch lookup returns the card's project so the branch path can be scoped to the PR's repo", () => {
+    expect(CARD_BY_IDENTIFIER_SQL).toMatch(/i\.project_id::text as project_id/);
   });
   it("ownership lookups do not filter on status or the card's eligibility", () => {
     expect(CARD_BY_IDENTIFIER_SQL).not.toMatch(/status not in|assignee_agent_id is not null|string_to_array/);

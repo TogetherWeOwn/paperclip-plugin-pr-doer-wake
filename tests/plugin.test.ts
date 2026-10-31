@@ -8,6 +8,7 @@ import { DB_NAMESPACE, SWEEP_JOB_KEY } from "../src/constants.js";
 import {
   CARD_BY_COMMENT_SQL,
   CARD_BY_IDENTIFIER_SQL,
+  NO_CARD_RETRY_ATTEMPTS,
   clearClosedSql,
   COMMENT_EXISTS_SQL,
   claimSql,
@@ -29,6 +30,7 @@ const REVIEWER = "68cba6b5-f816-4853-a3db-4389cd9ae8ca";
 const CARD = "aaaaaaaa-0000-4000-8000-000000000001";
 const BLOCKER = "aaaaaaaa-0000-4000-8000-000000000002";
 const OTHER = "aaaaaaaa-0000-4000-8000-000000000003"; // an unrelated live card
+const PROJECT = "bbbbbbbb-0000-4000-8000-000000000001"; // has a workspace for togetherweown/two-web-next
 const SECRET = "whsec-test";
 const HEAD = "c05b0b5d" + "0".repeat(32);
 const HEAD2 = "d15ea5e0" + "0".repeat(32);
@@ -95,7 +97,7 @@ function ilike(value: string, pattern: string): boolean {
 }
 
 function issue(id: string, identifier: string, status: string, extra: Record<string, unknown> = {}) {
-  return { id, companyId: CID, identifier, title: identifier, status, assigneeAgentId: DOER, ...extra } as any;
+  return { id, companyId: CID, identifier, title: identifier, status, assigneeAgentId: DOER, projectId: PROJECT, ...extra } as any;
 }
 
 function sign(body: string, secret = SECRET) {
@@ -151,6 +153,8 @@ function setup(config: Record<string, unknown> = {}) {
   harness = createTestHarness({ manifest, config: baseConfig });
   harness.seed({
     companies: [{ id: CID, name: "TogetherWeOwn" } as any],
+    projects: [{ id: PROJECT, companyId: CID, name: "two-web-next" } as any],
+    projectWorkspaces: [{ id: "ws", projectId: PROJECT, name: "two-web-next", path: "/w", repoUrl: "https://github.com/TogetherWeOwn/two-web-next.git", repoRef: null } as any],
     issues: [issue(CARD, "TOG-43084", "in_review"), issue(BLOCKER, "TOG-1", "in_progress"), issue(OTHER, "TOG-777", "in_progress")],
   });
   ledger = new Map();
@@ -254,7 +258,7 @@ function setup(config: Record<string, unknown> = {}) {
     const rows = (await Promise.all(issues)).filter(Boolean) as any[];
     // Ownership is decided regardless of status or the card's current assignee: the comment path returns up to two
     // distinct cards with a PR-link comment by any non-excluded agent (CARD_BY_COMMENT_SQL); two means ambiguous.
-    if (sql === CARD_BY_IDENTIFIER_SQL) return rows.filter((r) => r.identifier === params[1]).map((r) => ({ ...r, assignee_agent_id: r.assigneeAgentId }));
+    if (sql === CARD_BY_IDENTIFIER_SQL) return rows.filter((r) => r.identifier === params[1]).map((r) => ({ ...r, assignee_agent_id: r.assigneeAgentId, project_id: r.projectId ?? null }));
     if (sql === CARD_BY_COMMENT_SQL) {
       // The statement's own predicates: c.body ilike $2 and c.body ~* $3.
       const mentions = [...[...commentCards].map(([body, cardId]) => ({ body, cardId, author: DOER })), ...laterMentions]
@@ -274,7 +278,7 @@ function setup(config: Record<string, unknown> = {}) {
     if (sql === COMMENT_EXISTS_SQL) return comments.filter((c) => c.issueId === params[1] && c.body === params[2]).map(() => ({ id: "c" }));
     if (sql === retryableSql(DB_NAMESPACE)) {
       const snapshot = [...ledger.entries()]
-        .filter(([, r]) => r.signal !== "{}" && (["error", "no_card"].includes(r.outcome) || (["claimed", "retrying"].includes(r.outcome) && r.stale))) // backoff windows: see sql.test
+        .filter(([, r]) => r.signal !== "{}" && (r.outcome === "error" || (r.outcome === "no_card" && r.attempts < NO_CARD_RETRY_ATTEMPTS) || (["claimed", "retrying"].includes(r.outcome) && r.stale))) // backoff windows: see sql.test
         .map(asRow);
       onRetrySelect?.();
       return snapshot;
@@ -1353,6 +1357,30 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
     expect(row()!.outcome).toBe("wake_unconfirmed");
     await harness.runJob(SWEEP_JOB_KEY);
     expect(hostWakeCalls).toBe(1);
+  });
+
+  it("a PR no card owns is polled a bounded number of times, then only a genuine signal resumes it", async () => {
+    commentCards.clear(); // a PR opened by a person: no card links it
+    await deliver("check_run", ciFailed("build"));
+    expect(row()!.outcome).toBe("no_card");
+    for (let i = 0; i < NO_CARD_RETRY_ATTEMPTS + 4; i += 1) await harness.runJob(SWEEP_JOB_KEY);
+    expect(row()!).toMatchObject({ outcome: "no_card", attempts: NO_CARD_RETRY_ATTEMPTS }); // the sweep stopped polling it
+    const calls = graphCalls;
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(graphCalls).toBe(calls); // no GitHub read and no owner scan for it any more
+    commentCards.set(link(1903), CARD); // a card links the PR later
+    await deliver("check_run", ciFailed("build")); // the next genuine signal resumes the row
+    expect(wakes).toHaveLength(1);
+    expect(row()!.outcome).toMatch(/^woken:/);
+  });
+
+  it("a branch named after a card in a project not linked to the PR's repo names no card", async () => {
+    commentCards.clear();
+    harness.seed({ issues: [issue(CARD, "TOG-43084", "in_review", { projectId: "cccccccc-0000-4000-8000-000000000009" })] });
+    graph = { mergeable: "MERGEABLE", isDraft: false, ref: "TOG-43084-tmp" };
+    await deliver("check_run", reviewFailed(HEAD, "TOG-43084-tmp"));
+    expect(wakes).toEqual([]);
+    expect(row(1903, "review_findings")!.outcome).toBe("no_card");
   });
 
   it("a comment linking the same path on another host never makes an unrelated card the owner", async () => {

@@ -112,61 +112,133 @@ function namespace(ctx: PluginContext): string {
 
 export type CardResolution = { kind: "card"; card: CardRef } | { kind: "none" } | { kind: "ambiguous"; detail: string };
 
+/** How long the repo -> projects map and full issue texts are reused across resolutions (finding M1). */
+export const SCAN_CACHE_TTL_MS = 60_000;
+const PROJECT_SCAN_CAP = 200;
+const ISSUE_SCAN_CAP = 200;
+const OPEN_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+
+type ProjectMap = { at: number; overflow: boolean; repos: Map<string, string[]> };
+type IssueText = { title: string; description: string; originKind?: string; identifier: string | null; status: string };
+interface ScanCache {
+  projects: Map<string, ProjectMap>;
+  /** `${companyId}|${issueId}|${updatedAt}`: an edited issue gets a new key, so the cached text is never stale. */
+  issues: Map<string, { at: number; text: IssueText | null }>;
+}
+/** Keyed by the worker's context, so a new context (a restart, a test harness) starts empty. */
+const scanCaches = new WeakMap<PluginContext, ScanCache>();
+
+function scanCache(ctx: PluginContext): ScanCache {
+  let cache = scanCaches.get(ctx);
+  if (!cache) scanCaches.set(ctx, (cache = { projects: new Map(), issues: new Map() }));
+  return cache;
+}
+
+/** `owner/repo` from a workspace repoUrl (https, scp-style or ssh), lowercased; null for anything else. */
+export function repoOfUrl(repoUrl: string | null | undefined): string | null {
+  if (!repoUrl) return null;
+  const normalized = repoUrl.toLowerCase().replace(/\/$/, "").replace(/\.git$/, "");
+  const match = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/]+\/[^/]+)$/.exec(normalized);
+  return match?.[1] ?? null;
+}
+
+/**
+ * The company's repo -> project ids map from project workspace URLs, built once per SCAN_CACHE_TTL_MS instead of
+ * one listWorkspaces call per project on every resolution. `overflow`: more projects than the scan covers.
+ */
+async function projectsByRepo(ctx: PluginContext, companyId: string): Promise<ProjectMap> {
+  const cache = scanCache(ctx);
+  const hit = cache.projects.get(companyId);
+  if (hit && Date.now() - hit.at < SCAN_CACHE_TTL_MS) return hit;
+  const projects = await ctx.projects.list({ companyId, limit: PROJECT_SCAN_CAP + 1 });
+  const map: ProjectMap = { at: Date.now(), overflow: projects.length > PROJECT_SCAN_CAP, repos: new Map() };
+  if (!map.overflow) {
+    for (const project of projects) {
+      for (const { repoUrl } of await ctx.projects.listWorkspaces(project.id, companyId)) {
+        const repo = repoOfUrl(repoUrl);
+        if (!repo) continue;
+        const ids = map.repos.get(repo) ?? [];
+        if (!ids.includes(project.id)) ids.push(project.id);
+        map.repos.set(repo, ids);
+      }
+    }
+  }
+  cache.projects.set(companyId, map);
+  return map;
+}
+
+/** The full title and description of an issue the list returned as a (possibly truncated) summary. */
+async function issueText(ctx: PluginContext, companyId: string, summary: { id: string; updatedAt?: unknown }): Promise<IssueText | null> {
+  const cache = scanCache(ctx);
+  const version = summary.updatedAt instanceof Date ? summary.updatedAt.toISOString() : summary.updatedAt ? String(summary.updatedAt) : null;
+  const key = version ? `${companyId}|${summary.id}|${version}` : null;
+  const now = Date.now();
+  const hit = key ? cache.issues.get(key) : undefined;
+  if (hit && now - hit.at < SCAN_CACHE_TTL_MS) return hit.text;
+  const issue = await ctx.issues.get(summary.id, companyId);
+  const text = issue ? { title: issue.title ?? "", description: issue.description ?? "", originKind: issue.originKind, identifier: issue.identifier ?? null, status: issue.status } : null;
+  if (key) {
+    for (const [k, v] of cache.issues) if (now - v.at >= SCAN_CACHE_TTL_MS) cache.issues.delete(k);
+    cache.issues.set(key, { at: now, text });
+  }
+  return text;
+}
+
 /**
  * The owning card from both interim paths (README "Card resolution"), found without regard to status or the card's
  * current assignee: an ineligible owner (done, handed to the Reviewer) must hold the wake, not pass it to another card.
  * The owner is the one card both paths together name. Two or more distinct candidates (branch vs comment, or PR-link
  * comments on two cards) mean the owner is unknown: the wake is held rather than sent to a card that may be
  * unrelated. Eligibility is checked on the owner afterwards (wakeForSignal).
+ * A head branch names a card only when that card's project has a workspace for the PR's repo: a branch name is not
+ * tied to the PR the way an exact PR-link is, so `TOG-123-tmp` in an unrelated repo names nothing.
  */
 export async function resolveCard(ctx: PluginContext, companyId: string, config: DoerWakeConfig, signal: Signal): Promise<CardResolution> {
   const exclude = config.excludeAgentIds.join(",");
-  type Row = { id: string; identifier: string; status: string };
+  type Row = { id: string; identifier: string; status: string; project_id?: string | null };
   const candidates = new Map<string, CardRef>();
+  // The SDK has no text search. Resolve the repo from project workspace URLs and scan only open
+  // issues in matching projects. Fail closed if the complete scan would exceed the budget.
+  const projectMap = await projectsByRepo(ctx, companyId);
+  if (projectMap.overflow) return { kind: "ambiguous", detail: `project scan exceeds ${PROJECT_SCAN_CAP} projects` };
+  const repoProjects = projectMap.repos.get(signal.repo.toLowerCase()) ?? [];
   if (signal.headRef) {
     const match = new RegExp(config.branchIdentifierPattern).exec(signal.headRef);
     if (match?.[1]) {
       const [row] = await ctx.db.query<Row>(CARD_BY_IDENTIFIER_SQL, [companyId, match[1]]);
-      if (row) candidates.set(row.id, { id: row.id, identifier: row.identifier, status: row.status, via: "branch" });
+      if (row?.project_id && repoProjects.includes(row.project_id)) {
+        candidates.set(row.id, { id: row.id, identifier: row.identifier, status: row.status, via: "branch" });
+      }
     }
   }
   const { like, regex } = prUrlPatterns(signal.repo, signal.number);
   for (const row of await ctx.db.query<Row>(CARD_BY_COMMENT_SQL, [companyId, like, regex, exclude])) {
     if (!candidates.has(row.id)) candidates.set(row.id, { id: row.id, identifier: row.identifier, status: row.status, via: "comment" });
   }
-  // The SDK has no text search. Resolve the repo from project workspace URLs and scan only open
-  // issues in matching projects. Fail closed if the complete scan would exceed the budget.
-  const projects = await ctx.projects.list({ companyId, limit: 201 });
-  if (projects.length > 200) return { kind: "ambiguous", detail: "project scan exceeds 200 projects" };
+  const ambiguous = (): CardResolution => ({ kind: "ambiguous", detail: [...candidates.values()].map((c) => `${c.via}:${c.identifier}`).join(" ") });
+  // Already ambiguous: the description scan could only add candidates.
+  if (candidates.size > 1) return ambiguous();
   const urlPattern = new RegExp(regex, "i");
   const summaries = [];
-  const openStatuses = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
-  for (const project of projects) {
-    const workspaces = await ctx.projects.listWorkspaces(project.id, companyId);
-    const matchesRepo = workspaces.some(({ repoUrl }) => {
-      if (!repoUrl) return false;
-      const normalized = repoUrl.toLowerCase().replace(/\.git\/?$/, "").replace(/\/$/, "");
-      return normalized === `https://github.com/${signal.repo.toLowerCase()}` || normalized === `git@github.com:${signal.repo.toLowerCase()}` || normalized === `ssh://git@github.com/${signal.repo.toLowerCase()}`;
-    });
-    if (!matchesRepo) continue;
-    for (const status of openStatuses) {
-      const remaining = 200 - summaries.length;
-      const page = await ctx.issues.list({ companyId, projectId: project.id, status, limit: remaining + 1 });
-      if (page.length > remaining) return { kind: "ambiguous", detail: "project issue scan exceeds 200 open issues" };
+  for (const projectId of repoProjects) {
+    for (const status of OPEN_STATUSES) {
+      const remaining = ISSUE_SCAN_CAP - summaries.length;
+      const page = await ctx.issues.list({ companyId, projectId, status, limit: remaining + 1 });
+      if (page.length > remaining) return { kind: "ambiguous", detail: `project issue scan exceeds ${ISSUE_SCAN_CAP} open issues` };
       summaries.push(...page);
     }
   }
   for (const summary of summaries) {
     if (summary.originKind === "chat_channel") continue;
-    const issue = await ctx.issues.get(summary.id, companyId);
+    const issue = await issueText(ctx, companyId, summary);
     if (!issue || issue.originKind === "chat_channel") continue;
-    if (urlPattern.test(issue.title ?? "") || urlPattern.test(issue.description ?? "")) {
-      if (!candidates.has(issue.id)) candidates.set(issue.id, { id: issue.id, identifier: issue.identifier ?? issue.id, status: issue.status, via: "description" });
+    if (urlPattern.test(issue.title) || urlPattern.test(issue.description)) {
+      if (!candidates.has(summary.id)) candidates.set(summary.id, { id: summary.id, identifier: issue.identifier ?? summary.id, status: issue.status, via: "description" });
     }
   }
-  const cards = [...candidates.values()];
-  if (cards.length > 1) return { kind: "ambiguous", detail: cards.map((c) => `${c.via}:${c.identifier}`).join(" ") };
-  return cards[0] ? { kind: "card", card: cards[0] } : { kind: "none" };
+  if (candidates.size > 1) return ambiguous();
+  const [card] = candidates.values();
+  return card ? { kind: "card", card } : { kind: "none" };
 }
 
 export function evidenceComment(signal: Signal): string {

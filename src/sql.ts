@@ -98,17 +98,23 @@ where company_id = $1 and fingerprint = $2 and wake_attempted_at = $3::timestamp
  * Rows the sweep finishes: transient errors (GitHub down, secret refused) and rows without a resolvable or eligible
  * owning card yet (the doer's PR-link comment often lands after a fast check; the owner may be with the Reviewer)
  * with an exponential backoff of 2, 4, 8, 16, 32, then 60 minutes; and rows still at 'claimed' or 'retrying' after
- * 10 minutes (the worker stopped mid-attempt). There is no attempt cap: a pending row ends only when a retry decides
+ * 10 minutes (the worker stopped mid-attempt). Errors have no attempt cap: such a row ends only when a retry decides
  * it (woken, held, or forgotten because GitHub says the PR no longer qualifies), so an outage never loses a signal.
+ * A `no_card` row is polled for NO_CARD_RETRY_ATTEMPTS re-claims (about 4 hours) and then kept for a later genuine
+ * signal to resume (plugin.ts resumable): a PR no card owns (opened by a person) would otherwise cost a full owner
+ * scan every hour for as long as it stays open.
  * The exponent is capped as well, since power(2, n) overflows float8 past n ~ 1023. A row without a signal (a
  * settled tombstone, or a pending row an earlier build compacted, which only a redelivery can resume) is skipped.
  * Each row is then taken with reclaimSql.
  */
+export const NO_CARD_RETRY_ATTEMPTS = 8;
+
 export function retryableSql(ns: string): string {
   return `select ${ROW_COLUMNS}
 from ${ns}.wake_ledger
 where company_id = $1 and signal <> '{}'::jsonb and (
-(outcome in ('error', 'no_card') and updated_at < now() - interval '1 minute' * least(power(2, least(attempts, 5) + 1), 60))
+((outcome = 'error' or (outcome = 'no_card' and attempts < ${NO_CARD_RETRY_ATTEMPTS}))
+and updated_at < now() - interval '1 minute' * least(power(2, least(attempts, 5) + 1), 60))
 or (outcome in ('claimed', 'retrying') and updated_at < now() - interval '10 minutes'))
 order by updated_at asc limit 20`;
 }
@@ -148,9 +154,10 @@ and split_part(outcome, ':', 1) in (${SETTLED_OUTCOMES.map((o) => `'${o}'`).join
 /**
  * The card a `TOG-123-slug` head branch names, whatever its status or assignee: ownership first, eligibility
  * (status, assignee, blockers) is checked on the owner afterwards (waker.ts), so an ineligible owner holds the wake
- * instead of handing it to another card.
+ * instead of handing it to another card. project_id: the branch counts only if that project has a workspace for the
+ * PR's repo (waker.ts resolveCard).
  */
-export const CARD_BY_IDENTIFIER_SQL = `select i.id, i.identifier, i.status, i.assignee_agent_id
+export const CARD_BY_IDENTIFIER_SQL = `select i.id, i.identifier, i.status, i.assignee_agent_id, i.project_id::text as project_id
 from public.issues i
 where i.company_id = $1 and i.identifier = $2
 limit 1`;

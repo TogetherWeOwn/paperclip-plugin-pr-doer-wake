@@ -80,6 +80,43 @@ describe("review fixes", () => {
     const c = ctx([{ ...item("foreign", `https://github.com/${repo}/pull/12`), projectId: "other" }]);
     expect(await resolveCard(c, "company", config, signal)).toEqual({ kind: "none" });
   });
+  it("counts a branch-named card only when its project has a workspace for the PR's repo", async () => {
+    const branchCtx = (projectId: string | null) => {
+      const c = ctx([]);
+      c.db.query = async (sql: string) => sql.includes("i.identifier =") ? [{ id: "b", identifier: "TOG-10", status: "in_progress", project_id: projectId }] : [];
+      return c;
+    };
+    const branchSignal = { ...signal, headRef: "TOG-10-tmp" };
+    expect(await resolveCard(branchCtx("project"), "company", config, branchSignal)).toMatchObject({ kind: "card", card: { id: "b", via: "branch" } });
+    expect(await resolveCard(branchCtx("other"), "company", config, branchSignal)).toEqual({ kind: "none" });
+    expect(await resolveCard(branchCtx(null), "company", config, branchSignal)).toEqual({ kind: "none" });
+  });
+  it("reuses the repo -> projects map and unchanged issue texts across resolutions", async () => {
+    const at = new Date("2026-10-31T00:00:00Z");
+    const items = Array.from({ length: 50 }, (_, i) => ({ ...item(String(i), "unrelated"), updatedAt: at }));
+    const c = ctx(items);
+    let workspaceCalls = 0;
+    let reads = 0;
+    const listWorkspaces = c.projects.listWorkspaces;
+    c.projects.listWorkspaces = async () => { workspaceCalls++; return listWorkspaces(); };
+    const get = c.issues.get;
+    c.issues.get = async (id: string) => { reads++; return get(id); };
+    expect(await resolveCard(c, "company", config, signal)).toEqual({ kind: "none" });
+    expect([workspaceCalls, reads]).toEqual([1, 50]);
+    expect(await resolveCard(c, "company", config, signal)).toEqual({ kind: "none" });
+    expect([workspaceCalls, reads]).toEqual([1, 50]); // nothing re-read
+    items[7] = { ...item("7", `https://github.com/${repo}/pull/12`), updatedAt: new Date("2026-10-31T00:01:00Z") }; // edited
+    expect(await resolveCard(c, "company", config, signal)).toMatchObject({ kind: "card", card: { id: "7" } });
+    expect(reads).toBe(51); // only the edited issue
+  });
+  it("skips the description scan when the branch and comment paths already disagree", async () => {
+    const c = ctx([]);
+    c.db.query = async (sql: string) => sql.includes("i.identifier =")
+      ? [{ id: "b", identifier: "TOG-10", status: "in_progress", project_id: "project" }]
+      : [{ id: "c", identifier: "TOG-11", status: "in_progress" }];
+    c.issues.list = async () => { throw new Error("unexpected issue scan"); };
+    expect(await resolveCard(c, "company", config, { ...signal, headRef: "TOG-10-x" })).toEqual({ kind: "ambiguous", detail: "branch:TOG-10 comment:TOG-11" });
+  });
   it("defaults to stopping nntune and ignores stale required-check maps", () => {
     const c = parseConfig({ requiredChecks: { [repo]: ["build"] } });
     expect(c.stoppedRepos).toContain("togetherweown/nntune");
