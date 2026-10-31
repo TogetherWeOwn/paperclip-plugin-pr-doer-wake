@@ -1,0 +1,56 @@
+{
+  "name": "@togetherweown/paperclip-plugin-pr-doer-wake",
+  "version": "0.1.2",
+  "description": "Paperclip plugin: wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when a non-ignored check fails or a synchronize event reveals a merge conflict. Never wakes drafts, closed or merged PRs, forks, outsiders, stopped repos or a card whose ownership is ambiguous. A lost host reply can miss a wake (counted as wake_unconfirmed); it never wakes twice.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TogetherWeOwn/paperclip-plugin-pr-doer-wake"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "migrations",
+    "README.md"
+  ],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "github",
+    "pull-request",
+    "wakeup"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "peerDependencies": {
+    "@paperclipai/plugin-sdk": "*"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12",
+    "zod": "4.6.7"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
