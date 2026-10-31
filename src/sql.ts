@@ -143,7 +143,7 @@ export const SETTLED_OUTCOMES = ["woken", "wake_unconfirmed", "refused", "held_s
  * Retention: 30 days after a row was settled it keeps only its dedupe key and outcome (a tombstone of a few hundred
  * bytes); the signal payload is dropped. A pending row is never compacted, however old (for example of a company
  * disabled for a month): its signal is what a retry wakes with. Rows are never deleted: a still-open PR on the same
- * head in the same state would otherwise wake again (for example a later default-branch push re-sweeping a conflict).
+ * head in the same state would otherwise wake again (for example a re-run check that fails again on the same head).
  */
 export function compactSql(ns: string): string {
   return `update ${ns}.wake_ledger set signal = '{}'::jsonb

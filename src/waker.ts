@@ -185,9 +185,10 @@ async function issueText(ctx: PluginContext, companyId: string, summary: { id: s
 }
 
 /**
- * The owning card from both interim paths (README "Card resolution"), found without regard to status or the card's
- * current assignee: an ineligible owner (done, handed to the Reviewer) must hold the wake, not pass it to another card.
- * The owner is the one card both paths together name. Two or more distinct candidates (branch vs comment, or PR-link
+ * The owning card from the interim paths (README "Card resolution": head branch, agent PR-link comment, PR URL in a
+ * card title or description), found without regard to status or the card's current assignee: an ineligible owner
+ * (done, handed to the Reviewer) must hold the wake, not pass it to another card. The owner is the one card all paths
+ * together name. Two or more distinct candidates (branch vs comment, or PR-link
  * comments on two cards) mean the owner is unknown: the wake is held rather than sent to a card that may be
  * unrelated. Eligibility is checked on the owner afterwards (wakeForSignal).
  * A head branch names a card only when that card's project has a workspace for the PR's repo: a branch name is not

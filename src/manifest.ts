@@ -70,21 +70,34 @@ const manifest: PaperclipPluginManifestV1 = {
     type: "object",
     properties: {
       enabled: { type: "boolean", default: false, description: "Master switch for this company." },
-      shadow: { type: "boolean", default: true, description: "Record and log what would be woken, but post nothing and wake nobody." },
+      shadow: { type: "boolean", default: true, description: "Record and log what would be woken, but wake nobody." },
       githubOrg: { type: "string", description: "GitHub organization login whose webhooks this company accepts, e.g. TogetherWeOwn." },
       webhookSecretRef: { ...secretRef, description: "Paperclip secret holding the GitHub webhook secret." },
       githubTokenSecretRef: {
         ...secretRef,
         description:
-          "Required when enabled. Paperclip secret with a GitHub token that can read pull requests and check runs in githubOrg: a classic token (no scope for public repos, repo for private ones) or a token with Pull requests: read and Checks: read. Fine-grained personal access tokens cannot read check runs. Every wake is revalidated against GitHub first,.",
+          "Required when enabled. Paperclip secret with a GitHub token that can read pull requests and check runs in githubOrg: a classic token (no scope for public repos, repo for private ones) or a token with Pull requests: read and Checks: read. Fine-grained personal access tokens cannot read check runs. Every wake is revalidated against GitHub first.",
       },
-      reviewCheckName: { type: "string", default: "Paperclip Review" },
-      ignoreChecks: { type: "array", items: { type: "string" }, default: [] },
+      reviewCheckName: {
+        type: "string",
+        default: "Paperclip Review",
+        description: "Check run whose red conclusion wakes as review_findings; every other non-ignored red check wakes as ci_red.",
+      },
+      ignoreChecks: { type: "array", items: { type: "string" }, default: [], description: "Check run names that never wake, the review check included." },
       stoppedRepos: { type: "array", items: { type: "string" }, default: ["togetherweown/nntune"], description: "Lowercase org/repo that never wake." },
       excludeAgentIds: { type: "array", items: { type: "string" }, default: [], description: "Agents whose cards never own a PR (the Reviewer)." },
-      wakeStates: { type: "array", items: { type: "string", enum: [...WAKE_STATES] }, default: [...WAKE_STATES] },
-      skipBlockedStatus: { type: "boolean", default: true },
-      branchIdentifierPattern: { type: "string", default: "^([A-Z][A-Z0-9]*-[0-9]+)-" },
+      wakeStates: {
+        type: "array",
+        items: { type: "string", enum: [...WAKE_STATES] },
+        default: [...WAKE_STATES],
+        description: "States that may wake: review_findings, ci_red, conflict.",
+      },
+      skipBlockedStatus: { type: "boolean", default: true, description: "Hold cards whose own status is blocked, even without a blocker relation." },
+      branchIdentifierPattern: {
+        type: "string",
+        default: "^([A-Z][A-Z0-9]*-[0-9]+)-",
+        description: "Regular expression on the PR head branch; capture group 1 is the owning card's identifier.",
+      },
       trustedAuthors: {
         type: "array",
         items: { type: "string" },

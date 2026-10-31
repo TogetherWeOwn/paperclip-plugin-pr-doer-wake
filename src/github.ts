@@ -67,7 +67,7 @@ export interface ParsedEvent {
 
 /**
  * The only GitHub events this plugin consumes. Subscribe the org webhook to exactly these: the host stores every
- * delivery in plugin_webhook_deliveries and never prunes it (README "Webhook events").
+ * delivery in plugin_webhook_deliveries and never prunes it (README "Events and limitations").
  */
 export const SUBSCRIBED_EVENTS = new Set(["pull_request", "check_run"]);
 
@@ -87,7 +87,7 @@ export const CONFLICT_PR_ACTIONS = new Set(["synchronize"]);
 
 /**
  * Cheap pre-filter run BEFORE signature verification. Most org deliveries (check_run created/success,
- * pull_request labeled/assigned, feature-branch pushes) can never act, so they are acknowledged without loading
+ * pull_request labeled/assigned) can never act, so they are acknowledged without loading
  * company config or touching a secret. Skipping an unverified event is safe: it performs no work. Deliveries that
  * pass still verify against the worker-memory secret cache (src/secrets.ts) before any per-company work.
  */
@@ -171,8 +171,9 @@ export type CheckVerdict = { kind: "red"; run: CheckRunState } | Exclude<PrCheck
  */
 export function checkVerdict(runs: CheckRunState[] | undefined, signal: Signal, config: DoerWakeConfig): CheckVerdict {
   if (!runs) return { kind: "transient", detail: "check runs not read" };
-  // A head-level re-evaluation (RECHECK_PR_ACTIONS) names no check and no run: it judges every relevant check, and
-  // there is no delivered run whose absence could mean read lag, so not red now is check_not_red at once.
+  // A signal that names no check and no run (a ledger row from a build that re-evaluated the head on ready_for_review
+  // or reopened) judges every relevant check, and there is no delivered run whose absence could mean read lag, so not
+  // red now is check_not_red at once.
   const review = signal.state === "review_findings";
   const own = signal.detail.checkName ?? (review ? config.reviewCheckName : undefined);
   const relevant = (name: string) => isGatingCheck(config, signal.repo, name) && (review ? name === own : name !== config.reviewCheckName);
@@ -360,7 +361,7 @@ const SUITES = `checkSuites(first:100,after:$suites){pageInfo{hasNextPage endCur
  * the relevant names; plugin.ts headCheckRuns pages the runs of each suite with SUITE_RUNS_QUERY. GitHub GraphQL:
  * Repository.object(oid:), Commit.checkSuites, CheckSuite.checkRuns(filterBy: CheckRunFilter{checkType: LATEST}).
  * Reading check suites needs the Checks read permission, which fine-grained personal access tokens cannot get
- * (README "GitHub token").
+ * (README "Configuration").
  */
 export const HEAD_SUITES_QUERY = `query($o:String!,$r:String!,$oid:GitObjectID!,$suites:String,$runs:String){repository(owner:$o,name:$r){
 object(oid:$oid){... on Commit{${SUITES}}}}}`;
