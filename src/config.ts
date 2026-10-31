@@ -30,7 +30,10 @@ export interface DoerWakeConfig {
    * Stored normalized: lowercase, without a trailing `[bot]`.
    */
   trustedAuthors: string[];
-  /** GraphQL pages (50 PRs each) the conflict sweep reads per repo per tick; it resumes from the cursor next tick. */
+  /**
+   * GraphQL pages (50 PRs each) the conflict sweep reads per repo per tick; it resumes from the cursor next tick.
+   * Currently unused: push events are not consumed, so runSweep never runs the conflict sweep.
+   */
   sweepMaxPages: number;
 }
 

@@ -96,7 +96,7 @@ async function verifiedCompany(ctx: PluginContext, candidates: Company[], rawBod
   return null;
 }
 
-/** What the GitHub token must be allowed to read (README "GitHub token"). */
+/** What the GitHub token must be allowed to read (README "Configuration"). */
 export const TOKEN_PERMISSIONS =
   "pull requests and check runs of every repo in githubOrg: a classic token (no scope for public repos, `repo` for private ones) or another token with Pull requests: read and Checks: read; fine-grained personal access tokens cannot read check runs";
 
@@ -230,8 +230,8 @@ type LedgerRow = {
 };
 
 /**
- * The signal an attempt acts on: the newly delivered one, except that a head-level re-evaluation (ready_for_review or
- * reopened, no delivered run) keeps the stored signal's delivered run identity, which tells GitHub read lag from a
+ * The signal an attempt acts on: the newly delivered one, except that a check signal without a delivered run (none is
+ * parsed now that ready_for_review and reopened are not consumed) keeps the stored signal's delivered run identity, which tells GitHub read lag from a
  * recovered check (checkVerdict). Without it, a lagging read would forget a row whose failure GitHub has not listed yet.
  */
 function signalFor(fresh: Signal | undefined, stored: string): Signal {
