@@ -1856,5 +1856,159 @@ describe("pr-doer-wake end to end (SDK test harness)", () => {
       expect(wakes).toHaveLength(1);
       expect(ledger.size).toBe(1);
     });
+
+    /** GitHub answers hasNextPage without an endCursor on the head commit's check suites or on a suite's runs. */
+    function dropCursor(level: "suites" | "runs") {
+      const ctx = harness.ctx as any;
+      const real = ctx.http.fetch;
+      ctx.http.fetch = async (url: string, init?: { body?: string }) => {
+        const response: Response = await real(url, init);
+        if (!String(JSON.parse(init?.body ?? "{}").query ?? "").includes("object(oid:")) return response;
+        const body = await response.json();
+        const suites = body.data.repository.object.checkSuites;
+        const pages = level === "suites" ? [suites.pageInfo] : suites.nodes.map((s: any) => s.checkRuns.pageInfo);
+        for (const p of pages) if (p.hasNextPage) p.endCursor = null;
+        return new Response(JSON.stringify(body), { status: 200 });
+      };
+    }
+
+    it("a suites page that says there is more but gives no cursor is transient, never 'nothing else red'", async () => {
+      pageSize = 1;
+      dropCursor("suites");
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun(), { id: "CR_kwDOlint", name: "lint", status: "COMPLETED", conclusion: "SUCCESS", startedAt: RUN_STARTED, suite: "CS_2" }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toEqual([]);
+      expect(row()!).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+    });
+
+    it("a runs page that says there is more but gives no cursor is transient: the unread page may hold a newer green re-run", async () => {
+      pageSize = 1;
+      dropCursor("runs");
+      // Fully read, the newer passing re-run supersedes the failure; stopping at the first page would wake on it.
+      graph = { mergeable: "MERGEABLE", isDraft: false, checks: [redRun(), { id: "CR_kwDOrerun", name: "build", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-10-27T04:05:00Z" }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(wakes).toEqual([]);
+      expect(row()!).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+    });
+  });
+
+  describe("webhook authentication and routing", () => {
+    it("a correctly signed delivery for a repository outside githubOrg is rejected before any GitHub read", async () => {
+      const evil = { full_name: "Elsewhere/two-web-next", default_branch: "main", owner: { login: "Elsewhere" } };
+      await expect(deliver("check_run", { organization: { login: "Elsewhere" }, repository: evil, ...ciFailed("build") })).rejects.toThrow(/did not verify for any enabled company/);
+      expect(graphCalls).toBe(0);
+      expect(ledger.size).toBe(0);
+      expect(wakes).toEqual([]);
+    });
+
+    it("githubOrg matches the delivery's owner case-insensitively", async () => {
+      await deliver("check_run", { organization: { login: "togetherweown" }, ...ciFailed("build") });
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a disabled company never verifies a delivery, even one signed with its secret", async () => {
+      await setup({ enabled: false });
+      await expect(deliver("check_run", ciFailed("build"))).rejects.toThrow(/did not verify for any enabled company/);
+      expect(graphCalls).toBe(0);
+      expect(wakes).toEqual([]);
+    });
+
+    it("an unknown endpoint key is refused before any work", async () => {
+      const body = JSON.stringify({ organization, repository, ...ciFailed("build") });
+      await expect(plugin.definition.onWebhook!({
+        endpointKey: "other", headers: { "x-github-event": "check_run", "x-hub-signature-256": sign(body) }, rawBody: body, parsedBody: JSON.parse(body), requestId: "r",
+      })).rejects.toThrow(/unknown webhook endpoint/);
+      expect(graphCalls).toBe(0);
+      expect(wakes).toEqual([]);
+    });
+
+    it("verifies the raw body when the host passes no parsed body, and reads array-valued headers", async () => {
+      const body = JSON.stringify({ organization, repository, ...ciFailed("build") });
+      await plugin.definition.onWebhook!({
+        endpointKey: "github", headers: { "x-github-event": ["check_run"], "x-hub-signature-256": [sign(body)] } as any, rawBody: body, requestId: "r",
+      });
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a parsed body that differs from the signed raw bytes never verifies", async () => {
+      const body = JSON.stringify({ organization, repository, ...ciFailed("build") });
+      const tampered = JSON.stringify({ organization, repository, ...ciFailed("build", "failure", HEAD, 1904) });
+      await expect(plugin.definition.onWebhook!({
+        endpointKey: "github", headers: { "x-github-event": "check_run", "x-hub-signature-256": sign(tampered) }, rawBody: body, parsedBody: JSON.parse(tampered), requestId: "r",
+      })).rejects.toThrow(/did not verify/);
+      expect(wakes).toEqual([]);
+    });
+  });
+
+  describe("GraphQL error answers are never read as data", () => {
+    const prGone = { type: "NOT_FOUND", path: ["repository", "pullRequest"], message: "Could not resolve to a PullRequest with the number of 1903." };
+
+    it("a missing PR reported beside another error is transient, not closed: the pending row is kept", async () => {
+      graphFail = true;
+      await deliver("check_run", ciFailed("build"));
+      graphFail = false;
+      githubBody = { data: { repository: { pullRequest: null } }, errors: [prGone, { type: "INTERNAL", path: ["repository", "pullRequest", "commits"], message: "timeout" }] };
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(row()!.outcome).toBe("error");
+      githubBody = undefined;
+      await harness.runJob(SWEEP_JOB_KEY);
+      expect(wakes).toHaveLength(1);
+    });
+
+    it("a malformed errors field (not an array) is transient, not an empty success", async () => {
+      githubBody = { data: { repository: { pullRequest: null } }, errors: { message: "Something went wrong" } };
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!).toMatchObject({ outcome: "error", wakeAttemptedAt: null });
+      expect(wakes).toEqual([]);
+    });
+
+    it("a 'not accessible by' error without a type is reported as a token permission problem", async () => {
+      githubBody = { data: { repository: { pullRequest: null } }, errors: [{ path: ["repository", "pullRequest"], message: "Resource not accessible by integration" }] };
+      await deliver("check_run", ciFailed("build"));
+      expect(row()!.outcome).toBe("error");
+      expect(harness.logs.filter((l) => l.level === "error" && /lacks a permission/.test(l.message))).toHaveLength(1);
+    });
+  });
+
+  it("a closed delivery whose PR cannot be read right now keeps the pending row", async () => {
+    graphFail = true;
+    await deliver("check_run", ciFailed("build"));
+    expect(row()!.outcome).toBe("error");
+    await deliver("pull_request", prEvent({ action: "closed" }));
+    expect(row()!.outcome).toBe("error");
+    graphFail = false;
+    await harness.runJob(SWEEP_JOB_KEY);
+    expect(wakes).toHaveLength(1);
+  });
+});
+
+describe("config validation", () => {
+  const valid = {
+    enabled: true, githubOrg: "o",
+    webhookSecretRef: { type: "secret_ref", secretId: "a" }, githubTokenSecretRef: { type: "secret_ref", secretId: "b" },
+  };
+
+  it("accepts a complete enabled config and never rejects a disabled one", async () => {
+    expect(validateConfig(parseConfig(valid))).toEqual([]);
+    expect(validateConfig(parseConfig({ enabled: false }))).toEqual([]);
+    expect(await plugin.definition.onValidateConfig!(valid as any)).toEqual({ ok: true });
+  });
+
+  it("requires githubOrg and webhookSecretRef when enabled", () => {
+    expect(validateConfig(parseConfig({ ...valid, githubOrg: "" }))).toEqual([expect.stringMatching(/githubOrg/)]);
+    expect(validateConfig(parseConfig({ ...valid, webhookSecretRef: undefined }))).toEqual([expect.stringMatching(/webhookSecretRef/)]);
+  });
+
+  it("a secret given as a plain string or a non-secret_ref object is not a secret reference", () => {
+    for (const ref of ["whsec-plaintext", { type: "env", secretId: "a" }, { type: "secret_ref", secretId: 7 }]) {
+      expect(parseConfig({ ...valid, webhookSecretRef: ref }).webhookSecretRef).toBeNull();
+      expect(validateConfig(parseConfig({ ...valid, webhookSecretRef: ref }))).toEqual([expect.stringMatching(/webhookSecretRef/)]);
+    }
+  });
+
+  it("rejects a branchIdentifierPattern that is not a valid regular expression", async () => {
+    const config = { ...valid, branchIdentifierPattern: "^([A-Z]+-[0-9]+" };
+    expect(validateConfig(parseConfig(config))).toEqual([expect.stringMatching(/branchIdentifierPattern/)]);
+    expect(await plugin.definition.onValidateConfig!(config as any)).toMatchObject({ ok: false });
   });
 });
