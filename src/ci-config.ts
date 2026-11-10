@@ -14,6 +14,11 @@ export interface CiConfig {
   webhookSecretRef: SecretRef | null;
   /** Cold-start baseline only; measured successful waits replace it. */
   repoMedianMs: Record<string, number>;
+  gatesStatusEnabled: boolean;
+  /** Shadow publishes no GitHub status; it only logs what would be published. */
+  gatesStatusShadow: boolean;
+  /** Agent whose accepted merge confirmations publish `paperclip/gates`. */
+  releaseManagerAgentId: string | null;
 }
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -51,6 +56,9 @@ export function parseCiConfig(raw: Record<string, unknown>): CiConfig {
     webhooksEnabled: raw.webhooksEnabled === true,
     webhookSecretRef: secretRef(raw.webhookSecretRef),
     repoMedianMs: medians,
+    gatesStatusEnabled: raw.gatesStatusEnabled === true,
+    gatesStatusShadow: raw.gatesStatusShadow !== false,
+    releaseManagerAgentId: typeof raw.releaseManagerAgentId === "string" && UUID.test(raw.releaseManagerAgentId) ? raw.releaseManagerAgentId.toLowerCase() : null,
   };
 }
 
@@ -60,14 +68,15 @@ export function validateCiConfig(raw: Record<string, unknown>): string[] {
   // The manifest's combined instance config also declares the custody keys
   // validated by custody-config; the CI validator must recognize them here
   // (without validating them) so shared configs are not rejected as unknown.
-  const keys = ["enabled", "dryRun", "allowedRepos", "githubTokenSecretRef", "githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef", "webhooksEnabled", "webhookSecretRef", "repoMedianMs", "custodyEnabled", "custodyDryRun", "custodyCompanyId", "custodyOrg", "custodySummaryAgentId", "custodyClosedSince"];
+  const keys = ["enabled", "dryRun", "allowedRepos", "githubTokenSecretRef", "githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef", "webhooksEnabled", "webhookSecretRef", "repoMedianMs", "custodyEnabled", "custodyDryRun", "custodyCompanyId", "custodyOrg", "custodySummaryAgentId", "custodyClosedSince", "gatesStatusEnabled", "gatesStatusShadow", "releaseManagerAgentId"];
   if (Object.keys(raw).some((key) => !keys.includes(key))) errors.push("unknown configuration field");
   const bearer = Object.hasOwn(raw, "githubTokenSecretRef");
   const app = ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"].some((key) => Object.hasOwn(raw, key));
-  if (bearer && app || bearer && !config.githubTokenSecretRef || app && !config.githubApp || config.enabled && !bearer && !app) {
+  if (bearer && app || bearer && !config.githubTokenSecretRef || app && !config.githubApp || (config.enabled || config.gatesStatusEnabled) && !bearer && !app) {
     errors.push("configure exactly one complete authentication mode: githubTokenSecretRef OR githubAppId, githubInstallationId and githubAppPrivateKeySecretRef");
   }
-  if (!config.enabled) return errors;
+  if (config.gatesStatusEnabled && !config.releaseManagerAgentId) errors.push("gatesStatusEnabled requires releaseManagerAgentId as a UUID");
+  if (!config.enabled && !config.gatesStatusEnabled) return errors;
   if (!config.allowedRepos.length || !Array.isArray(raw.allowedRepos) || config.allowedRepos.length !== raw.allowedRepos.length) errors.push("allowedRepos must contain 1-100 valid owner/repo entries");
   if (config.webhooksEnabled && !config.webhookSecretRef) errors.push("webhooksEnabled requires webhookSecretRef");
   if (raw.repoMedianMs !== undefined && (!raw.repoMedianMs || typeof raw.repoMedianMs !== "object" || Array.isArray(raw.repoMedianMs) || Object.keys(raw.repoMedianMs).length !== Object.keys(config.repoMedianMs).length)) errors.push("repoMedianMs must map valid repos to integer durations from 60000 to 86400000 ms");

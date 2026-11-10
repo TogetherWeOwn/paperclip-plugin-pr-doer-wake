@@ -84,6 +84,13 @@ export interface CiPull {
   merged: boolean;
   mergeable: boolean | null;
 }
+export const GATES_CONTEXT = "paperclip/gates";
+export type GatesStatusState = "success" | "failure" | "error" | "pending";
+export interface CiCreatedStatus {
+  id: number;
+  context: string;
+  state: string;
+}
 export interface CiReadinessTiming {
   now: number;
   registeredAt: number;
@@ -350,6 +357,23 @@ export class CiGithub {
     return { repo, sha, baseBranch, required: [...unique.values()], runs, suites, statuses, currentAttemptRunIds, fetchedAt: this.now() };
   }
 
+  /**
+   * Create one `paperclip/gates` commit status. This is the plugin's only
+   * GitHub write: a fixed context, a fixed path shape and a two-field body.
+   * No target URL is sent. Callers gate this behind the RM-decision parser,
+   * the repo allowlist and the ledger dedupe/cap.
+   */
+  async createCommitStatus(repo: string, sha: string, state: GatesStatusState, description: string): Promise<CiCreatedStatus> {
+    repo = repoName(repo);
+    sha = fullSha(sha);
+    if (!["success", "failure", "error", "pending"].includes(state)) throw new CiGithubError("input");
+    if (typeof description !== "string" || !description.trim() || description.length > 140 || /[\x00-\x1f\x7f]/.test(description)) throw new CiGithubError("input");
+    const body = JSON.stringify({ state, context: GATES_CONTEXT, description });
+    const raw = object((await this.request(`/repos/${repo}/commits/${sha}/statuses`, undefined, undefined, body)).data);
+    if (text(raw.context) !== GATES_CONTEXT || text(raw.state) !== state) return invalid();
+    return { id: id(raw.id), context: GATES_CONTEXT, state };
+  }
+
   private async currentAttempt(repo: string, sha: string, suite: CiCheckSuite, runs: CiCheckRun[]): Promise<number[]> {
     // A queued suite contradicts an old in-progress workflow, even if its jobs
     // still look terminal. Wait for a coherent observation on a later poll.
@@ -489,10 +513,11 @@ export class CiGithub {
     }
   }
 
-  protected async request(path: string, graphqlBody?: string, exchange?: { jwt: string; body: string }): Promise<Page> {
-    // POSTs are reserved for fixed-origin GraphQL and the installation-token exchange; neither reuses a URL-only ETag.
-    if (!path.startsWith("/") || path.startsWith("//") || (graphqlBody !== undefined && path !== "/graphql") || (exchange !== undefined && !/^\/app\/installations\/[1-9][0-9]{0,15}\/access_tokens$/.test(path))) throw new CiGithubError("input");
-    if (graphqlBody !== undefined && exchange !== undefined) throw new CiGithubError("input");
+  protected async request(path: string, graphqlBody?: string, exchange?: { jwt: string; body: string }, statusBody?: string): Promise<Page> {
+    // POSTs are reserved for fixed-origin GraphQL, the installation-token exchange and
+    // the single gates commit-status create; none of them reuses a URL-only ETag.
+    if (!path.startsWith("/") || path.startsWith("//") || (graphqlBody !== undefined && path !== "/graphql") || (exchange !== undefined && !/^\/app\/installations\/[1-9][0-9]{0,15}\/access_tokens$/.test(path)) || (statusBody !== undefined && !/^\/repos\/[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+\/commits\/[a-f0-9]{40}\/statuses$/.test(path))) throw new CiGithubError("input");
+    if ([graphqlBody, exchange, statusBody].filter((part) => part !== undefined).length > 1) throw new CiGithubError("input");
     // Backoff/budget apply before secret resolution as well as to every fetch.
     if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
@@ -506,17 +531,17 @@ export class CiGithub {
         throw new CiGithubError("auth");
       });
     const url = `${ORIGIN}${path}`;
-    const cached = graphqlBody === undefined && !exchange ? this.cache.get(url) : undefined;
+    const cached = graphqlBody === undefined && !exchange && statusBody === undefined ? this.cache.get(url) : undefined;
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
       "X-GitHub-Api-Version": "2022-11-28",
-      ...(exchange ? { "Content-Type": "application/json" } : {}),
+      ...(exchange || statusBody ? { "Content-Type": "application/json" } : {}),
     };
     if (cached) headers["If-None-Match"] = cached.etag;
     if (graphqlBody !== undefined) headers["Content-Type"] = "application/json";
     let response: CiHttpResponse | Response;
     let unconditionalRetry = false;
-    try { response = await this.attempt(url, headers, exchange?.body ?? graphqlBody); }
+    try { response = await this.attempt(url, headers, exchange?.body ?? graphqlBody ?? statusBody); }
     catch (error) {
       if (!cached || !(error instanceof CiGithubError) || error.code !== "network") throw error;
       // Some stock SDKs construct Response("", {status:304}) and throw. Never assume
@@ -536,7 +561,9 @@ export class CiGithub {
       if (!cached || unconditionalRetry) return invalid();
       return { data: this.parse(cached.body, token), link: cached.link };
     }
-    if (response.status !== (exchange ? 201 : 200)) {
+    // GitHub create-status answers 201; plain reads answer 200. Either created
+    // status number is accepted, then strictly projected before returning.
+    if (!(exchange ? response.status === 201 : statusBody !== undefined ? response.status === 200 || response.status === 201 : response.status === 200)) {
       if (!exchange && response.status === 401 && typeof this.#credential !== "string") this.#credential.invalidate();
       throw new CiGithubError("http", response.status, this.cache.backoffUntil > this.now() ? this.cache.backoffUntil : undefined);
     }
@@ -546,10 +573,10 @@ export class CiGithub {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
       throw new CiGithubError("response");
     }
-    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > (exchange ? Math.min(this.maxBodyBytes, 16_384) : this.maxBodyBytes)) return invalid();
+    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > (exchange || statusBody ? Math.min(this.maxBodyBytes, 16_384) : this.maxBodyBytes)) return invalid();
     const data = this.parse(body, token, exchange !== undefined);
-    // Installation-token responses must never enter the ETag cache.
-    if (exchange) return { data, link: "" };
+    // Installation-token and status-create responses must never enter the ETag cache.
+    if (exchange || statusBody) return { data, link: "" };
     const link = header(response.headers, "link") ?? "";
     const etag = header(response.headers, "etag");
     if (link.includes(token) || etag?.includes(token) || SECRET_SHAPE.test(link) || etag && SECRET_SHAPE.test(etag)) return invalid();
