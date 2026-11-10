@@ -192,7 +192,8 @@ describe("native CI plugin entrypoint", () => {
       expect(registerTool).toHaveBeenCalledWith("ci_wait_register", registrationTool, expect.any(Function));
       expect(registerJob).toHaveBeenCalledWith("ci-wake-poll", expect.any(Function));
       const tool = registerTool.mock.calls[0]![2];
-      const poll = registerJob.mock.calls[0]![1];
+      expect(registerJob).toHaveBeenCalledWith("pr-custody", expect.any(Function));
+      const poll = registerJob.mock.calls.find(([key]) => key === "ci-wake-poll")![1];
       const job = { jobKey: "ci-wake-poll", runId: OTHER, trigger: "schedule" as const, scheduledAt: new Date(START).toISOString() };
       expect(await tool(registration, run)).toMatchObject({ data: { status: "open" } });
       await poll(job);
@@ -216,14 +217,21 @@ describe("native CI plugin entrypoint", () => {
       .toMatchObject({ ok: false, errors: expect.any(Array) });
   });
 
-  it("declares only read/binding, durable-state, native wake, tool, job and signed-hint capabilities", () => {
+  it("declares the explicit CI and custody capability envelopes without source status or comment mutation", () => {
     expect([...manifest.capabilities].sort()).toEqual([
       "agent.tools.register", "execution.workspaces.read", "http.outbound", "issues.checkout", "issues.read", "issues.wakeup",
       "jobs.schedule", "plugin.state.read", "plugin.state.write", "secrets.read-ref", "webhooks.receive",
+      "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
+      "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
     ].sort());
     expect(manifest.tools).toEqual([registrationTool]);
     expect(registrationTool.parametersSchema).toMatchObject({ additionalProperties: false, required: ["issueId", "repo", "prNumber", "headSha"] });
-    expect(manifest.jobs).toEqual([expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/4 * * * *" })]);
+    expect(manifest.jobs).toEqual([
+      expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/4 * * * *" }),
+      expect.objectContaining({ jobKey: "pr-custody", schedule: "17 * * * *" }),
+    ]);
+    expect(manifest.capabilities).not.toContain("issues.update");
+    expect(manifest.capabilities).not.toContain("issue.comments.create");
     expect(manifest.webhooks).toEqual([expect.objectContaining({ endpointKey: "github-ci" })]);
   });
 });

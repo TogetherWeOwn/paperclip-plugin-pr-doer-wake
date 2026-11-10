@@ -14,8 +14,11 @@ describe("stock manifest and config contract", () => {
     expect(new Set(manifest.capabilities)).toEqual(new Set([
       "webhooks.receive", "jobs.schedule", "issues.read", "issues.wakeup", "issues.checkout", "execution.workspaces.read",
       "agent.tools.register", "plugin.state.read", "plugin.state.write", "http.outbound", "secrets.read-ref",
+      "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
+      "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
     ]));
-    expect(manifest.database).toBeUndefined();
+    expect(manifest.database?.coreReadTables).toEqual(["issues", "issue_comments", "issue_documents"]);
+    expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")?.schedule).toBe("17 * * * *");
     expect(manifest.tools?.map((tool) => tool.name)).toEqual(["ci_wait_register"]);
     expect(manifest.jobs?.[0]?.schedule).toBe("*/4 * * * *");
   });

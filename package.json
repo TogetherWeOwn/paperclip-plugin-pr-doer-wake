@@ -20,6 +20,7 @@
   "files": [
     "dist",
     "migrations",
+    "custody-migrations",
     "README.md",
     "THREAT-MODEL.md",
     "ACCEPTANCE.md"

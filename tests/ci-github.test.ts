@@ -642,6 +642,96 @@ describe("Actions current-attempt evidence", () => {
 });
 
 describe("CiGithub caching, backoff, and caps", () => {
+  it("refuses caller admission before counting and persists admitted attempts before HTTP", async () => {
+    let ceiling = 1;
+    const events: string[] = [];
+    const fetch = vi.fn(async () => { events.push("http"); return response(pullData()); });
+    const github: CiGithub = new CiGithub(fetch, TOKEN, {
+      maxRequests: 2,
+      beforeRequest: () => { if (github.requestCount >= ceiling) throw new Error("reserved"); },
+      onRequestAdmitted: async () => { events.push(`save:${github.requestCount}`); },
+    });
+    await github.pull(REPO, 1);
+    await expect(github.pull(REPO, 1)).rejects.toThrow("reserved");
+    expect(github.requestCount).toBe(1);
+    ceiling = 2;
+    await github.pull(REPO, 1);
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
+    expect(github.requestCount).toBe(2);
+    expect(events).toEqual(["save:1", "http", "save:2", "http"]);
+  });
+
+  it("applies caller admission to cached conditional failures and each unconditional retry without phantom requests", async () => {
+    let ceiling = 2;
+    const admitted = vi.fn(async () => {});
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (fetch.mock.calls.length === 1) return response(pullData(), 200, { etag: '"v1"' });
+      if ((init?.headers as Record<string, string>)["If-None-Match"]) throw new TypeError("SDK cannot wrap 304");
+      return response(pullData());
+    });
+    const github: CiGithub = new CiGithub(fetch, TOKEN, {
+      maxRequests: 4, onRequestAdmitted: admitted,
+      beforeRequest: () => { if (github.requestCount >= ceiling) throw new Error("reserved"); },
+    });
+    await github.pull(REPO, 1);
+    await expect(github.pull(REPO, 1)).rejects.toThrow("reserved");
+    expect(github.requestCount).toBe(2);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    ceiling = 4;
+    await github.pull(REPO, 1); // Conditional attempt and compatibility retry both pay.
+    expect(github.requestCount).toBe(4);
+    expect(admitted).toHaveBeenCalledTimes(4);
+    expect(fetch).toHaveBeenCalledTimes(4);
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
+    expect(admitted).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not notify admission or count a request while shared backoff refuses it", async () => {
+    const cache = new CiGithubCache();
+    const admitted = vi.fn(async () => {});
+    const fetch = vi.fn(async () => response({}, 429, { "retry-after": "60" }));
+    const github = new CiGithub(fetch, TOKEN, { cache, now: () => 10_000, onRequestAdmitted: admitted });
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "http" });
+    await expect(github.pull(REPO, 2)).rejects.toMatchObject({ code: "backoff" });
+    expect(github.requestCount).toBe(1);
+    expect(admitted).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed on admission persistence failure without HTTP or a cached transport retry", async () => {
+    let fail = false;
+    const fetch = vi.fn(async () => response(pullData(), 200, { etag: '"v1"' }));
+    const admitted = vi.fn(async () => { if (fail) throw new Error("storage unavailable"); });
+    const github = new CiGithub(fetch, TOKEN, { onRequestAdmitted: admitted });
+    await github.pull(REPO, 1);
+    fail = true;
+    await expect(github.pull(REPO, 1)).rejects.toThrow("storage unavailable");
+    expect(github.requestCount).toBe(2);
+    expect(admitted).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("finishes admission persistence before starting a non-retrying transport timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetch = vi.fn(async () => new Promise<CiHttpResponse>(() => {}));
+      let persist!: () => void;
+      const github = new CiGithub(fetch, TOKEN, {
+        requestTimeoutMs: 5, onRequestAdmitted: () => new Promise<void>((resolve) => { persist = resolve; }),
+      });
+      const result = github.pull(REPO, 1).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      persist();
+      await vi.advanceTimersByTimeAsync(5);
+      expect(await result).toMatchObject({ code: "timeout" });
+      expect(github.requestCount).toBe(1);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("reuses cached pages on 304, including pagination metadata, across fresh credential clients", async () => {
     const counts = new Map<string, number>();
     const fetch: CiFetch = async (url, init) => {
@@ -750,10 +840,13 @@ describe("CiGithub caching, backoff, and caps", () => {
         ? new Response(JSON.stringify(pullData()), { status: 200, headers: { ETag: '\"v1\"' } })
         : new Response(null, { status: 304 });
     };
-    const github = new CiGithub(fetch, TOKEN, { maxRequests: 2 });
+    const admitted = vi.fn(async () => {});
+    const github = new CiGithub(fetch, TOKEN, { maxRequests: 2, onRequestAdmitted: admitted });
     await github.pull(REPO, 1);
     expect((await github.pull(REPO, 1)).headSha).toBe(SHA);
     await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
+    expect(github.requestCount).toBe(2);
+    expect(admitted).toHaveBeenCalledTimes(2);
     expect(calls).toBe(2);
   });
 

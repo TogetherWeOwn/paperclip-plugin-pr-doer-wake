@@ -3,6 +3,7 @@ import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } fr
 import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, type CiConfig, type Registration } from "./ci-config.js";
 import { CiGithub, CiGithubCache, evaluateReadiness } from "./ci-github.js";
 import { CiAppAuth } from "./ci-auth.js";
+import { retryableBeforeQueue } from "./native-wake.js";
 
 function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
@@ -49,15 +50,6 @@ function header(input: PluginWebhookInput, name: string): string | undefined {
   const key = Object.keys(input.headers).find((k) => k.toLowerCase() === name);
   const value = key ? input.headers[key] : undefined;
   return typeof value === "string" ? value : undefined;
-}
-
-/** These stock-host guards run before enqueue; all other exceptions may be post-dispatch. */
-function retryableBeforeQueue(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return /^(Company|Agent|Project) cannot start work while completed runs await accounting\.$/.test(error.message)
-    || error.message === "New work must wait while a native run recovers its unfinished accounting."
-    || error.message === "worker RPC host is not running"
-    || ((error as { code?: unknown }).code === -32000 && error.message === "Plugin is held for idle sleep");
 }
 
 /** One host-managed worker owns this ledger. All entrypoints share its lock, including overlapping job callbacks. */

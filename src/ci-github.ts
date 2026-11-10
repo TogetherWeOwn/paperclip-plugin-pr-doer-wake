@@ -15,6 +15,10 @@ export interface CiTokenSource {
 export interface CiGithubOptions {
   /** Counts every attempted fetch, including 304s and failed requests, for this instance. */
   maxRequests?: number;
+  /** Synchronous caller admission gate; a refusal consumes no request or transport call. */
+  beforeRequest?: () => void;
+  /** Persist caller admission before starting the transport deadline; a failure sends no HTTP. */
+  onRequestAdmitted?: () => Promise<void>;
   maxPages?: number;
   maxCacheEntries?: number;
   maxCacheBytes?: number;
@@ -215,7 +219,7 @@ export class CiGithubCache {
  */
 export class CiGithub {
   private readonly maxRequests: number;
-  private readonly maxPages: number;
+  protected readonly maxPages: number;
   private readonly maxBodyBytes: number;
   private readonly requestTimeoutMs: number;
   private readonly now: () => number;
@@ -223,6 +227,11 @@ export class CiGithub {
   private readonly cache: CiGithubCache;
   private readonly backoff: { until: number };
   #credential: string | CiTokenSource;
+  private readonly beforeRequest: (() => void) | undefined;
+  private readonly onRequestAdmitted: (() => Promise<void>) | undefined;
+
+  /** Authoritative admitted attempts, including failed, cached and timed-out transport calls. */
+  get requestCount(): number { return this.requests; }
 
   constructor(
     private readonly fetch: PluginContext["http"]["fetch"] | CiFetch,
@@ -238,6 +247,8 @@ export class CiGithub {
     this.cache = options.cache ?? new CiGithubCache(options);
     this.backoff = options.backoff ?? { until: 0 };
     this.now = options.now ?? Date.now;
+    this.beforeRequest = options.beforeRequest;
+    this.onRequestAdmitted = options.onRequestAdmitted;
   }
 
   async pull(repo: string, prNumber: number): Promise<CiPull> {
@@ -462,7 +473,10 @@ export class CiGithub {
   private async attempt(url: string, headers: Record<string, string>, body?: string): Promise<CiHttpResponse | Response> {
     if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
+    this.beforeRequest?.();
     this.requests++;
+    // Caller persistence is not a transport failure and must not trigger a conditional retry.
+    if (this.onRequestAdmitted) await this.onRequestAdmitted();
     try { return await this.deadline(() => this.fetch(url, { method: body === undefined ? "GET" : "POST", headers, redirect: "error", ...(body === undefined ? {} : { body }) })); }
     catch (error) {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
@@ -470,30 +484,34 @@ export class CiGithub {
     }
   }
 
-  private async request(path: string, exchange?: { jwt: string; body: string }): Promise<Page> {
+  protected async request(path: string, graphqlBody?: string, exchange?: { jwt: string; body: string }): Promise<Page> {
+    // POSTs are reserved for fixed-origin GraphQL and the installation-token exchange; neither reuses a URL-only ETag.
+    if (!path.startsWith("/") || path.startsWith("//") || (graphqlBody !== undefined && path !== "/graphql") || (exchange !== undefined && !/^\/app\/installations\/[1-9][0-9]{0,15}\/access_tokens$/.test(path))) throw new CiGithubError("input");
+    if (graphqlBody !== undefined && exchange !== undefined) throw new CiGithubError("input");
     // Backoff/budget apply before secret resolution as well as to every fetch.
     if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     const token = exchange ? exchange.jwt : typeof this.#credential === "string" ? this.#credential
       : await this.deadline(() => (this.#credential as CiTokenSource).token(path, async (installationId, jwt, body) => {
         if (!/^[1-9][0-9]{0,15}$/.test(installationId)) throw new CiGithubError("input");
-        return (await this.request(`/app/installations/${installationId}/access_tokens`, { jwt, body: JSON.stringify(body) })).data;
+        return (await this.request(`/app/installations/${installationId}/access_tokens`, undefined, { jwt, body: JSON.stringify(body) })).data;
       })).catch((error: unknown) => {
         (this.#credential as CiTokenSource).invalidate();
         if (error instanceof CiGithubError) throw error;
         throw new CiGithubError("auth");
       });
     const url = `${ORIGIN}${path}`;
-    const cached = exchange ? undefined : this.cache.get(url);
+    const cached = graphqlBody === undefined && !exchange ? this.cache.get(url) : undefined;
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
       "X-GitHub-Api-Version": "2022-11-28",
       ...(exchange ? { "Content-Type": "application/json" } : {}),
     };
     if (cached) headers["If-None-Match"] = cached.etag;
+    if (graphqlBody !== undefined) headers["Content-Type"] = "application/json";
     let response: CiHttpResponse | Response;
     let unconditionalRetry = false;
-    try { response = await this.attempt(url, headers, exchange?.body); }
+    try { response = await this.attempt(url, headers, exchange?.body ?? graphqlBody); }
     catch (error) {
       if (!cached || !(error instanceof CiGithubError) || error.code !== "network") throw error;
       // Some stock SDKs construct Response("", {status:304}) and throw. Never assume
@@ -531,7 +549,7 @@ export class CiGithub {
     const etag = header(response.headers, "etag");
     if (link.includes(token) || etag?.includes(token) || SECRET_SHAPE.test(link) || etag && SECRET_SHAPE.test(etag)) return invalid();
     const safeBody = JSON.stringify(data);
-    if (etag) this.cache.remember(url, { body: safeBody, etag, link, bytes: Buffer.byteLength(safeBody + etag + link + url, "utf8") });
+    if (etag && graphqlBody === undefined) this.cache.remember(url, { body: safeBody, etag, link, bytes: Buffer.byteLength(safeBody + etag + link + url, "utf8") });
     else if (cached) this.cache.delete(url);
     return { data, link };
   }
