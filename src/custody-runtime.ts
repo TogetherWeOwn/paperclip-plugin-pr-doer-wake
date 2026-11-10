@@ -64,14 +64,19 @@ export class CustodyRuntime {
       ledger.audits = ledger.audits.filter((a) => this.now() - a.at < 30 * DAY).slice(-CUSTODY_LIMITS.audits);
     };
     const save = () => this.ctx.state.set(key, ledger);
+    // Admitted preflight yields durably even if it refuses before any native mutation.
+    const admitDispatch = async (receipt: Receipt) => {
+      guard();
+      receipt.turn = ++ledger.dispatchSequence;
+      await save();
+    };
     // Each trigger spends one slot at its first native mutation, including ambiguous attempts.
-    const effectSlot = (receipt: Receipt) => {
+    const effectSlot = () => {
       let spent = false;
       return () => {
         if (spent) return;
         if (ledger.report.effects >= CUSTODY_LIMITS.effects) throw new Error("effect_budget");
         ledger.report.effects++;
-        receipt.turn = ++ledger.dispatchSequence;
         spent = true;
       };
     };
@@ -229,7 +234,8 @@ export class CustodyRuntime {
         }
         else if (ledger.report.effects >= CUSTODY_LIMITS.effects) { unknown("effect_budget"); holdSummaryClosures(); }
         else try {
-          const spend = effectSlot(receipt);
+          const spend = effectSlot();
+          await admitDispatch(receipt);
           await this.confirmConfig(config, guard);
           const lines = new Set([...summaries].map((s) => `- ${s}`));
           if (receipt.childId) {
@@ -267,7 +273,7 @@ export class CustodyRuntime {
           await save();
         }
         receipt.turn ??= entry.turn;
-        const spend = effectSlot(receipt);
+        const spend = effectSlot();
         // A fresh disposition acknowledges a terminal trigger; closed rationale remains mandatory on both sides.
         if (trigger.kind === "terminal" && (latestDisposition(card, pr)?.at ?? 0) > receipt.at) receipt.status = "cleared";
         if (receipt.status === "unconfirmed" && receipt.phase === "create") {
@@ -286,6 +292,9 @@ export class CustodyRuntime {
         }
         if (ledger.report.effects >= CUSTODY_LIMITS.effects) { holdClosure(repo, trigger); unknown("effect_budget"); continue; }
         try {
+          // Budget-denied work keeps its place; admitted preflight rotates independently of spend().
+          if (requests >= CUSTODY_LIMITS.requests) throw new Error("custody_request_budget");
+          await admitDispatch(receipt);
           await this.confirmConfig(config, guard);
           const currentPr = await github.pull(pr.repo, pr.number);
           if (currentPr.headSha !== pr.headSha || currentPr.state !== pr.state || currentPr.merged !== pr.merged) throw new Error("pr_changed");

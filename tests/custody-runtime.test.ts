@@ -328,6 +328,53 @@ describe("coverage, summary and cursor controls", () => {
     }
     expect(h.ctx.issues.documents.upsert).toHaveBeenCalledTimes(1);
   });
+  it("yields pre-mutation dispatch priority across request-exhausted restarts", async () => {
+    const prs = Array.from({ length: 410 }, (_, i) => pull({ number: i + 1,
+      ...(i === 408 ? { headBranch: `work/${PROJECT}` } : {}), authorIsBot: i === 409 }));
+    const h = fixture({ cards: [card(), card({ id: PROJECT, status: "done", updatedAt: NOW - DAY })], open: prs });
+    h.docs.set(ISSUE, { body: "x".repeat(250_000) });
+    h.activity.mockImplementation(async function (this: any, pr) {
+      for (let i = 0; i < 3; i++) await this.fetch("https://api.github.com/graphql", { method: "POST" });
+      return pr.number <= 300 ? NOW - 9 * DAY : NOW;
+    });
+    vi.mocked(CustodyGithub.prototype.pull).mockImplementation(async function (this: any, _repo, number) {
+      await this.fetch(`https://api.github.com/repos/example/project/pulls/${number}`);
+      return { ...prs[number - 1]!, baseBranch: "main", draft: false, mergeable: true };
+    });
+    h.ctx.issues.create.mockImplementation(async (input) => {
+      const created = { ...input, id: `dddddddd-0000-4000-8000-${String(h.created.length + 1).padStart(12, "0")}` };
+      h.created.push(created);
+      return created;
+    });
+    const attempted = new Set<number>();
+    const turns = new Map<string, number>();
+    for (let tick = 0; tick < 5; tick++) {
+      h.ctx.http.fetch.mockClear();
+      await h.restart().poll();
+      const urls = h.ctx.http.fetch.mock.calls.map(([url]) => url);
+      expect(urls.filter((url) => url.endsWith("/graphql"))).toHaveLength(1_100);
+      expect(urls.length).toBeLessThanOrEqual(1_200);
+      expect(h.ledger().report.effects).toBeLessThanOrEqual(15);
+      for (const url of urls) if (url.includes("/pulls/")) attempted.add(Number(url.split("/").at(-1)));
+      // A budget-denied entry keeps its place; admitted failures yield durably without spending effects.
+      for (const [key, receipt] of Object.entries(h.ledger().receipts) as Array<[string, any]>) {
+        const number = Number(key.match(/^example\/project#(\d+)\|/)?.[1]);
+        if (number <= 300 && !urls.some((url) => url.endsWith(`/pulls/${number}`)) && turns.has(key)) expect(receipt.turn).toBe(turns.get(key));
+        turns.set(key, receipt.turn);
+      }
+      if (tick === 0) {
+        expect(attempted.size).toBe(100);
+        expect(h.ledger().report.effects).toBe(1); // Only the independent daily summary mutates.
+        expect(h.ctx.issues.requestWakeup.mock.calls.some((args) => (args as any)[2].idempotencyKey.startsWith("example/project#409|"))).toBe(false);
+      }
+    }
+    expect(attempted.size).toBe(301);
+    expect(h.ledger().receipts[`example/project#409|terminal|${PROJECT}:done:2`]).toMatchObject({ status: "woken" });
+    expect(h.ledger().receipts["pr-custody-summary|2026-10-20"]).toMatchObject({ status: "woken" });
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(h.ctx.issues.create).toHaveBeenCalledTimes(2);
+    expect(Object.entries(h.ledger().receipts).filter(([key]) => /^example\/project#(?:[1-9]\d?|[12]\d\d|300)\|/.test(key)).every(([, receipt]) => (receipt as any).status === "pending")).toBe(true);
+  });
   it("counts ambiguous document writes against the effect cap", async () => {
     const h = fixture({ open: Array.from({ length: 20 }, (_, i) => pull({ number: i + 1 })) });
     h.ctx.issues.documents.upsert.mockRejectedValue(new Error("lost write reply"));
