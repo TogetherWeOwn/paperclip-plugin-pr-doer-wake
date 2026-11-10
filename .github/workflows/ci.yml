@@ -24,13 +24,44 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Build the PR head itself, not GitHub's synthetic merge commit.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm run check
+      - run: node --test tests/package-artifact.test.mjs
+      - name: Pack and validate installable package
+        run: node scripts/retain-package.mjs "$RUNNER_TEMP/ci-wake-artifact"
+        env:
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Retain validated package and provenance
+        id: package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-wake-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-wake-artifact/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: false
+      - name: Record archive receipt
+        env:
+          ARTIFACT_ID: ${{ steps.package.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.package.outputs.artifact-url }}
+          ARTIFACT_DIGEST: ${{ steps.package.outputs.artifact-digest }}
+        run: |
+          test -n "$ARTIFACT_ID" && test -n "$ARTIFACT_URL" && test -n "$ARTIFACT_DIGEST"
+          {
+            printf '## Retained package\n\nArtifact ID: `%s`\n\nURL: %s\n\nArchive SHA-256: `%s`\n\n' "$ARTIFACT_ID" "$ARTIFACT_URL" "$ARTIFACT_DIGEST"
+            printf 'Requested retention: 30 days; verify actual expires_at through the artifact API.\n\n'
+            printf 'Require this run/job to finish successfully. PR bundles are not merged-source or host acceptance.\n\n'
+            printf '### Bundle checksums\n\n```text\n'
+            cat "$RUNNER_TEMP/ci-wake-artifact/SHA256SUMS"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   sdk-compat:
     name: SDK 2026.1106.0 compatibility
@@ -39,6 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
