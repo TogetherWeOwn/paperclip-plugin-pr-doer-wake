@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { validatePaths, validateEntrypoints } from "../scripts/retain-package.mjs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { inspectManifest, validatePaths, validateEntrypoints } from "../scripts/retain-package.mjs";
 
 const paths = ["package.json", "LICENSE", "README.md", "THREAT-MODEL.md", "ACCEPTANCE.md",
   "migrations/001_wake_ledger.sql", "migrations/002_wake_phases.sql",
@@ -23,6 +26,18 @@ test("allows only the intended package payload", () => {
   assert.throws(() => validatePaths(paths.slice(1)), /Missing package.json/);
   assert.throws(() => validatePaths([]), /count/);
   assert.throws(() => validatePaths(Array(101).fill("dist/index.js")), /count/);
+});
+
+test("loads the declared manifest and rejects an existing non-manifest module", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ci-wake-manifest-test-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, "dist"));
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module" }));
+  writeFileSync(join(dir, "dist/manifest.js"), `export default ${JSON.stringify(manifest)};\n`);
+  writeFileSync(join(dir, "dist/ci-runtime.js"), "export default {};\n");
+  assert.equal((await inspectManifest(dir, pkg, paths)).manifest.id, manifest.id);
+  const wrong = { ...pkg, paperclipPlugin: { ...pkg.paperclipPlugin, manifest: "./dist/ci-runtime.js" } };
+  await assert.rejects(inspectManifest(dir, wrong, paths), /Invalid entrypoint/);
 });
 
 test("validates packed entrypoint existence and manifest identity", () => {

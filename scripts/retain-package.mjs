@@ -32,6 +32,16 @@ export function validateEntrypoints(pkg, manifest, paths) {
   return entrypoints;
 }
 
+export async function inspectManifest(packageDir, pkg, paths) {
+  const declared = pkg.paperclipPlugin?.manifest;
+  assert(typeof declared === "string" && declared.startsWith("./dist/"), "Invalid manifest entrypoint");
+  assert(paths.includes(declared.slice(2)), "Missing manifest entrypoint");
+  const { default: manifest } = await import(pathToFileURL(join(packageDir, declared)).href);
+  assert(manifest && typeof manifest === "object", "Invalid manifest export");
+  const entrypoints = validateEntrypoints(pkg, manifest, paths);
+  return { manifest, entrypoints };
+}
+
 const run = (command, args, options = {}) => execFileSync(command, args, {
   encoding: "utf8", timeout: 60_000, maxBuffer: 4 * 1024 * 1024, ...options,
 }).trim();
@@ -74,8 +84,7 @@ export async function retainPackage(outputDir) {
       return { path, size: bytes.length, sha256: sha256(bytes) };
     });
     const pkg = json(join(packageDir, "package.json"));
-    const { default: manifest } = await import(pathToFileURL(join(packageDir, "dist/manifest.js")).href);
-    const entrypoints = validateEntrypoints(pkg, manifest, paths);
+    const { manifest, entrypoints } = await inspectManifest(packageDir, pkg, paths);
     const exported = await import(pathToFileURL(join(packageDir, pkg.exports["."].import)).href);
     assert.equal(exported.manifest.id, manifest.id);
     assert(exported.plugin && typeof exported.CiWakeRuntime === "function", "Invalid public exports");
