@@ -150,7 +150,10 @@ Custody is independent of `enabled`, `dryRun` and the CI registration `allowedRe
 | `custodyOrg` | unset | Exact GitHub organization; all its visible non-archived repos. |
 | `custodySummaryAgentId` | unset | Accountable recipient of the daily unmapped/bot summary and unassigned-source follow-ups. |
 | `custodyClosedSince` | unset | Required initial closed-inventory boundary, `YYYY-MM-DDTHH:mm:ssZ`. |
-| `githubTokenSecretRef` | unset | Existing approved read credential; resolved only for the tick. |
+| `githubTokenSecretRef` | unset | Existing approved read credential; resolved only for the tick. Exactly one of bearer or App mode. |
+| `githubAppId`, `githubInstallationId`, `githubAppPrivateKeySecretRef` | unset | App mode: dedicated read-only App triple; all three required, mutually exclusive with the bearer ref. |
+
+Custody accepts exactly one authentication mode. App mode mints short-lived installation tokens without a repository selection from the dedicated read-only App (pull_requests/checks/statuses/actions/administration/metadata = read, installed on every org repository), and every mint is refused unless GitHub returns exactly those read permissions; listed repositories must belong to the configured org. Fine-grained PATs expose no Checks permission, so bearer mode cannot read check-suite evidence; App mode is the supported checks-capable route.
 
 The new manifest capabilities are `issues.create`, `issue.documents.read`, `issue.documents.write`, `issue.relations.read`, `projects.read`, `project.workspaces.read`, `database.namespace.read` and `database.namespace.migrate`. The last capability is required by the stock schema for **any** database declaration, including read-only access. `custody-migrations` contains no SQL; historical migrations are not activated. Only `issues`, `issue_comments` and `issue_documents` are core-read tables. Document bodies use the supported SDK, not an undeclared join. No `issues.update`, comment creation, core SQL write or work-product mutation is granted.
 

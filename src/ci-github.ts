@@ -7,7 +7,8 @@ export interface CiHttpResponse {
   body: string;
 }
 export type CiFetch = (url: string, init?: RequestInit) => Promise<CiHttpResponse | Response>;
-export type CiTokenExchange = (installationId: string, jwt: string, body: { repositories: string[]; permissions: Record<string, string> }) => Promise<unknown>;
+/** Omitted repositories means every repository the installation can access (custody's org-wide App mode). */
+export type CiTokenExchange = (installationId: string, jwt: string, body: { repositories?: string[]; permissions: Record<string, string> }) => Promise<unknown>;
 export interface CiTokenSource {
   token(path: string, exchange: CiTokenExchange): Promise<string>;
   invalidate(): void;
@@ -546,7 +547,9 @@ export class CiGithub {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
       throw new CiGithubError("response");
     }
-    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > (exchange ? Math.min(this.maxBodyBytes, 16_384) : this.maxBodyBytes)) return invalid();
+    // Installation-wide token responses carry one entry per accessible repository (GitHub caps at 500);
+    // single-repo and org-wide responses both stay far below this ceiling.
+    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > (exchange ? Math.min(this.maxBodyBytes, 256 * 1024) : this.maxBodyBytes)) return invalid();
     const data = this.parse(body, token, exchange !== undefined);
     // Installation-token responses must never enter the ETag cache.
     if (exchange) return { data, link: "" };

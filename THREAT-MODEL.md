@@ -69,7 +69,7 @@ This scheduled operation is separately disabled and dry-run by default. It regis
 
 | Credential/host ceiling | Custody exposes | Forbidden |
 | --- | --- | --- |
-| GitHub read grant | Fixed-origin GET organization repos, repo open/closed pulls, exact PR, PR issue comments; POST `/graphql` with generated PR commit/review/head-suite query and validated variables | Arbitrary URL/query/header/provider method, search inventory, writes, webhook/settings changes, workflow dispatch/rerun, close/reopen/merge |
+| GitHub read grant | Fixed-origin GET organization repos, repo open/closed pulls, exact PR, PR issue comments; POST `/graphql` with generated PR commit/review/head-suite query and validated variables. Exactly one credential mode: bearer ref **or** the dedicated read-only App (`githubAppId`/`githubInstallationId`/`githubAppPrivateKeySecretRef`). App mode mints without a repository selection and refuses any mint whose returned permissions are not all `read` within the fixed six-permission ceiling, or whose listed repositories leave the configured org. | Arbitrary URL/query/header/provider method, search inventory, writes, webhook/settings changes, workflow dispatch/rerun, close/reopen/merge |
 | Core-read tables | Company-scoped keyset SELECTs of issues, comments and document metadata, SDK document body reads, project/repo membership | Core SQL writes, undeclared document/work-product table joins, private runtime APIs, shell or credential discovery |
 | Native issues/documents | One disposition document on an eligible source, or exact-origin `todo` child plus explicit native wake; one daily summary | Source assignment/status/review-policy changes, comments, inferred primary owner, automatic PR verdict or reopening a superseded proposal |
 

@@ -4,6 +4,7 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { CiGithubCache } from "./ci-github.js";
 import { workspaceRepo, UUID } from "./ci-config.js";
 import { parseCustodyConfig, type CustodyConfig } from "./custody-config.js";
+import { CustodyAppAuth } from "./custody-auth.js";
 import { CustodyGithub, type CustodyPull } from "./custody-github.js";
 import { loadCustodyCards, type CustodyCard } from "./custody-reader.js";
 import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prReference, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
@@ -133,16 +134,24 @@ export class CustodyRuntime {
       const ci = await this.ctx.state.get({ scopeKind: "instance", namespace: "ci-wake-v1", stateKey: "ledger" }) as { version: number; waits: CustodyRegistration[] } | null;
       if (ci && (ci.version !== 1 || !Array.isArray(ci.waits))) throw new Error("invalid_ci_ledger");
       const registrations = ci?.waits ?? [];
-      const cacheKey = `${config.companyId}:${config.tokenRef.secretId}:${config.tokenRef.version ?? "latest"}`;
+      const app = config.githubApp;
+      const cacheKey = app
+        ? `${config.companyId}:app:${app.appId}:${app.installationId}`
+        : `${config.companyId}:${config.tokenRef!.secretId}:${config.tokenRef!.version ?? "latest"}`;
       if (!this.caches.has(cacheKey)) {
         if (this.caches.size >= 8) this.caches.delete(this.caches.keys().next().value!);
         this.caches.set(cacheKey, new CiGithubCache({ maxCacheEntries: 512, maxCacheBytes: 16 * 1024 * 1024 }));
       }
       guard();
-      const token = await this.ctx.secrets.resolve(config.tokenRef, { companyId: config.companyId, configPath: "githubTokenSecretRef" });
+      // App mode mints a short-lived read-only installation token per operation
+      // and refuses any non-read permission; the key is resolved only at call time.
+      const credential: string | CustodyAppAuth = app
+        ? new CustodyAppAuth({ appId: app.appId, installationId: app.installationId, org: config.org, now: this.now, cycleMs: CUSTODY_LIMITS.tickMs,
+            resolvePrivateKey: () => this.ctx.secrets.resolve(app.privateKeySecretRef, { companyId: config.companyId, configPath: "githubAppPrivateKeySecretRef" }) })
+        : await this.ctx.secrets.resolve(config.tokenRef!, { companyId: config.companyId, configPath: "githubTokenSecretRef" });
       // Reserve discovery capacity inside the client's admission gate, before its sole counter advances.
       const inventoryAvailable = () => github.requestCount < CUSTODY_LIMITS.requests - 100 && this.now() - started < CUSTODY_LIMITS.tickMs - 30_000;
-      const github: CustodyGithub = new CustodyGithub((url, init) => this.ctx.http.fetch(url, init), token, {
+      const github: CustodyGithub = new CustodyGithub((url, init) => this.ctx.http.fetch(url, init), credential, {
         now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100,
         beforeRequest: () => {
           guard();
