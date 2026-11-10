@@ -1,4 +1,6 @@
-# Acceptance record: CI wake 0.2
+# Acceptance record: CI wake and PR custody
+
+The CI-specific sections below preserve prior source-review evidence. They do not accept the custody expansion; its new matrix and pending gates are listed at the end.
 
 **NOT ACCEPTED FOR INSTALLATION.** Fill exact source/artifact/host evidence through the native Security and QA review, then the Operator canary. A completed test implementation is not an observed passing test.
 
@@ -6,7 +8,7 @@
 
 - Tool: `ci_wait_register` (state-writing registration; no provider mutation), exact four-field closed schema in `src/manifest.ts` and `src/ci-config.ts`.
 - Provider ceiling: existing approved GitHub read credential for allowlisted repos; optional separate owner-held webhook HMAC secret. Record actual grant/resource scope at installation, never values.
-- Permission envelope: exactly the eleven capabilities in `src/manifest.ts`; no SQL/core-table access or issue create/update/comments.
+- CI path's original permission envelope: eleven capabilities. The current manifest additionally declares custody's core reads, issue creation and document writes; see the custody expansion below. No issue-update/comment creation or core SQL write is exposed.
 - Source/artifact digest/config envelope: **pending native review evidence**.
 - Threat model and runbook: [THREAT-MODEL.md](THREAT-MODEL.md), [README.md](README.md).
 - SDK fixture target: `@paperclipai/plugin-sdk@2026.1023.0`, lockfile; REST `2022-11-28`. Installed target-host version: **pending Operator evidence**.
@@ -59,3 +61,29 @@ Record evidence, not screenshots alone, for:
 - Rollback/revocation proof: **pending**; runbook specifies dryRun/disable, remove bindings/tool access, owner disables optional webhook, retain card backstops.
 
 Do not erase the ledger to replay an unconfirmed wake or reinstall the old ownership heuristic as an automatic rollback. No installation or security exception is granted by merging source.
+
+## Custody expansion: not accepted for installation
+
+Provider: same configured existing GitHub read credential, with organization repository listing and generated GraphQL activity queries added to the read surface. Native capability additions: issue creation, document read/write, relation/project/workspace reads, restricted core table reads, and stock-schema-required namespace migrate. The active migration directory intentionally has no SQL. Source authority remains build/test/review only, never installation, credential creation/rotation/widening, or automatic PR disposition.
+
+| Boundary | Changed fixture / evidence |
+| --- | --- |
+| Full inventory / endpoint-specific pagination | `tests/custody-github.test.ts`: more than 100 repos/pulls/commits/reviews/suites/comments, inclusive closed cursor, closed-between-polls support, duplicate/count/cursor/identity/malformed/partial rejection |
+| Transport / credential hygiene | `tests/custody-github.test.ts`: fixed-origin reconstructed Link pages, reflection and redirects, GET ETags versus generated GraphQL POST cache bypass, request/body/page limits; existing CI transport fixtures remain regression coverage |
+| Push evidence / conservative warmup | `tests/custody-github.test.ts`: null push evidence without observation floor UNKNOWN, persisted floor maximum, invalid floor refusal, seven-day boundary, later review/suite activity; GraphQL schema marks pushedDate unsupported since 2023 |
+| Tenant / core read / budgets | `tests/custody-reader.test.ts`: parameterized company/keyset reads, state/origin coverage, per-document identity, no undeclared body join, duplicate/partial/cross-company rejection, row/body/64-MiB refusal limits |
+| Ownership tiers / ambiguity / injection | `tests/custody-policy.test.ts`: registration precedence, project/same-repo branch guards, URL-token boundaries, human-only ownership refusal, multiple candidates UNMAPPED, tracker fallback |
+| Triggers / PR attribution | `tests/custody-policy.test.ts`: exact seven-day threshold, disposition resets and stale finish, future defer, PR-specific directives, terminal status-version stability, missing closure rationale on either side, valid supersession |
+| Native effects / durable receipts | `tests/custody-runtime.test.ts`: evidence before explicit wake, todo child status, source/summary recipient, blocker routing, restart/lost replies, exact-origin reuse, positively deferred retry, no effects after intent failure/revocation/head change |
+| Dry-run / caps / coverage / cursor | `tests/custody-runtime.test.ts`: no dry-run native writes, separate live keys/cursors, 15 attempts including ambiguous creates, oldest-first closure drain, daily summary accumulation, UNKNOWN card/activity reads, preserved head observation and overlap coalescing |
+| Exact host manifest/config | `tests/ci-manifest.test.ts` plus `tests/custody-policy.test.ts`: expanded explicit capability set, empty migration directory contract, opt-in/defaults/required selectors/secret picker |
+
+Current source verification: bounded project typecheck and focused changed/covering unit files are diagnostic evidence, recorded on the source task/PR. Full suite/build/required checks must run on GitHub Actions for the exact head; no local full suite or CI mirror was run. A fresh-context diff assessment, bot thread dispositions, exact-head native Security and QA remain gates, not claims established by fixture authorship.
+
+Before live installation, record:
+
+1. Exact reviewed source/artifact digest, stock host/SDK versions, permissions and actual credential visibility/grants. Prove the generated GraphQL query and core-read privacy rules on that host, not just static schema acceptance.
+2. Independent manual expected org/repo/open-PR inventory and chosen initial closure boundary, then compare every saved custody row. Partial visibility, UNKNOWN data and conservative head warmup must be explicit; do not claim universal historical activity coverage.
+3. Explicit native Security acceptance of mapping evidence, expanded read/native-write ceilings, stock-required migrate capability, single-worker state/ambiguous-effect controls and residual races; then QA and exact-head Actions.
+4. Operator-only installation and dry-run comparison; no premature, missed beyond one tick, duplicate, false ownership, bogus closure or per-unmapped-PR creation. Dry/live state isolation and 15-effect drainage must be observed. Backstops remain in force.
+5. Coordinate the old detector to avoid duplicate asks, retain its label repair only, then accepted Operator live configuration and actual native queue/run evidence. Only afterwards queue the Detection text change through its configuration window. Source merge does not authorize any of these steps.

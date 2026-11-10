@@ -1,6 +1,6 @@
-# CI wake
+# CI wake and PR custody
 
-CI completion wakes for explicitly registered Paperclip cards. This is the successor to PR doer wake in the same repository and package, retaining plugin ID `togetherweown.pr-doer-wake`. Version 0.2 replaces the old ownership guessing, check-failure/conflict triggers, core-table reads and SQL ledger. It never trusts PR bodies, issue text, comments or a branch prefix to select a card.
+CI completion wakes for explicitly registered Paperclip cards, plus separately opt-in hourly PR custody. This is the successor to PR doer wake in the same repository and package, retaining plugin ID `togetherweown.pr-doer-wake`. The CI registration path never trusts PR bodies, issue text, comments or a branch prefix to select a card. The custody job has a distinct, conservative discovery policy described below; it cannot create CI registrations or authorize a merge.
 
 **Status: implementation pending independent Security/QA acceptance and Operator canary. Not installed or qualified by this repository.** Stock Paperclip plugin SDK only; no core modifications, internal APIs, GitHub settings changes or LLM calls are needed for phase one.
 
@@ -45,7 +45,7 @@ Each `(repo, headSha, waitId)` has a durable intent before `ctx.issues.requestWa
 
 ## Configuration and limits
 
-The manifest has only these capabilities:
+The CI registration/polling path uses these capabilities:
 
 ```text
 webhooks.receive  jobs.schedule  issues.read  issues.wakeup  issues.checkout
@@ -53,7 +53,7 @@ execution.workspaces.read  agent.tools.register  plugin.state.read
 plugin.state.write  http.outbound  secrets.read-ref
 ```
 
-No issue creation/update/comments, company/project enumeration, SQL namespace, shell or GitHub writes. The tool discovers companies only from its own registered waits. Both credentials resolve **at call time**, remain operation-local and are never returned/logged/stored. Do not paste credential values into config; use Paperclip secret pickers.
+CI registration discovers companies only from its own registered waits. Custody adds the explicitly listed read/create/document capabilities below, but no issue-update/comment, shell, company-enumeration or GitHub-write surface. Both credentials resolve **at call time**, remain operation-local and are never returned/logged/stored. Do not paste credential values into config; use Paperclip secret pickers.
 
 | Config | Default | Meaning |
 | --- | --- | --- |
@@ -96,6 +96,58 @@ The plugin verifies SHA-256 HMAC over the **raw body** with `timingSafeEqual`, i
 ## Rollback and revocation
 
 Operator sets `dryRun: true` or `enabled: false`, disables the tool profile, and removes secret bindings if needed. The owner disables/deletes the optional webhook. Keep card backstops and reconcile `unconfirmed` waits against actual host run records; never blindly replay them. A rollback must not reinstall the unsafe ownership heuristic without a separate decision. Do not delete the state ledger to retry a wake. Review threats and residual host limits in [THREAT-MODEL.md](THREAT-MODEL.md).
+
+## Hourly PR custody (separate opt-in)
+
+`pr-custody` runs at `17 * * * *` without an LLM. It inventories every **credential-visible** non-archived repository in one configured organization, using fully paginated REST repository/pulls listings, never search. All open PRs are read. Closed PRs are read by descending update time back to an inclusive stored cursor, including PRs opened and closed between ticks. On first use the Operator must explicitly choose `custodyClosedSince`; no coverage before that boundary is claimed. Partial, denied, malformed or over-cap evidence is **UNKNOWN**, never a zero count or absence of ownership.
+
+### Configuration
+
+Custody is independent of `enabled`, `dryRun` and the CI registration `allowedRepos`:
+
+| Config | Default | Meaning |
+| --- | --- | --- |
+| `custodyEnabled` | `false` | Opt in to the hourly job. |
+| `custodyDryRun` | `true` | State/report/log only; no card, document or wake effects. |
+| `custodyCompanyId` | unset | Exactly one company's card evidence and native effects. |
+| `custodyOrg` | unset | Exact GitHub organization; all its visible non-archived repos. |
+| `custodySummaryAgentId` | unset | Accountable recipient of the daily unmapped/bot summary and unassigned-source follow-ups. |
+| `custodyClosedSince` | unset | Required initial closed-inventory boundary, `YYYY-MM-DDTHH:mm:ssZ`. |
+| `githubTokenSecretRef` | unset | Existing approved read credential; resolved only for the tick. |
+
+The new manifest capabilities are `issues.create`, `issue.documents.read`, `issue.documents.write`, `issue.relations.read`, `projects.read`, `project.workspaces.read`, `database.namespace.read` and `database.namespace.migrate`. The last capability is required by the stock schema for **any** database declaration, including read-only access. `custody-migrations` contains no SQL; historical migrations are not activated. Only `issues`, `issue_comments` and `issue_documents` are core-read tables. Document bodies use the supported SDK, not an undeclared join. No `issues.update`, comment creation, core SQL write or work-product mutation is granted.
+
+### Mapping and triggers
+
+Use the first nonempty mapping tier: explicit ci-wake registration; exact `work/<uuid>` head with a company card and project-repo match; an exact PR URL token in card title/description, agent comments or documents; then tracker-identifier branch plus project-repo match. Branch tiers require a same-repository head, never a fork prefix. Multiple candidates at the winning tier, or no candidates, are UNMAPPED; never select a primary owner. All card states and unrelated plugin/routine origins participate. The job excludes its own generated custody cards/documents so its output cannot become ownership or disposition evidence. Work-product mapping is not implemented because the pinned SDK has no read API; the existing upstream [work-product read proposal](https://github.com/paperclipai/paperclip/issues/17887) tracks this gap. Any SDK contribution is a separately gated follow-up, not an invented table grant or a duplicate issue.
+
+Triggers:
+
+- Open PR idle for seven days since the latest push/head observation, commit, submitted review, head check-suite update, or PR-specific `PR disposition:` line. A latest `defer` with a future UTC revisit date suppresses idle. Holds must be recorded as such a defer; unrelated PR directives do not count. `finish` lines become stale again after seven days.
+- Open PR on a `done`, `cancelled` or `backlog` card. Stable card/status-version identity defines the epoch, not document writes or generic `updatedAt` churn.
+- Closed unmerged PR missing a `Closed unmerged:` line on **either** the mapped card or the PR. The card line must identify this PR by repository/number or exact URL. A valid superseded closure is not reopened.
+
+GitHub's GraphQL `Commit.pushedDate` is deprecated and may be null. Commit author/committer dates do **not** prove push time, and PR metadata `updatedAt` is not used as a substitute. The job persists first observation of each head and resets it on SHA changes. This is a conservative upper bound: newly observed heads receive a seven-day warmup before idle can fire. Later review/check/disposition activity extends the epoch. Unknown/missing activity still blocks idle, but cannot erase an independently proven terminal-card trigger. This warmup is a documented coverage/latency limit, not a claim of historical push evidence.
+
+### Effects, state and recovery
+
+Keys are `repo#number|kind|epoch`; the same key is the wake idempotency key and any created child's `originId`. For an assigned, unblocked `todo`/`in_progress`/`in_review` card, append bounded PR/head/trigger evidence to its `pr-custody` document and explicitly request a native wake. Otherwise create a `todo` child assigned to the source's agent (configured summary recipient when absent), save evidence, then explicitly request the wake. Creation alone does not wake. Current config, card assignment/status/blockers and PR head/state are rechecked before dispatch; the host remains authoritative for its native run/budget gates. No task status, review policy, PR, branch or work product is modified.
+
+At most **15 trigger effects per tick**, oldest first across repos, including uncertain creation attempts. Unmapped and bot PRs go into one daily summary card, not one card per PR. Its document accumulates observed items for the day; its wake is requested once. No comments are posted. A fresh PR-specific disposition acknowledges a previously observed terminal trigger; closure rationale is still required on both sides.
+
+Durable creation/wake intent precedes each effect. Restart/ambiguous wake replies are `unconfirmed` and never replayed automatically; a possibly created card can only be recovered by its exact origin. `queued: false` is positive no-dispatch evidence and may retry. Preserve existing backstops and inspect unconfirmed records manually. One worker only: plugin state has no distributed CAS. Live and dry-run state are separate so promotion cannot consume live dedupe keys or skip the initial live closure inventory. Closed cursors do not advance past undispatched/deferred closures or failed summaries.
+
+State namespace `pr-custody-v1`, company scope, key `<org>:dry` or `<org>:live` stores cursor/receipt/head observations, a latest inventory report, and 1,000 safe audit records retained at most 30 days. Reports project only PR identifiers, card IDs, mapping source, trigger keys and UNKNOWN scopes, never raw API/card bodies or credentials. Receipt tombstones are bounded at 20,000 and never automatically forgotten while an old trigger could recur; exhaustion fails closed for new effects. Head observations are bounded at 10,000. Per tick: 1,200 attempted HTTP requests, 20,000 host-read admissions and four minutes. Card snapshot caps are 20,000 cards, 100,000 comments, 10,000 documents and 64 MiB text; per-body limits and HTTP page/byte/cache/time limits also apply. These are refusal budgets, never silent truncation. No cloud resources or spend reservations exist, so TTL/auto-teardown of provider resources is not applicable.
+
+### Custody rollout gate
+
+1. Native Security sign-off on exact source/artifact, expanded capabilities, core-read/privacy boundary, GitHub grant, single-worker state and host transport; then QA using exact-head Actions evidence.
+2. Operator installs the reviewed package with custody disabled, binds the existing approved credential, chooses the one company/org/summary recipient and initial closure boundary, then enables **dry run first**. Creating/rotating/widening a credential is a separate authority decision.
+3. Compare the saved inventory against a manual REST inventory of every non-archived repo and every open PR, plus the chosen closed boundary. Require zero omitted repos/PRs, no false owner/primary-owner choice, correct mapped/unmapped/bot classifications, zero duplicate effects, no premature idle wake, and correct closed-between-ticks/rationale handling. UNKNOWN evidence and head warmup are explicit incomplete qualification, not passes.
+4. Reconcile the existing detector so it cannot duplicate disposition asks; retain only its work-product-label repair responsibility. Operator enables live only in the accepted envelope and records actual native wake receipts.
+5. Only after live adoption, queue the Detection-rule replacement through its existing instruction reviewer and configuration window. Source merge is not installation, live acceptance, or permission to replace operational rules.
+
+Rollback: Operator disables `custodyEnabled` (or sets `custodyDryRun: true`) and preserves state/backstops. Do not delete tombstones to retry an ambiguous effect, reinstall old guessing behavior, or automatically close/reopen PRs. Existing CI configuration can remain independent.
 
 ## Development
 

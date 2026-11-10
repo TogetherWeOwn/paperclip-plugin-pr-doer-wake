@@ -206,7 +206,7 @@ export class CiGithubCache {
  */
 export class CiGithub {
   private readonly maxRequests: number;
-  private readonly maxPages: number;
+  protected readonly maxPages: number;
   private readonly maxBodyBytes: number;
   private readonly requestTimeoutMs: number;
   private readonly now: () => number;
@@ -445,28 +445,31 @@ export class CiGithub {
     }
   }
 
-  private async attempt(url: string, headers: Record<string, string>): Promise<CiHttpResponse | Response> {
+  private async attempt(url: string, headers: Record<string, string>, graphqlBody?: string): Promise<CiHttpResponse | Response> {
     if (this.now() < this.cache.backoffUntil) throw new CiGithubError("backoff", undefined, this.cache.backoffUntil);
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     this.requests++;
-    try { return await this.deadline(() => this.fetch(url, { method: "GET", headers, redirect: "error" })); }
+    try { return await this.deadline(() => this.fetch(url, { method: graphqlBody === undefined ? "GET" : "POST", headers, redirect: "error", ...(graphqlBody === undefined ? {} : { body: graphqlBody }) })); }
     catch (error) {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
       throw new CiGithubError("network");
     }
   }
 
-  private async request(path: string): Promise<Page> {
+  protected async request(path: string, graphqlBody?: string): Promise<Page> {
+    // POST is reserved for fixed-origin GraphQL; it must never reuse a URL-only ETag.
+    if (!path.startsWith("/") || path.startsWith("//") || (graphqlBody !== undefined && path !== "/graphql")) throw new CiGithubError("input");
     const url = `${ORIGIN}${path}`;
-    const cached = this.cache.get(url);
+    const cached = graphqlBody === undefined ? this.cache.get(url) : undefined;
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json", Authorization: `Bearer ${this.token}`,
       "X-GitHub-Api-Version": "2022-11-28",
     };
     if (cached) headers["If-None-Match"] = cached.etag;
+    if (graphqlBody !== undefined) headers["Content-Type"] = "application/json";
     let response: CiHttpResponse | Response;
     let unconditionalRetry = false;
-    try { response = await this.attempt(url, headers); }
+    try { response = await this.attempt(url, headers, graphqlBody); }
     catch (error) {
       if (!cached || !(error instanceof CiGithubError) || error.code !== "network") throw error;
       // Some stock SDKs construct Response("", {status:304}) and throw. Never assume
@@ -500,7 +503,7 @@ export class CiGithub {
     const link = header(response.headers, "link") ?? "";
     const etag = header(response.headers, "etag");
     if (link.includes(this.token) || etag?.includes(this.token)) return invalid();
-    if (etag) this.cache.remember(url, { body, etag, link, bytes: Buffer.byteLength(body + etag + link + url, "utf8") });
+    if (etag && graphqlBody === undefined) this.cache.remember(url, { body, etag, link, bytes: Buffer.byteLength(body + etag + link + url, "utf8") });
     else if (cached) this.cache.delete(url);
     return { data, link };
   }

@@ -1,0 +1,81 @@
+import { UUID } from "./ci-config.js";
+import type { CustodyCard } from "./custody-reader.js";
+import type { CustodyPull } from "./custody-github.js";
+
+export const DAY = 86_400_000;
+export const CUSTODY_ORIGIN = "plugin:togetherweown.pr-doer-wake:pr-custody" as const;
+export interface CustodyRegistration { companyId: string; issueId: string; repo: string; prNumber: number }
+export interface Mapping { card: CustodyCard | null; source: "registration" | "workspace" | "url" | "identifier" | "unmapped"; candidates: string[] }
+export interface Disposition { at: number; action: string; revisit: number | null }
+export interface Trigger { key: string; kind: "idle" | "terminal" | "closed"; epoch: string; at: number }
+
+function escape(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+export function prReference(pr: Pick<CustodyPull, "repo" | "number">): string { return `${pr.repo}#${pr.number}`; }
+export function prUrl(pr: Pick<CustodyPull, "repo" | "number">): string { return `https://github.com/${pr.repo}/pull/${pr.number}`; }
+
+/** Tokens only; never accept a URL embedded in another host's query or a longer PR number. */
+export function containsPrUrl(body: string, pr: Pick<CustodyPull, "repo" | "number">): boolean {
+  return new RegExp(`(^|\\s|<|\\]\\()${escape(prUrl(pr))}(?=$|[\\s<>),;#?\\]])`, "i").test(body);
+}
+function containsReference(body: string, pr: Pick<CustodyPull, "repo" | "number">): boolean {
+  return new RegExp(`(^|\\s|<)${escape(prReference(pr))}(?=$|[\\s>;,.)])`, "i").test(body) || containsPrUrl(body, pr);
+}
+
+/** The first nonempty tier wins; multiple matches at that tier are UNMAPPED, never a primary-owner guess. */
+export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrations: CustodyRegistration[], projectRepos: Map<string, Set<string>>, companyId: string): Mapping {
+  const eligible = cards.filter((c) => c.companyId === companyId);
+  const pick = (source: Mapping["source"], matches: CustodyCard[]): Mapping | null => {
+    const unique = [...new Map(matches.map((c) => [c.id, c])).values()];
+    return unique.length ? { source, card: unique.length === 1 ? unique[0]! : null, candidates: unique.map((c) => c.id).sort() } : null;
+  };
+  const registered = new Set(registrations.filter((r) => r.companyId === companyId && r.repo === pr.repo && r.prNumber === pr.number).map((r) => r.issueId));
+  const explicit = pick("registration", eligible.filter((c) => registered.has(c.id)));
+  if (explicit) return explicit;
+  const sameRepo = pr.headRepo === pr.repo;
+  const projectMatches = (c: CustodyCard) => c.projectId !== null && projectRepos.get(c.projectId)?.has(pr.repo) === true;
+  const branchId = /^work\/([0-9a-f-]{36})$/i.exec(pr.headBranch)?.[1];
+  const workspace = sameRepo && branchId && UUID.test(branchId) ? pick("workspace", eligible.filter((c) => c.id.toLowerCase() === branchId.toLowerCase() && projectMatches(c))) : null;
+  if (workspace) return workspace;
+  const url = pick("url", eligible.filter((c) => c.texts.some((t) => t.ownership && containsPrUrl(t.body, pr))));
+  if (url) return url;
+  const identifier = /^([A-Z][A-Z0-9]*-\d+)(?:[-/]|$)/i.exec(pr.headBranch)?.[1]?.toLowerCase();
+  const tracker = sameRepo && identifier ? pick("identifier", eligible.filter((c) => c.identifier?.toLowerCase() === identifier && projectMatches(c))) : null;
+  return tracker ?? { card: null, source: "unmapped", candidates: [] };
+}
+
+/** A directive belongs to this PR, not to every PR mentioned elsewhere in the same card. */
+export function latestDisposition(card: CustodyCard, pr: CustodyPull): Disposition | null {
+  const found: Disposition[] = [];
+  for (const text of card.texts) for (const line of text.body.split(/\r?\n/)) {
+    const match = new RegExp(`^PR disposition:\\s+${escape(prReference(pr))}\\s+(finish|rework|defer|close);\\s*next actor\\s+[^;]+;\\s*revisit\\s+(.+?)\\s*$`, "i").exec(line);
+    if (!match) continue;
+    const revisitText = match[2]!;
+    const revisit = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?$/.test(revisitText) ? Date.parse(revisitText) : NaN;
+    found.push({ at: text.at, action: match[1]!.toLowerCase(), revisit: Number.isFinite(revisit) ? revisit : null });
+  }
+  return found.sort((a, b) => b.at - a.at)[0] ?? null;
+}
+export function hasCardClosure(card: CustodyCard, pr: CustodyPull): boolean {
+  return card.texts.some((t) => t.body.split(/\r?\n/).some((line) => /^Closed unmerged:\s+\S/i.test(line) && containsReference(line, pr)));
+}
+export function hasPrClosure(texts: string[]): boolean {
+  return texts.some((body) => body.split(/\r?\n/).some((line) => /^Closed unmerged:\s+(?:duplicate of|superseded by|need lost|mismatch|burden)\b/i.test(line)));
+}
+export function custodyTriggers(pr: CustodyPull, card: CustodyCard, activityAt: number | null, closureTexts: string[] | null, now: number): Trigger[] {
+  const result: Trigger[] = [];
+  const add = (kind: Trigger["kind"], epoch: string, at: number) => result.push({ key: `${prReference(pr)}|${kind}|${epoch}`, kind, epoch, at });
+  const disposition = latestDisposition(card, pr);
+  if (pr.state === "open") {
+    if (["done", "cancelled", "backlog"].includes(card.status)) {
+      // statusVersion changes only on status transitions, unlike updatedAt/document writes.
+      add("terminal", `${card.id}:${card.status}:${card.statusVersion}`, now);
+    }
+    if (activityAt !== null) {
+      const epoch = Math.max(pr.createdAt, activityAt, disposition?.at ?? 0);
+      if (now - epoch >= 7 * DAY && !(disposition?.action === "defer" && disposition.revisit !== null && disposition.revisit > now)) add("idle", String(epoch), epoch);
+    }
+  } else if (!pr.merged && pr.closedAt !== null && closureTexts !== null && (!hasCardClosure(card, pr) || !hasPrClosure(closureTexts))) {
+    add("closed", String(pr.closedAt), pr.closedAt);
+  }
+  return result;
+}
