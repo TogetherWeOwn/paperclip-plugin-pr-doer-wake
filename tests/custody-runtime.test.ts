@@ -864,18 +864,28 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
   });
 
-  it("falls back to a fresh warmup when no head-bound seeding evidence exists", async () => {
+  it("keeps a head with no seeding evidence UNKNOWN for idle, then adopts later evidence", async () => {
     const h = fixture();
     h.seedHead.mockResolvedValue(null);
     h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
     await h.runtime.poll();
-    // No evidence ever wakes immediately, but the head is staged so the
-    // inventory completes and the PR gets its conservative seven-day warmup
-    // instead of staying UNKNOWN forever (e.g. a repo with no CI).
-    expect(h.ledger().heads["example/project#42"].at).toBe(NOW);
+    // No evidence stays UNKNOWN for idle: no fabricated arrival epoch, so a
+    // seven-day passage without genuine evidence must never wake either.
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: null });
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
-    expect(h.ledger().report.unknown).not.toContain("example/project#42");
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().report.complete).toBe(false);
+    h.advance(8 * DAY);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"].at).toBeNull();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    // Genuine head-bound evidence arriving later is still discoverable and
+    // seeds the retained head without waiting out another warmup.
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW - 8 * DAY);
     expect(h.ledger().report.complete).toBe(true);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
   });
 
   it("does not seed a changed SHA from stale evidence (a revert to an older head gets a fresh warmup)", async () => {

@@ -21,7 +21,7 @@ interface Ledger {
   attempted: Record<string, number>;
   activityAfter: Record<string, number>;
   dispatchSequence: number;
-  heads: Record<string, { sha: string; at: number }>;
+  heads: Record<string, { sha: string; at: number | null }>;
   dispositions: Record<string, number>;
   audits: Audit[];
   report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number };
@@ -219,15 +219,23 @@ export class CustodyRuntime {
                 if (!head || head.sha !== pr.headSha) {
                   if (!head && Object.keys(ledger.heads).length >= CUSTODY_LIMITS.prs) throw new Error("head_capacity");
                   // Seed only a first observation from head-bound evidence
-                  // (head suite, review on the head commit). No evidence
-                  // falls back to arrival time, keeping liveness for CI-less
-                  // repos. A changed SHA (e.g. a force-push revert to an
-                  // older head) became current now and must not inherit
-                  // stale evidence as its idle epoch.
-                  const at = head ? this.now() : (await github.seedHead(pr)) ?? this.now();
+                  // (head suite, review on the head commit). No evidence keeps
+                  // the head UNKNOWN for idle purposes instead of fabricating
+                  // an epoch from arrival time; later genuine evidence is
+                  // retried each tick below. A changed SHA (e.g. a force-push
+                  // revert to an older head) became current now and must not
+                  // inherit stale evidence as its idle epoch.
+                  const at = head ? this.now() : await github.seedHead(pr);
                   head = ledger.heads[ref] = { sha: pr.headSha, at };
+                } else if (head.at === null) {
+                  head.at = await github.seedHead(pr);
                 }
-                activity = await github.activity(pr, head.at);
+                if (head.at === null) {
+                  row.unknown = true;
+                  unknown(prReference(pr));
+                } else {
+                  activity = await github.activity(pr, head.at);
+                }
               } else if (!pr.merged) closure = await github.closureTexts(pr);
             } catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); }
             // Missing activity cannot erase an independently established terminal-card trigger.
