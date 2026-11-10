@@ -912,6 +912,43 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
   });
 
+  it("preserves a legacy changed-head warmup instead of adopting older stale evidence", async () => {
+    const h = fixture();
+    // A legacy numeric epoch with no provenance may be an intentional
+    // changed-SHA warmup (a force-push revert records arrival time). Older
+    // head-bound evidence from the same SHA predates that warmup and must
+    // not shorten it into an early wake.
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const legacy = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW - DAY } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), legacy);
+    h.seedHead.mockResolvedValue(NOW - 20 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }));
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: NOW - DAY, provenance: "warmup" });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    // The preserved warmup still completes seven days after the legacy
+    // timestamp without reseeding.
+    h.seedHead.mockClear();
+    h.advance(7 * DAY);
+    await h.runtime.poll();
+    expect(h.seedHead).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - DAY}` }));
+  });
+
+  it("adopts newer head-bound evidence over a legacy numeric epoch", async () => {
+    const h = fixture();
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const legacy = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW - 8 * DAY } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), legacy);
+    h.seedHead.mockResolvedValue(NOW - 2 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: NOW - 2 * DAY, provenance: "seeded" });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().report.complete).toBe(true);
+  });
+
   it("trusts a provenanced seeded epoch without reseeding it", async () => {
     const h = fixture();
     const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };

@@ -240,9 +240,22 @@ export class CustodyRuntime {
                   // adopts genuine evidence when it exists (including a
                   // genuine epoch from an older release) and otherwise
                   // downgrades it to UNKNOWN instead of letting it wake.
-                  head.at = await github.seedHead(pr);
-                  if (head.at === null) delete head.provenance;
-                  else head.provenance = "seeded";
+                  // But a legacy numeric epoch may equally be an
+                  // intentional changed-SHA warmup (a force-push revert
+                  // records arrival time): adopting older stale evidence
+                  // from that SHA would shorten the seven-day warmup into
+                  // an early wake, so the legacy timestamp is preserved as
+                  // a lower bound and only newer evidence replaces it.
+                  const seeded = await github.seedHead(pr);
+                  if (seeded === null) {
+                    head.at = null;
+                    delete head.provenance;
+                  } else if (head.at === null || seeded >= head.at) {
+                    head.at = seeded;
+                    head.provenance = "seeded";
+                  } else {
+                    head.provenance = "warmup";
+                  }
                 }
                 if (head.at === null) {
                   row.unknown = true;
