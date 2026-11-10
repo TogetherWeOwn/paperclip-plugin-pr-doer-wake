@@ -29,6 +29,8 @@ interface QueueEntry {
   nextAttemptAt: number;
   /** Missing-permission retries never exhaust: they use this counter, not `attempts`. */
   missingPermissionAttempts?: number;
+  /** Shadow-deferred sweeps never exhaust: they use this counter, not `attempts`. */
+  shadowAttempts?: number;
 }
 interface Published {
   repo: string;
@@ -173,7 +175,16 @@ export class GatesStatusRuntime {
     await this.serialized(async () => {
       const ledger = await this.load();
       this.compact(ledger);
-      if (!ledger.queue.some((entry) => entry.issueId === issueId && entry.companyId === companyId)) {
+      const existing = ledger.queue.find((entry) => entry.issueId === issueId && entry.companyId === companyId);
+      if (existing) {
+        // A fresh update re-checks now even if a prior defer (shadow or
+        // missing-permission) backed this entry off; the attempt counters
+        // and cooldown/permission checks still apply at apply time.
+        if (existing.nextAttemptAt > this.now()) {
+          existing.nextAttemptAt = this.now();
+          await this.save(ledger);
+        }
+      } else {
         if (ledger.queue.length >= GATES_LIMITS.queue) {
           this.ctx.logger.warn("gates: queue full, issue.updated dropped", { issueId });
           return;
@@ -275,14 +286,17 @@ export class GatesStatusRuntime {
       }
       let retryable = false;
       let missingPermission = false;
+      let shadowDeferred = false;
       for (const decision of authoritative.values()) {
         const outcome = await this.applyDecision(ledger, entry, config!, decision, fetch, cycle);
         if (outcome === "retryable") retryable = true;
         if (outcome === "retryable_missing_permission") missingPermission = true;
+        if (outcome === "shadow_deferred") shadowDeferred = true;
       }
-      if (!retryable && !missingPermission) return true;
+      if (!retryable && !missingPermission && !shadowDeferred) return true;
       if (missingPermission) return this.retryMissingPermission(ledger, entry, identity);
-      return this.retry(ledger, entry, identity, "retryable");
+      if (retryable) return this.retry(ledger, entry, identity, "retryable");
+      return this.retryShadow(ledger, entry, identity);
     } catch {
       return this.retry(ledger, entry, identity, "retryable");
     }
@@ -312,7 +326,20 @@ export class GatesStatusRuntime {
     return false;
   }
 
-  private async applyDecision(ledger: GatesLedger, entry: QueueEntry, config: CiConfig, decision: GatesDecision, fetch: PluginContext["http"]["fetch"], cycle: Map<string, CiAppAuth>): Promise<"done" | "retryable" | "retryable_missing_permission"> {
+  /**
+   * Shadow mode is a deliberate wait, not a GitHub failure: the queue entry
+   * stays (source-identified) on capped backoff, never counts toward
+   * `maxAttempts`, and the next live sweep re-reads config and source
+   * interactions instead of blindly publishing the stored shadow record.
+   */
+  private retryShadow(ledger: GatesLedger, entry: QueueEntry, identity: { companyId: string; issueId: string }): boolean {
+    entry.shadowAttempts = (entry.shadowAttempts ?? 0) + 1;
+    entry.nextAttemptAt = this.now() + backoffMs(entry.shadowAttempts);
+    this.audit(ledger, "decision", "shadow_deferred", identity);
+    return false;
+  }
+
+  private async applyDecision(ledger: GatesLedger, entry: QueueEntry, config: CiConfig, decision: GatesDecision, fetch: PluginContext["http"]["fetch"], cycle: Map<string, CiAppAuth>): Promise<"done" | "retryable" | "retryable_missing_permission" | "shadow_deferred"> {
     const identity = { companyId: entry.companyId, issueId: entry.issueId, repo: decision.repo, sha: decision.sha, state: decision.state };
     if (!config.allowedRepos.includes(decision.repo)) {
       this.audit(ledger, "publish", "repo_refused", identity);
@@ -341,6 +368,22 @@ export class GatesStatusRuntime {
       }
     }
     if (record && !record.shadowed && record.count > 0 && record.state === decision.state) {
+      // Same-state dedupe still advances the authoritative watermark when
+      // this decision is strictly newer, without a POST or any change to
+      // the published count/timestamp — so an older opposite-state decision
+      // delivered later cannot slip past the stale guard.
+      const strictlyNewer = !((record.watermarkDecidedAtMs !== undefined
+        && decision.decidedAtMs < record.watermarkDecidedAtMs)
+        || (record.watermarkDecidedAtMs !== undefined
+          && decision.decidedAtMs === record.watermarkDecidedAtMs
+          && record.watermarkInteractionId !== undefined
+          && decision.interactionId !== undefined
+          && decision.interactionId <= record.watermarkInteractionId));
+      if (strictlyNewer) {
+        record.watermarkDecidedAtMs = decision.decidedAtMs;
+        if (decision.interactionId !== undefined) record.watermarkInteractionId = decision.interactionId;
+        else delete record.watermarkInteractionId;
+      }
       this.audit(ledger, "publish", "deduped", identity);
       return "done";
     }
@@ -354,8 +397,9 @@ export class GatesStatusRuntime {
       ...(decision.interactionId !== undefined ? { watermarkInteractionId: decision.interactionId } : {}),
     };
     if (config.gatesStatusShadow) {
-      // Retain the authoritative shadow decision so flipping shadow off
-      // publishes it on the next event/sweep instead of losing it.
+      // Record the authoritative shadow decision and defer the queue entry
+      // (source-identified) so flipping shadow off publishes on the next
+      // sweep from re-read source interactions, not from this record.
       ledger.published[key] = {
         repo: decision.repo, sha: decision.sha, state: decision.state,
         count: record?.count ?? 0, lastPublishedAt: record?.lastPublishedAt ?? 0,
@@ -364,7 +408,7 @@ export class GatesStatusRuntime {
       };
       this.audit(ledger, "publish", "shadow", identity);
       this.ctx.logger.info("gates: shadow status", { context: GATES_CONTEXT, repo: decision.repo, prNumber: decision.prNumber, headSha: decision.sha, state: decision.state });
-      return "done";
+      return "shadow_deferred";
     }
     if (record?.lastMissingPermissionAt && this.now() - record.lastMissingPermissionAt < GATES_LIMITS.permissionCooldownMs) {
       this.audit(ledger, "publish", "missing_permission_cooldown", identity);

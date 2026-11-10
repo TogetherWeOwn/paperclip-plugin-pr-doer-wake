@@ -38,7 +38,7 @@ const clone = <T>(value: T): T => structuredClone(value);
 
 interface Ledger {
   version: 1;
-  queue: Array<{ issueId: string; companyId: string; enqueuedAt: number; attempts: number; nextAttemptAt: number; missingPermissionAttempts?: number }>;
+  queue: Array<{ issueId: string; companyId: string; enqueuedAt: number; attempts: number; nextAttemptAt: number; missingPermissionAttempts?: number; shadowAttempts?: number }>;
   published: Record<string, { repo: string; sha: string; state: string | null; count: number; lastPublishedAt: number; lastMissingPermissionAt?: number; shadowed?: boolean; lastShadowAt?: number; watermarkDecidedAtMs?: number; watermarkInteractionId?: string }>;
   audits: Array<{ at: number; operation: string; outcome: string; companyId?: string; issueId?: string; repo?: string; sha?: string; state?: string }>;
 }
@@ -229,6 +229,88 @@ describe("gates status runtime", () => {
     expect(github.createStatus).toHaveBeenCalledTimes(1);
     expect(h.ledger().audits.map((a) => a.outcome)).toContain("stale_decision");
     expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
+  });
+
+  it("advances the watermark on same-state dedupe across separate issues (D1,D3,D2 regression)", async () => {
+    const issue1 = "55555555-5555-4555-8555-555555555555";
+    const issue2 = "66666666-6666-4666-8666-666666666666";
+    const issue3 = "77777777-7777-4777-8777-777777777777";
+    const d1Id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const d3Id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const d2Id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const t1 = "2026-11-10T10:00:00.000Z";
+    const t2 = "2026-11-10T11:00:00.000Z";
+    const t3 = "2026-11-10T12:00:00.000Z";
+    const d1 = interaction({
+      id: d1Id, status: "rejected",
+      result: { outcome: "rejected", reason: `rejected at exact head ${SHA_A}` },
+      resolvedAt: t1,
+    });
+    const d3 = interaction({
+      id: d3Id, status: "rejected",
+      result: { outcome: "rejected", reason: `rejected at exact head ${SHA_A}` },
+      resolvedAt: t3,
+    });
+    const d2 = interaction({
+      id: d2Id, status: "accepted",
+      result: { outcome: "accepted", reason: `approved at exact head ${SHA_A}` },
+      resolvedAt: t2,
+    });
+    const h = setup({ interactions: [d1] });
+    await h.enqueue(issue1);
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    expect(github.createStatus).toHaveBeenLastCalledWith(REPO, SHA_A, "failure", expect.any(String));
+    h.setInteractions([d3]);
+    await h.enqueue(issue2);
+    // Same-state dedupe must advance the persisted watermark to T3 without a POST.
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({
+      state: "failure", count: 1,
+      watermarkDecidedAtMs: Date.parse(t3), watermarkInteractionId: d3Id,
+    });
+    const persisted = h.ledger();
+    // Reload from persisted state (fresh runtime) so in-memory state cannot mask the bug.
+    const reloaded = setup({ interactions: [d2] });
+    reloaded.seed(persisted);
+    await reloaded.enqueue(issue3);
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    expect(reloaded.ledger().audits.map((a) => a.outcome)).toContain("stale_decision");
+    expect(reloaded.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({
+      state: "failure", count: 1,
+      watermarkDecidedAtMs: Date.parse(t3), watermarkInteractionId: d3Id,
+    });
+  });
+
+  it("recovers shadow-deferred work via sweep-only drain after flipping shadow off, surviving maxAttempts and reload", async () => {
+    const shadowIssue = "55555555-5555-4555-8555-555555555555";
+    const h = setup({ config: gatesConfig({ gatesStatusShadow: true }) });
+    await h.enqueue(shadowIssue);
+    expect(github.createStatus).not.toHaveBeenCalled();
+    expect(h.ledger().queue).toHaveLength(1);
+    expect(h.ledger().queue[0]!.issueId).toBe(shadowIssue);
+    for (let i = 0; i < 25; i += 1) {
+      h.advance(1_000_000);
+      await h.runtime.drain();
+      expect(github.createStatus).not.toHaveBeenCalled();
+    }
+    expect(h.ledger().queue).toHaveLength(1);
+    expect(h.ledger().queue[0]!.attempts).toBe(0);
+    expect(h.ledger().queue[0]!.shadowAttempts).toBeGreaterThan(20);
+    expect(h.ledger().audits.map((a) => a.outcome)).not.toContain("gave_up");
+    // Runtime reconstruction from persisted state; flip only shadow off, then drain without any enqueue.
+    const persisted = h.ledger();
+    const live = setup({ config: gatesConfig({ gatesStatusShadow: false }) });
+    live.seed(persisted);
+    live.advance(30_000_000); // past the persisted shadow backoff
+    await live.runtime.drain();
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    expect(github.createStatus).toHaveBeenCalledWith(REPO, SHA_A, "success", expect.any(String));
+    expect(live.ledger().queue).toEqual([]);
+    expect(live.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
+    expect(live.ledger().published[`${REPO}:${SHA_A}`]!.shadowed).toBeUndefined();
+    live.advance(1_000_000);
+    await live.runtime.drain();
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
   });
 
   it("publishes distinct SHAs independently (unchanged-decision and distinct-SHA controls)", async () => {
