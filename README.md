@@ -23,7 +23,7 @@ Retries in the same run return the original wait ID without extending its seven-
 
 ## Readiness and delivery
 
-The SDK job `ci-wake-poll` runs every four minutes over registered open waits. Conditional REST reads use ETag / `If-None-Match`; a 304 reuses only the corresponding successfully cached response. All pages of check runs, suites, statuses and applicable branch rules are read, with finite page, byte, time and request limits. A failed/incomplete read is pending, never green. Rate limits defer work; they do not create an LLM retry loop.
+The SDK job `ci-wake-poll` runs every fifteen minutes as a **backstop** over registered open waits; signed webhook deliveries (phase two below) are the primary trigger so agents only run when CI has actually settled. Conditional REST reads use ETag / `If-None-Match`; a 304 reuses only the corresponding successfully cached response. All pages of check runs, suites, statuses and applicable branch rules are read, with finite page, byte, time and request limits. A failed/incomplete read is pending, never green. Rate limits defer work; they do not create an LLM retry loop.
 
 Required status-check contexts come from the **PR base branch's effective rules** plus classic branch protection, including required app identity. The latest run per name/app wins, so a queued rerun supersedes its earlier green result. All required contexts must finish before a normal pass/fail wake:
 
@@ -59,7 +59,7 @@ No issue creation/update/comments, company/project enumeration, SQL namespace, s
 | --- | --- | --- |
 | `enabled` | `false` | Master switch; rejects registrations and stops rechecks when disabled. |
 | `dryRun` | `true` | Log/record would-wake decisions without waking. |
-| `allowedRepos` | `[]` | Explicit owner/repo allowlist; mandatory when enabled, maximum 100. |
+| `allowedRepos` | `[]` | Explicit owner/repo allowlist; mandatory when enabled, maximum 200. |
 | `githubTokenSecretRef` | unset | Bearer mode: existing read-only token reference. Do not configure any App field with this. |
 | `githubAppId` | unset | App mode: numeric App ID, as a positive decimal string. |
 | `githubInstallationId` | unset | App mode: existing authorized installation ID, as a positive decimal string. |
@@ -91,7 +91,7 @@ GitHub-issued tokens expire upstream after about one hour; this plugin discards 
 
 Bearer mode uses an existing approved read-only token. Prompt same-attempt reconciliation needs **Actions: read**; without it, active-suite evidence defers conservatively until settlement. App mode intentionally requests the fixed complete read envelope above and never retries with fewer or broader scopes. Verify the actual plugin credential rather than an agent's separate GitHub identity.
 
-Hard runtime caps: 20 simultaneous open waits across the installation; 2,000 retained waits; seven-day active TTL; 30-day dedupe tombstones; 1,000 recent safe audit entries; 240 HTTP requests / 180 seconds / 20 wake attempts per tick. Bounded per-client page and response limits may defer large heads rather than truncate results. Expiry/compaction run on the independent scheduled job, including while disabled. No cloud resources are provisioned and no paid runner is used, so provisioning/spend reservation and cloud teardown are not applicable. Routine poll intents are evicted before wake/refusal evidence, preserving the current call's audit-before-credential write. Other events can still exhaust the ring; the Operator must export required evidence before eviction.
+Hard runtime caps: 300 simultaneous open waits across the installation; 8,000 retained waits; seven-day active TTL; 30-day dedupe tombstones; 5,000 recent safe audit entries; 3,600 HTTP requests / 600 seconds / 100 wake attempts per tick. Sizing rationale: at the measured load of 103 open cards polling for CI, 300 open waits with a 15-minute backstop poll covers the real waiting population (a single sweep costs roughly 7–10 conditional requests per wait, inside the 3,600 request budget); webhook hints, not polling, provide prompt wakes, so the backstop only bounds worst-case latency. Bounded per-client page and response limits may defer large heads rather than truncate results. Expiry/compaction run on the independent scheduled job, including while disabled. No cloud resources are provisioned and no paid runner is used, so provisioning/spend reservation and cloud teardown are not applicable. Routine poll intents are evicted before wake/refusal evidence, preserving the current call's audit-before-credential write. Other events can still exhaust the ring; the Operator must export required evidence before eviction.
 
 ## Retained build package (not installation or publication)
 
@@ -111,7 +111,7 @@ No staging or preview runtime is provisioned by this pipeline; no recurring alwa
 
 1. Verify the exact final head through GitHub Actions and permitted bounded local checks. Retain Actions run/job links, required CodeQL and completed Devin analysis, finding dispositions and native Security → QA. Complete `ACCEPTANCE.md`, including exact-artifact/host/configuration Security sign-off and native-tool governance coverage on the target stock host. A manifest declaration is not evidence that governance ran.
 2. Obtain applicable Release Manager production authorization before installation/activation. An Operator installs/upgrades the reviewed package, preserving the plugin ID. Configure an **existing approved** credential reference with the secret picker. For App mode, the existing approved installation must cover the target repository and the exact six read permissions above. Do not create/rotate keys, add repositories or increase App grants as part of installation; those require separate owner authorization and authorized administrative work. Source merge grants none of it.
-3. Replace old configuration, do not carry its heuristic fields forward. Install enabled with `enabled: true`, `dryRun: false`, allowlisting only the authorized target repository. Keep `webhooksEnabled: false`; no GitHub settings change is needed. There is no canary trial, twenty-head acceptance gate or disabled-first rollout. `dryRun` remains available as a configuration/rollback switch, not a required rollout stage.
+3. Replace old configuration, do not carry its heuristic fields forward. Install enabled with `enabled: true`, `dryRun: false`, allowlisting the repos in the scaled allowlist below (digest `3202dad14d8014c74e39d39d55a5c68d5840fdd555f40fdfdb0dedcaf94958f2`). Keep `webhooksEnabled: false` for the first live window (backstop polling only); there is no canary trial, twenty-head acceptance gate or disabled-first rollout. `dryRun` remains available as a configuration/rollback switch, not a required rollout stage.
 4. Record evidence of authorized live operation, including registration, authoritative GitHub/check timestamps and actual host queue/run receipts. Count ambiguity, caps, HTTP denials and failed reads explicitly; they are not passes. Dry-run records stay terminal and never replay automatically in live mode.
 5. Route the registration/backstop instruction change through its normal reviewer/applier, retaining the accepted operational envelope: register after push and keep a long backstop `max(15 minutes, 2 × repo median)`. Do not change instructions or remove backstops merely because code merged.
 
@@ -124,11 +124,74 @@ After phase-one acceptance, the owner who administers GitHub and holds the new s
 1. Generate a high-entropy webhook secret privately. Do not send it to an agent, an issue, the Operator or this repository.
 2. Store it directly in a Paperclip company secret. Bind its reference as `webhookSecretRef` for the reviewed plugin, using the secret picker; never a raw string.
 3. In the authorized target GitHub repository **Settings → Webhooks → Add webhook** (later the organization **Settings → Webhooks → Add webhook**), set payload URL to `https://<your-public-paperclip-host>/api/plugins/<installed-plugin-id>/webhooks/github-ci`. Use the installed record's route identifier, not an assumed UUID. Content type **application/json**; **SSL verification enabled**; enter the same secret privately.
-4. Select **Let me select individual events → Check suites only**, then **Active**. Do not select all events, check runs, pull requests or workflow runs. GitHub check-suite webhooks deliver completed events; statuses are still caught by polling.
+4. Select **Let me select individual events → Check suites, Check runs, Workflow runs and Pull requests**, then **Active**. Do not select all events. The plugin accepts only `completed` check_suite/check_run/workflow_run events and `opened`/`reopened`/`synchronize`/`ready_for_review` pull_request events; every other event/action is ignored. Commit statuses have no webhook and are still caught by the backstop poll.
 5. Operator enables `webhooksEnabled` only after the owner confirms the webhook/secret placement. Validate one real completed check-suite delivery and its HMAC verdict, then prove the resulting read sees current GitHub state. A delivery itself is not CI completion evidence.
 6. Monitor the host's webhook-delivery table/storage growth during authorized operation: stock host may persist raw bodies/headers before plugin verification and may not prune them. If that risk is not accepted, leave webhooks off and use polling. Protect public ingress with existing limits if authorized; this plugin cannot enforce pre-storage retention.
 
-The plugin verifies SHA-256 HMAC over the **raw body** with `timingSafeEqual`, ignores `parsedBody`, requires delivery UUIDs, retains a 24-hour replay guard and checks repo/org against the allowlist. The event is only a hint for the same readiness recheck. Payloads are capped at 64 KiB; before any ledger/config RPC, admission is limited to two outstanding hints and six candidate bodies per minute. Verification is independently capped at six secret resolutions per minute per worker; hints are debounced 20 seconds per head and capped at six per minute. Oversized/busy hints may be dropped safely: polling remains authoritative.
+The plugin verifies SHA-256 HMAC over the **raw body** with `timingSafeEqual`, ignores `parsedBody`, requires delivery UUIDs, retains a 24-hour replay guard and checks repo/org against the allowlist. The event is only a hint for the same readiness recheck. Payloads are capped at 64 KiB; before any ledger/config RPC, admission is limited to 32 outstanding hints and 240 candidate bodies per minute. Verification is independently capped at 120 secret resolutions per minute per worker (the binding budget at scale); hints are debounced 10 seconds per head and capped at 120 per minute. Oversized/busy hints may be dropped safely: the 15-minute backstop poll remains authoritative.
+
+## Scaled allowlist (push mode at scale)
+
+Measured 2026-11-10 via `gh repo list TogetherWeOwn --limit 200 --json name,pushedAt,isArchived`: **49 non-archived repositories pushed within the last 14 days** (53 including archived; the 61-repo figure in TWO-5787 predates this measurement and was not reproduced). The Operator pastes these exact lowercased `owner/repo` strings into `allowedRepos`; the canonical digest is the SHA-256 of the compact JSON array printed by the command below (lowercased `owner/repo` strings in that command's sort order): `3202dad14d8014c74e39d39d55a5c68d5840fdd555f40fdfdb0dedcaf94958f2`.
+
+Reproduction:
+
+```sh
+gh repo list TogetherWeOwn --limit 200 --json name,pushedAt,isArchived \
+  | python3 -c "import json,sys,hashlib;from datetime import datetime,timezone,timedelta; d=json.load(sys.stdin); c=datetime(2026,11,10,tzinfo=timezone.utc)-timedelta(days=14); a=sorted('TogetherWeOwn/'+r['name'].lower() for r in d if not r.get('isArchived') and datetime.fromisoformat(r['pushedAt'].replace('Z','+00:00'))>=c); print(len(a)); print(hashlib.sha256(json.dumps(a,separators=(',',':')).encode()).hexdigest())"
+```
+
+- `togetherweown/.github`
+- `togetherweown/agent-avatar-generator`
+- `togetherweown/agent-toolkit`
+- `togetherweown/ai-engineer-knowledge`
+- `togetherweown/boat-offload-canary`
+- `togetherweown/cli-proxy-api-management-center`
+- `togetherweown/cliproxy-provider-cloudflare-workers-ai`
+- `togetherweown/cliproxy-provider-hopper`
+- `togetherweown/cliproxy-provider-kit`
+- `togetherweown/cliproxy-provider-meta`
+- `togetherweown/cliproxy-provider-nvidia-nim`
+- `togetherweown/cliproxy-provider-opencode-go`
+- `togetherweown/cliproxy-provider-openrouter`
+- `togetherweown/cliproxy-provider-synthetic`
+- `togetherweown/cliproxy-provider-zai-coding-plan`
+- `togetherweown/cliproxyapi`
+- `togetherweown/coderabbit`
+- `togetherweown/hindsight`
+- `togetherweown/kagi-shinobi`
+- `togetherweown/kagi-shinobi-public`
+- `togetherweown/kofra`
+- `togetherweown/kofra-cloud`
+- `togetherweown/labelloop`
+- `togetherweown/musicbrainz-cloudflare`
+- `togetherweown/nntunev2`
+- `togetherweown/open-personal-agent`
+- `togetherweown/open-serverless-vault`
+- `togetherweown/osv-kdf-candidate`
+- `togetherweown/paperclip`
+- `togetherweown/paperclip-operator-toolkit`
+- `togetherweown/paperclip-ops`
+- `togetherweown/paperclip-plugin-cf-test-env`
+- `togetherweown/paperclip-plugin-cliproxy-connector`
+- `togetherweown/paperclip-plugin-decision-notifier`
+- `togetherweown/paperclip-plugin-decision-router`
+- `togetherweown/paperclip-plugin-feed-watch`
+- `togetherweown/paperclip-plugin-github-upstream`
+- `togetherweown/paperclip-plugin-model-capacity`
+- `togetherweown/paperclip-plugin-pr-doer-wake`
+- `togetherweown/paperclip-plugin-pr-tracker`
+- `togetherweown/paperclip-plugin-sandbox-boat`
+- `togetherweown/paperclip-plugin-vuln-sentinel`
+- `togetherweown/paperclip-r2-backups`
+- `togetherweown/qerith`
+- `togetherweown/routeware-shadow-api`
+- `togetherweown/two-bot-next`
+- `togetherweown/two-design-kit`
+- `togetherweown/two-web-next`
+- `togetherweown/velmora`
+
+This delta (allowlist + caps + four webhook events) requires fresh Security delta and Release Manager acceptance on TWO-5424 before the Operator applies it; source merge alone does not authorize installation or configuration changes.
 
 ## Rollback and revocation
 

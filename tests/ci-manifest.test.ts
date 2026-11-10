@@ -20,7 +20,7 @@ describe("stock manifest and config contract", () => {
     expect(manifest.database?.coreReadTables).toEqual(["issues", "issue_comments", "issue_documents"]);
     expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")?.schedule).toBe("17 * * * *");
     expect(manifest.tools?.map((tool) => tool.name)).toEqual(["ci_wait_register"]);
-    expect(manifest.jobs?.[0]?.schedule).toBe("*/4 * * * *");
+    expect(manifest.jobs?.[0]?.schedule).toBe("*/15 * * * *");
   });
 
   it("accepts disabled defaults and allowlist revocation but refuses enabling an empty allowlist", () => {

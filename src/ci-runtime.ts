@@ -9,7 +9,7 @@ function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
 }
 
-export const LIMITS = { active: 20, retained: 2_000, audit: 1_000, deliveries: 2_000, requestsPerTick: 240, wakePerTick: 20, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 180_000, secretResolveMs: 15_000 } as const;
+export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 600_000, secretResolveMs: 15_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
 export interface CiWakeRuntimeOptions {
   /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
   secretResolveTimeoutMs?: number;
@@ -54,6 +54,35 @@ function header(input: PluginWebhookInput, name: string): string | undefined {
   const key = Object.keys(input.headers).find((k) => k.toLowerCase() === name);
   const value = key ? input.headers[key] : undefined;
   return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Extract the exact head SHA a signed delivery claims completion for, or null
+ * when the event/action is not a CI-hint trigger. A returned SHA is only a
+ * ledger lookup key: without an open wait matching it exactly, nothing is read.
+ */
+function webhookHeadSha(event: string | undefined, rawBody: string): string | null {
+  // Unsupported events are ignored without parsing, even when malformed.
+  if (!["check_suite", "check_run", "workflow_run", "pull_request"].includes(event ?? "")) return null;
+  let payload: Record<string, any>;
+  try { payload = JSON.parse(rawBody) as Record<string, any>; } catch { throw new Error("invalid_webhook_payload"); }
+  const shaOf = (value: unknown): string | null => (typeof value === "string" && SHA.test(value) ? value : null);
+  switch (event) {
+    case "check_suite":
+    case "check_run":
+    case "workflow_run": {
+      if (payload?.action !== "completed") return null;
+      const sha = shaOf(event === "check_suite" ? payload.check_suite?.head_sha : event === "check_run" ? payload.check_run?.head_sha : payload.workflow_run?.head_sha);
+      if (!sha) throw new Error("invalid_webhook_payload");
+      return sha;
+    }
+    case "pull_request":
+      // Non-CI transitions (assigned, labeled, ...) carry no head evidence.
+      if (!["opened", "reopened", "synchronize", "ready_for_review"].includes(payload?.action)) return null;
+      return shaOf(payload.pull_request?.head?.sha) ?? (() => { throw new Error("invalid_webhook_payload"); })();
+    default:
+      return null;
+  }
 }
 
 /** One host-managed worker owns this ledger. All entrypoints share its lock, including overlapping job callbacks. */
@@ -391,18 +420,18 @@ export class CiWakeRuntime {
 
   async webhook(input: PluginWebhookInput): Promise<void> {
     if (input.endpointKey !== "github-ci") throw new Error("unknown_webhook");
-    if (header(input, "x-github-event") !== "check_suite") return;
+    const event = header(input, "x-github-event");
+    const sha = webhookHeadSha(event, input.rawBody);
+    // Unsupported events and non-terminal actions are ignored without ledger reads.
+    if (sha === null) return;
     if (Buffer.byteLength(input.rawBody, "utf8") > 65_536) throw new Error("webhook_too_large");
     const signature = header(input, "x-hub-signature-256");
     const delivery = header(input, "x-github-delivery");
     if (!signature || !/^sha256=[0-9a-f]{64}$/.test(signature) || !delivery || !UUID.test(delivery)) throw new Error("invalid_webhook_headers");
     const payload = JSON.parse(input.rawBody) as Record<string, any>;
-    if (payload?.action !== "completed") return;
     const repo = typeof payload.repository?.full_name === "string" ? payload.repository.full_name.toLowerCase() : "";
-    const sha = payload.check_suite?.head_sha;
-    if (typeof sha !== "string" || !SHA.test(sha)) throw new Error("invalid_webhook_payload");
     if (this.now() - this.webhookAdmissions.since >= 60_000) this.webhookAdmissions = { since: this.now(), used: 0 };
-    if (this.pendingWebhooks >= 2 || this.webhookAdmissions.used >= 6) throw new Error("webhook_admission_budget");
+    if (this.pendingWebhooks >= LIMITS.webhookPending || this.webhookAdmissions.used >= LIMITS.webhookAdmissionPerMin) throw new Error("webhook_admission_budget");
     this.webhookAdmissions.used += 1;
     this.pendingWebhooks += 1;
     try { await this.webhookAdmitted(input, repo, sha, signature, delivery); } finally { this.pendingWebhooks -= 1; }
@@ -423,7 +452,7 @@ export class CiWakeRuntime {
         if (typeof owner !== "string" || owner.toLowerCase() !== repo.split("/")[0]) continue;
         if (payload.organization !== undefined && (typeof payload.organization?.login !== "string" || payload.organization.login.toLowerCase() !== owner.toLowerCase())) continue;
         if (this.now() - this.webhookBudget.since >= 60_000) this.webhookBudget = { since: this.now(), used: 0 };
-        if (++this.webhookBudget.used > 6) throw new Error("webhook_verification_budget");
+        if (++this.webhookBudget.used > LIMITS.webhookVerifyPerMin) throw new Error("webhook_verification_budget");
         let secret: string;
         try { secret = await this.resolveSecret(config.webhookSecretRef!, companyId, "webhookSecretRef"); } catch { continue; }
         if (!verifyCiSignature(secret, input.rawBody, signature)) continue;
@@ -433,7 +462,7 @@ export class CiWakeRuntime {
         ledger.deliveries[replayKey] = this.now();
         const hintKey = `${companyId}:${repo}:${sha}`;
         const recent = Object.values(ledger.hints).filter((at) => this.now() - at < 60_000).length;
-        if (recent < 6 && (ledger.hints[hintKey] === undefined || this.now() - ledger.hints[hintKey]! >= 20_000)) {
+        if (recent < LIMITS.webhookHintsPerMin && (ledger.hints[hintKey] === undefined || this.now() - ledger.hints[hintKey]! >= LIMITS.webhookDebounceMs)) {
           ledger.hints[hintKey] = this.now();
           target = { companyId, repo, sha };
         }
