@@ -105,7 +105,7 @@ export async function retainPackage(outputDir) {
       result: "passed", package: pkg.name, version: pkg.version, manifestId: manifest.id, entrypoints,
       checks: ["regular-file allowlist", "packed bytes match built workspace", "manifest and package entrypoints exist",
         "manifest version and worker agree", "packed public entrypoint imports with locked SDK", "worker syntax"],
-      limits: "Worker not started; no host installation, governance, configuration or canary acceptance implied.",
+      limits: "Worker not started; no host installation, governance, configuration or operational acceptance implied.",
     });
     save(outputDir, "provenance.json", {
       schemaVersion: 1, sourceSha, repository: env.GITHUB_REPOSITORY,

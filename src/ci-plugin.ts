@@ -21,5 +21,5 @@ export default definePlugin({
     return errors.length ? { ok: false, errors } : { ok: true };
   },
   async onWebhook(input) { await ready().webhook(input); },
-  async onHealth() { return { status: "ok", message: "ci-wake ready; inspect wait audits and Actions/canary evidence separately" }; },
+  async onHealth() { return { status: "ok", message: "ci-wake ready; inspect wait audits and Actions/operational evidence separately" }; },
 });

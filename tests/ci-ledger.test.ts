@@ -72,7 +72,7 @@ function setup(app = false) {
     if (/^\/app\/installations\/[0-9]+\/access_tokens$/.test(path)) {
       expect(init?.method).toBe("POST");
       if (throttled && path === "/app/installations/456/access_tokens") return { status: 429, headers: { "retry-after": "600" }, body: "{}" };
-      expect(JSON.parse(init?.body as string)).toEqual({ repositories: ["widget"], permissions: APP_PERMISSIONS });
+      expect(JSON.parse(init?.body as string)).toEqual({ repositories: ["widget"], permissions: { pull_requests: "read", checks: "read", statuses: "read", actions: "read", administration: "read", metadata: "read" } });
       return { status: 201, headers: {}, body: JSON.stringify({ token: APP_TOKEN, expires_at: new Date(now + 3_600_000).toISOString(), repositories: [{ full_name: REPO }], permissions: APP_PERMISSIONS }) };
     }
     if (app) expect((init?.headers as Record<string, string>).Authorization).toBe(`Bearer ${APP_TOKEN}`);

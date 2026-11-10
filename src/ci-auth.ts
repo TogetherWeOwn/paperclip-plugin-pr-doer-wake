@@ -2,8 +2,8 @@ import { createPrivateKey, sign } from "node:crypto";
 import { REPO } from "./ci-config.js";
 import { CiGithubError, type CiTokenExchange, type CiTokenSource } from "./ci-github.js";
 
-/** GitHub's permission key is statuses, not commit_statuses. Metadata read is implicit. */
-export const APP_PERMISSIONS = Object.freeze({ pull_requests: "read", checks: "read", statuses: "read", actions: "read", administration: "read" } as const);
+/** Request the full read-only ceiling on every mint, including metadata. */
+export const APP_PERMISSIONS = Object.freeze({ pull_requests: "read", checks: "read", statuses: "read", actions: "read", administration: "read", metadata: "read" } as const);
 export const AUTH_CYCLE_MS = 180_000;
 const MARGIN_MS = 60_000;
 interface AppAuthOptions {
@@ -73,7 +73,7 @@ export class CiAppAuth implements CiTokenSource {
     if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) throw new CiGithubError("auth");
     const granted = permissions as Record<string, unknown>;
     if (Object.keys(APP_PERMISSIONS).some((name) => granted[name] !== "read")
-        || Object.entries(granted).some(([name, level]) => level !== "read" || name !== "metadata" && !Object.hasOwn(APP_PERMISSIONS, name))) throw new CiGithubError("auth");
+        || Object.entries(granted).some(([name, level]) => level !== "read" || !Object.hasOwn(APP_PERMISSIONS, name))) throw new CiGithubError("auth");
     const repos = data.repositories;
     if (!Array.isArray(repos) || repos.length !== 1 || !repos[0] || typeof repos[0] !== "object"
         || typeof repos[0].full_name !== "string" || repos[0].full_name.toLowerCase() !== this.#options.repo

@@ -9,6 +9,7 @@ const app = { githubAppId: "123", githubInstallationId: "456", githubAppPrivateK
 const base = { enabled: true, allowedRepos: ["example/project"] };
 const START = 1_800_000_000_000;
 const TOKEN = "ghs_synthetic_installation_token_never_output";
+const EXPECTED_PERMISSIONS = { pull_requests: "read", checks: "read", statuses: "read", actions: "read", administration: "read", metadata: "read" };
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const KEY = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 const pr = { number: 1, head: { sha: "a".repeat(40), ref: "feature", repo: { full_name: "example/project" } }, base: { ref: "main", repo: { full_name: "example/project" } }, user: { login: "example" }, state: "open", draft: false, merged: false, mergeable: null };
@@ -61,7 +62,7 @@ describe("App installation authentication", () => {
     expect(h.resolve).toHaveBeenCalledTimes(1);
     expect(h.calls[0]?.url).toBe("https://api.github.com/app/installations/456/access_tokens");
     expect(h.calls[0]?.init?.redirect).toBe("error");
-    expect(JSON.parse(h.calls[0]?.init?.body as string)).toEqual({ repositories: ["project"], permissions: APP_PERMISSIONS });
+    expect(JSON.parse(h.calls[0]?.init?.body as string)).toEqual({ repositories: ["project"], permissions: EXPECTED_PERMISSIONS });
     const jwt = (h.calls[0]?.init?.headers as Record<string, string>).Authorization!.slice(7);
     const [header, payload, signature] = jwt.split(".");
     expect(JSON.parse(Buffer.from(header!, "base64url").toString())).toEqual({ alg: "RS256", typ: "JWT" });
@@ -114,6 +115,31 @@ describe("App installation authentication", () => {
     expect(h.calls).toHaveLength(1);
     await expect(h.github.pull("example/project", 1)).rejects.toThrow("auth");
     expect(h.calls).toHaveLength(1);
+  });
+
+  it.each(Object.keys(EXPECTED_PERMISSIONS))("refuses missing or write-level %s permission", async (name) => {
+    for (const missing of [false, true]) {
+      const permissions: Record<string, string> = { ...EXPECTED_PERMISSIONS, [name]: "write" };
+      if (missing) delete permissions[name];
+      const h = fixture({ tokenPatch: { permissions } });
+      await expect(h.github.pull("example/project", 1)).rejects.toThrow("auth");
+      expect(h.calls).toHaveLength(1);
+    }
+  });
+
+  it("narrows every renewal and refuses cross-repository reuse of an existing token", async () => {
+    let now = START;
+    const auth = new CiAppAuth({ appId: "123", installationId: "456", repo: "example/project", resolvePrivateKey: async () => KEY, now: () => now });
+    const exchange = vi.fn(async (_id: string, _jwt: string, _scope: unknown) => ({ token: TOKEN, expires_at: new Date(now + 90_000).toISOString(), repositories: [{ full_name: "example/project" }], permissions: EXPECTED_PERMISSIONS }));
+    await auth.token("/repos/example/project/pulls/1", exchange);
+    await expect(auth.token("/repos/example/other/pulls/1", exchange)).rejects.toThrow("input");
+    expect(exchange).toHaveBeenCalledTimes(1);
+    now += 30_000;
+    await auth.token("/repos/example/project/check-runs", exchange);
+    expect(exchange).toHaveBeenCalledTimes(2);
+    for (const call of exchange.mock.calls) {
+      expect(call[2]).toEqual({ repositories: ["project"], permissions: EXPECTED_PERMISSIONS });
+    }
   });
 
   it.each([301, 302, 401, 403, 404, 422, 429])("never falls back from exchange HTTP %s to a bearer or wider token", async (status) => {
