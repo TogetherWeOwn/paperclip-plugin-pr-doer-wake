@@ -120,7 +120,7 @@ function setup(overrides: Record<string, unknown> = {}) {
   const requestWakeup = vi.fn(async (..._args: unknown[]): Promise<{ queued: boolean }> => ({ queued: true }));
   const issueGet = vi.fn(async (_id: string, _companyId: string) => clone(issue));
   const workspaceGet = vi.fn(async (_id: string, _companyId: string) => clone(workspace));
-  const resolveSecret = vi.fn(async (ref: { secretId: string }, _options: unknown) => ref.secretId === WEBHOOK_REF.secretId ? SECRET : TOKEN);
+  const resolveSecret = vi.fn(async (ref: { secretId: string }, _options: unknown): Promise<string> => ref.secretId === WEBHOOK_REF.secretId ? SECRET : TOKEN);
   const fetch = vi.fn(async (..._args: unknown[]) => ({ status: 200, headers: {}, body: "{}" }));
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const configGet = vi.fn(async (_companyId: string) => clone(rawConfig));
