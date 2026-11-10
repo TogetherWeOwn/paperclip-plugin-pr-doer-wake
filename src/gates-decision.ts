@@ -36,6 +36,16 @@ export interface GatesDecision {
   sha: string;
   state: GatesStatusState;
   interactionId?: string;
+  /**
+   * Trusted host decision time in epoch ms, for authoritative precedence
+   * when a thread retains several RM decisions for the same repo+SHA.
+   * Parsed from `resolvedAt`, falling back to `updatedAt` then `createdAt`;
+   * 0 when the host supplied no parseable timestamp. The runtime groups by
+   * repo+SHA and keeps only the newest decision under this ordering, with
+   * the interaction id as a deterministic tie-break, so list order returned
+   * by the host never chooses the published state.
+   */
+  decidedAtMs: number;
 }
 
 export type GatesExtraction = { decision: GatesDecision } | { reason: string };
@@ -63,6 +73,29 @@ function shas(source: string): Set<string> {
 
 function recordOf(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+/** Epoch ms for a host timestamp (`Date`, ISO string or epoch number), else null. */
+function timeMs(value: unknown): number | null {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const ms = Date.parse(value);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return null;
+}
+
+/** Host decision time for one interaction: resolution first, then update, then creation. */
+function decidedAtMs(interaction: Record<string, unknown>): number {
+  for (const field of ["resolvedAt", "updatedAt", "createdAt"]) {
+    const ms = timeMs(interaction[field]);
+    if (ms !== null) return ms;
+  }
+  return 0;
 }
 
 /** Combined prose an RM merge confirmation may cite its PR/SHA in. */
@@ -152,6 +185,7 @@ export function extractGatesDecision(raw: unknown, releaseManagerAgentId: string
     decision: {
       repo, prNumber: Number(prNumber), sha: sha!, state,
       ...(typeof interaction.id === "string" ? { interactionId: interaction.id } : {}),
+      decidedAtMs: decidedAtMs(interaction),
     },
   };
 }

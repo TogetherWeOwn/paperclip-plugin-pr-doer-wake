@@ -31,7 +31,7 @@ function interaction(overrides: Record<string, unknown> = {}) {
 describe("gates decision extraction", () => {
   it("publishes success for an RM-accepted merge-authorization contract citing one PR and one SHA", () => {
     expect(extractGatesDecision(interaction(), RM)).toEqual({
-      decision: { repo: REPO, prNumber: PR, sha: SHA_A, state: "success", interactionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+      decision: { repo: REPO, prNumber: PR, sha: SHA_A, state: "success", interactionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", decidedAtMs: 0 },
     });
   });
 
@@ -157,6 +157,21 @@ describe("gates decision extraction", () => {
       result: { outcome: "accepted", reason: `approved at exact head ${SHA_B}` },
     }), RM);
     expect(newHead).toMatchObject({ decision: { sha: SHA_B, state: "success" } });
+  });
+
+  it("carries the host decision time for authoritative precedence (resolvedAt, then updatedAt, then createdAt)", () => {
+    const resolved = new Date("2026-11-10T12:00:00.000Z").getTime();
+    expect(extractGatesDecision(interaction({
+      resolvedAt: "2026-11-10T12:00:00.000Z", updatedAt: "2026-11-10T13:00:00.000Z", createdAt: "2026-11-10T11:00:00.000Z",
+    }), RM)).toMatchObject({ decision: { decidedAtMs: resolved } });
+    expect(extractGatesDecision(interaction({
+      resolvedAt: null, updatedAt: "2026-11-10T13:30:00.000Z", createdAt: "2026-11-10T11:00:00.000Z",
+    }), RM)).toMatchObject({ decision: { decidedAtMs: new Date("2026-11-10T13:30:00.000Z").getTime() } });
+    expect(extractGatesDecision(interaction({
+      resolvedAt: null, updatedAt: null, createdAt: new Date("2026-11-10T11:15:00.000Z"),
+    }), RM)).toMatchObject({ decision: { decidedAtMs: new Date("2026-11-10T11:15:00.000Z").getTime() } });
+    expect(extractGatesDecision(interaction({ resolvedAt: "not-a-date", updatedAt: undefined, createdAt: undefined }), RM))
+      .toMatchObject({ decision: { decidedAtMs: 0 } });
   });
 
   it("keeps the status description inside the GitHub 140-character limit", () => {

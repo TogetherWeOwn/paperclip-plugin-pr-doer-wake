@@ -38,8 +38,8 @@ const clone = <T>(value: T): T => structuredClone(value);
 
 interface Ledger {
   version: 1;
-  queue: Array<{ issueId: string; companyId: string; enqueuedAt: number; attempts: number; nextAttemptAt: number }>;
-  published: Record<string, { repo: string; sha: string; state: string | null; count: number; lastPublishedAt: number; lastMissingPermissionAt?: number }>;
+  queue: Array<{ issueId: string; companyId: string; enqueuedAt: number; attempts: number; nextAttemptAt: number; missingPermissionAttempts?: number }>;
+  published: Record<string, { repo: string; sha: string; state: string | null; count: number; lastPublishedAt: number; lastMissingPermissionAt?: number; shadowed?: boolean; lastShadowAt?: number; watermarkDecidedAtMs?: number; watermarkInteractionId?: string }>;
   audits: Array<{ at: number; operation: string; outcome: string; companyId?: string; issueId?: string; repo?: string; sha?: string; state?: string }>;
 }
 
@@ -63,7 +63,7 @@ function setup(options: { config?: Record<string, unknown>; interactions?: unkno
   let durable: Ledger | null = null;
   let now = START;
   let interactions = options.interactions ?? [interaction()];
-  const rawConfig = options.config ?? gatesConfig();
+  let rawConfig = options.config ?? gatesConfig();
   const get = vi.fn(async () => clone(durable));
   const set = vi.fn(async (_key: unknown, value: unknown) => { durable = clone(value as Ledger); });
   const listInteractions = vi.fn(async () => clone(interactions));
@@ -83,6 +83,7 @@ function setup(options: { config?: Record<string, unknown>; interactions?: unkno
     ledger: () => clone(durable!),
     seed: (ledger: Ledger) => { durable = clone(ledger); },
     setInteractions: (next: unknown[]) => { interactions = next; },
+    setConfig: (next: Record<string, unknown>) => { rawConfig = next; },
     enqueue: async (issueId = ISSUE) => { await runtime.handleIssueUpdated(event(issueId)); },
   };
 }
@@ -111,11 +112,11 @@ describe("gates status runtime", () => {
     expect(h.ledger().published[`${REPO}:${SHA_A}`]).toBeUndefined();
   });
 
-  it("is a no-op while gatesStatusEnabled is false", async () => {
+  it("is a no-op while gatesStatusEnabled is false, with no ledger writes at all", async () => {
     const h = setup({ config: gatesConfig({ gatesStatusEnabled: false }) });
     await h.enqueue();
     expect(github.createStatus).not.toHaveBeenCalled();
-    expect(h.ledger().audits.map((a) => a.outcome)).toContain("skipped_disabled");
+    expect(h.ledger()).toBeNull();
   });
 
   it("shadow mode logs the would-be status without any POST", async () => {
@@ -160,6 +161,125 @@ describe("gates status runtime", () => {
     expect(github.createStatus).toHaveBeenCalledTimes(2);
     expect(github.createStatus).toHaveBeenLastCalledWith(REPO, SHA_A, "pending", expect.any(String));
     expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "pending", count: 2 });
+  });
+
+  it("publishes only the newest decision for a SHA when retained history contradicts, in both list orders, without replay flap", async () => {
+    const olderSuccess = interaction({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", status: "accepted",
+      result: { outcome: "accepted", reason: `approved at exact head ${SHA_A}` },
+      resolvedAt: "2026-11-10T10:00:00.000Z", updatedAt: "2026-11-10T10:00:00.000Z", createdAt: "2026-11-09T10:00:00.000Z",
+    });
+    const newerFailure = interaction({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", status: "rejected",
+      result: { outcome: "rejected", reason: `rejected at exact head ${SHA_A}` },
+      resolvedAt: "2026-11-10T11:00:00.000Z", updatedAt: "2026-11-10T11:00:00.000Z", createdAt: "2026-11-10T09:00:00.000Z",
+    });
+    for (const history of [[olderSuccess, newerFailure], [newerFailure, olderSuccess]]) {
+      github.createStatus.mockClear();
+      const h = setup({ interactions: history });
+      await h.enqueue();
+      expect(github.createStatus).toHaveBeenCalledTimes(1);
+      expect(github.createStatus).toHaveBeenCalledWith(REPO, SHA_A, "failure", expect.any(String));
+      expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "failure", count: 1 });
+      // An unchanged replay (any later issue.updated) publishes nothing more.
+      await h.enqueue();
+      expect(github.createStatus).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("publishes only the newest decision when an older rejection is followed by a newer acceptance, in both list orders", async () => {
+    const olderFailure = interaction({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", status: "rejected",
+      result: { outcome: "rejected", reason: `rejected at exact head ${SHA_A}` },
+      resolvedAt: "2026-11-10T10:00:00.000Z",
+    });
+    const newerSuccess = interaction({
+      id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", status: "accepted",
+      result: { outcome: "accepted", reason: `approved at exact head ${SHA_A}` },
+      resolvedAt: "2026-11-10T11:00:00.000Z",
+    });
+    for (const history of [[olderFailure, newerSuccess], [newerSuccess, olderFailure]]) {
+      github.createStatus.mockClear();
+      const h = setup({ interactions: history });
+      await h.enqueue();
+      expect(github.createStatus).toHaveBeenCalledTimes(1);
+      expect(github.createStatus).toHaveBeenCalledWith(REPO, SHA_A, "success", expect.any(String));
+      await h.enqueue();
+      expect(github.createStatus).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("never lets a stale retained decision republish over the persisted watermark", async () => {
+    const h = setup({
+      interactions: [interaction({
+        id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", status: "accepted",
+        result: { outcome: "accepted", reason: `approved at exact head ${SHA_A}` },
+        resolvedAt: "2026-11-10T11:00:00.000Z",
+      })],
+    });
+    await h.enqueue();
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    // History shrinks to only the older contradictory decision: still no republish.
+    h.setInteractions([interaction({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", status: "rejected",
+      result: { outcome: "rejected", reason: `rejected at exact head ${SHA_A}` },
+      resolvedAt: "2026-11-10T10:00:00.000Z",
+    })]);
+    await h.enqueue();
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    expect(h.ledger().audits.map((a) => a.outcome)).toContain("stale_decision");
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
+  });
+
+  it("publishes distinct SHAs independently (unchanged-decision and distinct-SHA controls)", async () => {
+    const h = setup({
+      interactions: [
+        interaction({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", result: { outcome: "accepted", reason: `approved at exact head ${SHA_A}` }, resolvedAt: "2026-11-10T10:00:00.000Z" }),
+        interaction({ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", status: "rejected", result: { outcome: "rejected", reason: `rejected at exact head ${SHA_B}` }, resolvedAt: "2026-11-10T11:00:00.000Z" }),
+      ],
+    });
+    await h.enqueue();
+    expect(github.createStatus).toHaveBeenCalledTimes(2);
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
+    expect(h.ledger().published[`${REPO}:${SHA_B}`]).toMatchObject({ state: "failure", count: 1 });
+  });
+
+  it("retains shadow decisions and publishes them after the shadow→live flip, without a new decision", async () => {
+    const h = setup({ config: gatesConfig({ gatesStatusShadow: true }) });
+    await h.enqueue();
+    expect(github.createStatus).not.toHaveBeenCalled();
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", shadowed: true, count: 0 });
+    h.setConfig(gatesConfig({ gatesStatusShadow: false }));
+    await h.enqueue();
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    expect(github.createStatus).toHaveBeenCalledWith(REPO, SHA_A, "success", expect.any(String));
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]!.shadowed).toBeUndefined();
+  });
+
+  it("never exhausts missing-permission retries: the entry survives past maxAttempts and publishes after the grant", async () => {
+    let granted = false;
+    const h = setup({
+      createStatus: async () => {
+        if (!granted) throw new CiGithubError("http", 403) as never;
+        return { id: 2, context: "paperclip/gates", state: "success" };
+      },
+    });
+    await h.enqueue();
+    // More than GATES_LIMITS.maxAttempts (20) missing-permission retries.
+    for (let i = 0; i < 25; i += 1) {
+      h.advance(1_000_000); // past the capped 15-minute missing-permission backoff
+      await h.runtime.drain();
+    }
+    expect(h.ledger().queue).toHaveLength(1);
+    expect(h.ledger().queue[0]!.attempts).toBe(0);
+    expect(h.ledger().queue[0]!.missingPermissionAttempts).toBeGreaterThan(20);
+    expect(h.ledger().audits.map((a) => a.outcome)).not.toContain("gave_up");
+    granted = true;
+    h.advance(1_000_000); // past the capped 15-minute missing-permission backoff
+    await h.runtime.drain();
+    expect(h.ledger().queue).toEqual([]);
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
   });
 
   it("never greens an uncited new push: a decision for SHA A produces no status for SHA B", async () => {

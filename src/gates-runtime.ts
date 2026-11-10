@@ -27,6 +27,8 @@ interface QueueEntry {
   enqueuedAt: number;
   attempts: number;
   nextAttemptAt: number;
+  /** Missing-permission retries never exhaust: they use this counter, not `attempts`. */
+  missingPermissionAttempts?: number;
 }
 interface Published {
   repo: string;
@@ -35,6 +37,12 @@ interface Published {
   count: number;
   lastPublishedAt: number;
   lastMissingPermissionAt?: number;
+  /** Shadow-only record: retained so the shadow→live flip can publish it. Never dedupes live. */
+  shadowed?: boolean;
+  lastShadowAt?: number;
+  /** Authoritative-decision watermark: no decision older than this may republish. */
+  watermarkDecidedAtMs?: number;
+  watermarkInteractionId?: string;
 }
 interface Audit {
   at: number;
@@ -109,10 +117,11 @@ export class GatesStatusRuntime {
     const now = this.now();
     for (const [key, record] of Object.entries(ledger.published)) {
       const published = record.count > 0;
-      const at = published ? record.lastPublishedAt : (record.lastMissingPermissionAt ?? 0);
-      if (now - at >= (published ? PUBLISHED_RETENTION_MS : MISSING_PERMISSION_RETENTION_MS)) delete ledger.published[key];
+      const at = published ? record.lastPublishedAt : (record.lastShadowAt ?? record.lastMissingPermissionAt ?? 0);
+      const retention = published || record.shadowed ? PUBLISHED_RETENTION_MS : MISSING_PERMISSION_RETENTION_MS;
+      if (now - at >= retention) delete ledger.published[key];
     }
-    const records = Object.entries(ledger.published).sort((a, b) => (a[1].lastPublishedAt || a[1].lastMissingPermissionAt || 0) - (b[1].lastPublishedAt || b[1].lastMissingPermissionAt || 0));
+    const records = Object.entries(ledger.published).sort((a, b) => (a[1].lastPublishedAt || a[1].lastShadowAt || a[1].lastMissingPermissionAt || 0) - (b[1].lastPublishedAt || b[1].lastShadowAt || b[1].lastMissingPermissionAt || 0));
     for (const [key] of records.slice(0, Math.max(records.length - GATES_LIMITS.published, 0))) delete ledger.published[key];
   }
 
@@ -157,6 +166,10 @@ export class GatesStatusRuntime {
     if (event.eventType !== "issue.updated" || !event.entityId || !UUID.test(event.entityId) || !UUID.test(event.companyId)) return;
     const issueId = event.entityId.toLowerCase();
     const companyId = event.companyId.toLowerCase();
+    // Disabled/invalid publisher: return before any ledger I/O, so the
+    // default-disabled configuration costs no state writes per update.
+    const { config, invalid } = await this.config(companyId);
+    if (invalid || !config!.gatesStatusEnabled || !config!.releaseManagerAgentId) return;
     await this.serialized(async () => {
       const ledger = await this.load();
       this.compact(ledger);
@@ -244,12 +257,31 @@ export class GatesStatusRuntime {
         this.audit(ledger, "decision", "no_decision", identity);
         return true;
       }
-      let retryable = false;
+      // A thread may retain several RM decisions for one repo+SHA with
+      // opposite outcomes. Only the authoritative (newest) decision per
+      // repo+SHA is applied; host list order must never pick the state.
+      // Authoritative = greatest host decision time, interaction id as
+      // the deterministic tie-break for equal/missing timestamps.
+      const authoritative = new Map<string, GatesDecision>();
       for (const decision of decisions) {
+        const key = `${decision.repo}:${decision.sha}`;
+        const current = authoritative.get(key);
+        if (!current
+          || decision.decidedAtMs > current.decidedAtMs
+          || (decision.decidedAtMs === current.decidedAtMs
+            && (decision.interactionId ?? "") > (current.interactionId ?? ""))) {
+          authoritative.set(key, decision);
+        }
+      }
+      let retryable = false;
+      let missingPermission = false;
+      for (const decision of authoritative.values()) {
         const outcome = await this.applyDecision(ledger, entry, config!, decision, fetch, cycle);
         if (outcome === "retryable") retryable = true;
+        if (outcome === "retryable_missing_permission") missingPermission = true;
       }
-      if (!retryable) return true;
+      if (!retryable && !missingPermission) return true;
+      if (missingPermission) return this.retryMissingPermission(ledger, entry, identity);
       return this.retry(ledger, entry, identity, "retryable");
     } catch {
       return this.retry(ledger, entry, identity, "retryable");
@@ -267,7 +299,20 @@ export class GatesStatusRuntime {
     return false;
   }
 
-  private async applyDecision(ledger: GatesLedger, entry: QueueEntry, config: CiConfig, decision: GatesDecision, fetch: PluginContext["http"]["fetch"], cycle: Map<string, CiAppAuth>): Promise<"done" | "retryable"> {
+  /**
+   * Missing `statuses: write` is a durable blocked state, not a dying
+   * retry: it retries at capped backoff forever (bounded by the queue
+   * cap) and never counts toward `maxAttempts`, so a later grant still
+   * publishes without needing another issue update.
+   */
+  private retryMissingPermission(ledger: GatesLedger, entry: QueueEntry, identity: { companyId: string; issueId: string }): boolean {
+    entry.missingPermissionAttempts = (entry.missingPermissionAttempts ?? 0) + 1;
+    entry.nextAttemptAt = this.now() + backoffMs(entry.missingPermissionAttempts);
+    this.audit(ledger, "decision", "missing_permission_retry", identity);
+    return false;
+  }
+
+  private async applyDecision(ledger: GatesLedger, entry: QueueEntry, config: CiConfig, decision: GatesDecision, fetch: PluginContext["http"]["fetch"], cycle: Map<string, CiAppAuth>): Promise<"done" | "retryable" | "retryable_missing_permission"> {
     const identity = { companyId: entry.companyId, issueId: entry.issueId, repo: decision.repo, sha: decision.sha, state: decision.state };
     if (!config.allowedRepos.includes(decision.repo)) {
       this.audit(ledger, "publish", "repo_refused", identity);
@@ -276,7 +321,26 @@ export class GatesStatusRuntime {
     }
     const key = `${decision.repo}:${decision.sha}`;
     const record = ledger.published[key];
-    if (record && record.state === decision.state) {
+    // Persisted watermark: a decision older than the last applied one for
+    // this SHA can never republish, on any replay or list order.
+    if (record?.watermarkDecidedAtMs !== undefined) {
+      const older = decision.decidedAtMs < record.watermarkDecidedAtMs
+        || (decision.decidedAtMs === record.watermarkDecidedAtMs
+          && record.watermarkInteractionId !== undefined
+          && decision.interactionId !== undefined
+          && decision.interactionId < record.watermarkInteractionId);
+      const alreadyApplied = decision.decidedAtMs === record.watermarkDecidedAtMs
+        && decision.interactionId === record.watermarkInteractionId;
+      if (older) {
+        this.audit(ledger, "publish", "stale_decision", identity);
+        return "done";
+      }
+      if (alreadyApplied && !record.shadowed && record.count > 0 && record.state === decision.state) {
+        this.audit(ledger, "publish", "deduped", identity);
+        return "done";
+      }
+    }
+    if (record && !record.shadowed && record.count > 0 && record.state === decision.state) {
       this.audit(ledger, "publish", "deduped", identity);
       return "done";
     }
@@ -285,14 +349,26 @@ export class GatesStatusRuntime {
       this.ctx.logger.warn("gates: status cap reached for SHA", { repo: decision.repo, sha: decision.sha });
       return "done";
     }
+    const watermark = {
+      watermarkDecidedAtMs: decision.decidedAtMs,
+      ...(decision.interactionId !== undefined ? { watermarkInteractionId: decision.interactionId } : {}),
+    };
     if (config.gatesStatusShadow) {
+      // Retain the authoritative shadow decision so flipping shadow off
+      // publishes it on the next event/sweep instead of losing it.
+      ledger.published[key] = {
+        repo: decision.repo, sha: decision.sha, state: decision.state,
+        count: record?.count ?? 0, lastPublishedAt: record?.lastPublishedAt ?? 0,
+        ...(record?.lastMissingPermissionAt !== undefined ? { lastMissingPermissionAt: record.lastMissingPermissionAt } : {}),
+        shadowed: true, lastShadowAt: this.now(), ...watermark,
+      };
       this.audit(ledger, "publish", "shadow", identity);
       this.ctx.logger.info("gates: shadow status", { context: GATES_CONTEXT, repo: decision.repo, prNumber: decision.prNumber, headSha: decision.sha, state: decision.state });
       return "done";
     }
     if (record?.lastMissingPermissionAt && this.now() - record.lastMissingPermissionAt < GATES_LIMITS.permissionCooldownMs) {
       this.audit(ledger, "publish", "missing_permission_cooldown", identity);
-      return "retryable";
+      return "retryable_missing_permission";
     }
     // Persist intent before any outbound write, mirroring the wake path:
     // a restart after the POST is deduped by the published record, never replayed.
@@ -309,14 +385,14 @@ export class GatesStatusRuntime {
         this.audit(ledger, "publish", "missing_permission", identity);
         this.ctx.logger.warn("gates: missing_permission", { repo: decision.repo, headSha: decision.sha, state: decision.state });
         await this.save(ledger);
-        return "retryable";
+        return "retryable_missing_permission";
       }
       this.audit(ledger, "publish", "publish_failed", identity);
       return "retryable";
     }
     ledger.published[key] = {
       repo: decision.repo, sha: decision.sha, state: decision.state,
-      count: (record?.count ?? 0) + 1, lastPublishedAt: this.now(),
+      count: (record?.count ?? 0) + 1, lastPublishedAt: this.now(), ...watermark,
     };
     this.audit(ledger, "publish", "published", identity);
     this.ctx.logger.info("gates: status published", { context: GATES_CONTEXT, repo: decision.repo, headSha: decision.sha, state: decision.state });
