@@ -21,7 +21,7 @@ interface Ledger {
   attempted: Record<string, number>;
   activityAfter: Record<string, number>;
   dispatchSequence: number;
-  heads: Record<string, { sha: string; at: number | null }>;
+  heads: Record<string, { sha: string; at: number | null; provenance?: "seeded" | "warmup" }>;
   dispositions: Record<string, number>;
   audits: Audit[];
   report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number };
@@ -224,11 +224,25 @@ export class CustodyRuntime {
                   // an epoch from arrival time; later genuine evidence is
                   // retried each tick below. A changed SHA (e.g. a force-push
                   // revert to an older head) became current now and must not
-                  // inherit stale evidence as its idle epoch.
+                  // inherit stale evidence as its idle epoch. Provenance is
+                  // recorded so a trusted numeric epoch (genuine "seeded"
+                  // evidence or an intentional "warmup") is never confused
+                  // with a legacy synthesized epoch below.
                   const at = head ? this.now() : await github.seedHead(pr);
-                  head = ledger.heads[ref] = { sha: pr.headSha, at };
-                } else if (head.at === null) {
+                  const provenance = head ? "warmup" as const : at === null ? undefined : "seeded" as const;
+                  head = ledger.heads[ref] = { sha: pr.headSha, at, ...(provenance ? { provenance } : {}) };
+                } else if (head.at === null || !head.provenance) {
+                  // Unproven heads (at=null, or a numeric epoch with no
+                  // provenance from a legacy ledger) are (re)seeded from
+                  // head-bound evidence every tick. A legacy numeric epoch
+                  // may be the old synthesized first-observation fallback
+                  // and cannot be trusted for idle; revalidating it here
+                  // adopts genuine evidence when it exists (including a
+                  // genuine epoch from an older release) and otherwise
+                  // downgrades it to UNKNOWN instead of letting it wake.
                   head.at = await github.seedHead(pr);
+                  if (head.at === null) delete head.provenance;
+                  else head.provenance = "seeded";
                 }
                 if (head.at === null) {
                   row.unknown = true;
