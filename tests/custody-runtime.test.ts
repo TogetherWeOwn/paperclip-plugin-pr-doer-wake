@@ -63,8 +63,11 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
   const seedHead = vi.spyOn(CustodyGithub.prototype, "seedHead").mockImplementation(async () => now);
   vi.spyOn(CustodyGithub.prototype, "closureTexts").mockResolvedValue([]);
   const runtime = new CustodyRuntime(ctx as unknown as PluginContext, () => now);
+  // Production captures the company from the host's onConfigChanged delivery;
+  // bind it here the same way so the tick can read config explicitly.
+  runtime.setCustodyCompanyId(COMPANY);
   const ledger = () => [...state.entries()].find(([key]) => key.includes("pr-custody-v1"))?.[1];
-  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => new CustodyRuntime(ctx as unknown as PluginContext, () => now) };
+  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => { const next = new CustodyRuntime(ctx as unknown as PluginContext, () => now); next.setCustodyCompanyId(COMPANY); return next; } };
 }
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); });
 

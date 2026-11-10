@@ -32,7 +32,16 @@ const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {},
 export class CustodyRuntime {
   private running = false;
   private caches = new Map<string, CiGithubCache>();
+  // Scheduled jobs run with no invocation company scope, so the company-less
+  // ctx.config.get() the host gate rejects is unusable here. The host delivers
+  // the stored company config via onConfigChanged; capture custodyCompanyId
+  // from that delivery and read config explicitly with it.
+  private custodyCompanyId: string | null = null;
   constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now) {}
+
+  setCustodyCompanyId(companyId: string | null): void {
+    this.custodyCompanyId = companyId && UUID.test(companyId) ? companyId.toLowerCase() : null;
+  }
 
   async poll(): Promise<void> {
     if (this.running) return;
@@ -42,7 +51,13 @@ export class CustodyRuntime {
   }
 
   private async tick(): Promise<void> {
-    const raw = await this.ctx.config.get();
+    // Fail closed without a captured company: never issue a company-less
+    // config.get, which the installed host rejects during scheduled jobs.
+    if (!this.custodyCompanyId) {
+      this.ctx.logger.info("pr-custody: no company config delivered; skipping tick");
+      return;
+    }
+    const raw = await this.ctx.config.get(this.custodyCompanyId);
     const config = parseCustodyConfig(raw);
     if (!config) return;
     const key = { scopeKind: "company" as const, scopeId: config.companyId, namespace: "pr-custody-v1", stateKey: `${config.org}:${config.dryRun ? "dry" : "live"}` };
