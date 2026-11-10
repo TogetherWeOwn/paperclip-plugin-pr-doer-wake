@@ -153,6 +153,38 @@ describe("evaluateReadiness", () => {
       .toMatchObject({ kind: "pending", missingSince: null, missingFailAt: null });
   });
 
+  it.each(["queued", "in_progress"])("defers missing-check grace while another observed suite is %s", (status) => {
+    const at = (time: string) => Date.parse(`2026-01-01T${time}:00Z`);
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }, { context: "lint", appId: 7 }],
+      runs: [run(1, { name: "lint" })],
+      suites: [
+        suite(1, { createdAt: at("09:59"), completedAt: at("10:00") }),
+        suite(2, { status, conclusion: null, createdAt: at("10:01"), completedAt: null }),
+      ],
+    });
+    const clock = { registeredAt: at("09:59"), now: at("11:01"), medianMs: 30 * 60_000 };
+    expect(evaluateReadiness(input, clock)).toMatchObject({
+      kind: "pending", missing: ["build [app 7]"], pending: [],
+      lastSuiteCompletedAt: at("10:00"), missingSince: null, missingFailAt: null,
+    });
+    input.suites[1] = suite(2, { createdAt: at("10:01"), completedAt: at("11:02") });
+    expect(evaluateReadiness(input, { ...clock, now: at("12:01") })).toMatchObject({
+      kind: "pending", lastSuiteCompletedAt: at("11:02"), missingSince: at("11:02"), missingFailAt: at("12:02"),
+    });
+    expect(evaluateReadiness(input, { ...clock, now: at("12:02") }).kind).toBe("fail");
+  });
+
+  it("does not start missing-check grace from a partial set of suite completion timestamps", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }],
+      suites: [suite(), suite(2, { completedAt: null })],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({
+      kind: "pending", lastSuiteCompletedAt: 5_000, missingSince: null, missingFailAt: null,
+    });
+  });
+
   it.each([false, true])("waits for missing-check grace despite an existing failure (has suites: %s)", (hasSuites) => {
     const input = snapshot({
       required: [{ context: "build", appId: 7 }, { context: "lint", appId: null }],
@@ -237,6 +269,26 @@ describe("CiGithub REST reads", () => {
     expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "fail", failed: ["legacy-101"] });
     expect(calls.every((call) => call.url.origin === "https://api.github.com")).toBe(true);
     expect(calls.some((call) => call.url.pathname.endsWith("/status"))).toBe(false);
+  });
+
+  it("accepts exactly 100 array-endpoint records followed by an empty second page without Link", async () => {
+    const required = Array.from({ length: 100 }, (_, i) => ({ context: `legacy-${i + 1}`, appId: null }));
+    const statuses = required.map(({ context }, i) => ({ id: i + 1, context, state: "success" }));
+    const { fetch, calls } = fixtures((url) => {
+      const firstPage = url.searchParams.get("page") === "1";
+      if (url.pathname.includes("rules/branches")) return response(firstPage ? required.map(({ context }) => ({
+        type: "required_status_checks", parameters: { required_status_checks: [{ context, integration_id: null }] },
+      })) : []);
+      if (url.pathname.endsWith("statuses")) return response(firstPage ? statuses : []);
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(actual.required).toEqual(required);
+    expect(actual.statuses).toEqual(statuses);
+    for (const endpoint of ["rules/branches", "statuses"]) {
+      const pages = calls.filter((call) => call.url.pathname.includes(endpoint));
+      expect(pages.map((call) => call.url.searchParams.get("page"))).toEqual(["1", "2"]);
+      expect(pages.every((call) => call.url.searchParams.get("per_page") === "100")).toBe(true);
+    }
   });
 
   it("paginates rules and treats Link only as a continuation signal, never as a fetch URL", async () => {

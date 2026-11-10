@@ -102,11 +102,11 @@ export class CiWakeRuntime {
     for (const [id, at] of Object.entries(ledger.hints)) if (now - at >= 60_000) delete ledger.hints[id];
   }
 
-  private async config(companyId: string): Promise<CiConfig> {
+  private async config(companyId: string, requireEnabled = true): Promise<CiConfig> {
     const raw = await this.ctx.config.get(companyId);
     if (validateCiConfig(raw).length) throw new Error("invalid_configuration");
     const config = parseCiConfig(raw);
-    if (!config.enabled) throw new Error("plugin_disabled");
+    if (requireEnabled && !config.enabled) throw new Error("plugin_disabled");
     return config;
   }
 
@@ -222,9 +222,11 @@ export class CiWakeRuntime {
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const wait of pending) {
       if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
-      wait.lastAttemptAt = this.now();
       try {
-        const config = await this.config(wait.companyId);
+        const config = await this.config(wait.companyId, false);
+        // Disabled polling still compacts above, but must not churn per-wait audit evidence.
+        if (!config.enabled) continue;
+        wait.lastAttemptAt = this.now();
         if (!config.allowedRepos.includes(wait.repo)) { wait.status = "retired"; wait.reason = "repo_revoked"; wait.finishedAt = this.now(); await this.save(ledger); continue; }
         const github = await this.client(wait.companyId, config, fetch);
         const pr = await github.pull(wait.repo, wait.prNumber);
@@ -238,7 +240,11 @@ export class CiWakeRuntime {
         const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs });
         if (verdict.kind === "pending") continue;
         const binding = await this.binding(wait, wait.companyId, wait.projectId);
-        if (binding.workspaceId !== wait.workspaceId || binding.branch !== wait.branch) throw new Error("binding_changed");
+        if (binding.workspaceId !== wait.workspaceId || binding.branch !== wait.branch) {
+          wait.status = "retired"; wait.reason = "binding_changed"; wait.finishedAt = this.now();
+          this.audit(ledger, "poll", "binding_changed", undefined, wait.waitId);
+          await this.save(ledger); continue;
+        }
         const freshConfig = await this.config(wait.companyId);
         if (!freshConfig.allowedRepos.includes(wait.repo) || freshConfig.dryRun !== config.dryRun) throw new Error("configuration_changed");
         const current = await github.pull(wait.repo, wait.prNumber);
@@ -329,7 +335,9 @@ export class CiWakeRuntime {
       for (const companyId of companies) {
         const config = await this.config(companyId);
         if (!config.webhooksEnabled || !config.webhookSecretRef || !config.allowedRepos.includes(repo)) continue;
-        if (payload.organization?.login?.toLowerCase() !== repo.split("/")[0]) continue;
+        const owner = payload.repository?.owner?.login;
+        if (typeof owner !== "string" || owner.toLowerCase() !== repo.split("/")[0]) continue;
+        if (payload.organization !== undefined && (typeof payload.organization?.login !== "string" || payload.organization.login.toLowerCase() !== owner.toLowerCase())) continue;
         if (this.now() - this.webhookBudget.since >= 60_000) this.webhookBudget = { since: this.now(), used: 0 };
         if (++this.webhookBudget.used > 6) throw new Error("webhook_verification_budget");
         const secret = await this.ctx.secrets.resolve(config.webhookSecretRef, { companyId, configPath: "webhookSecretRef" });

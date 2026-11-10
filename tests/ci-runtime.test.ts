@@ -159,7 +159,7 @@ function webhook(options: {
   signature?: string | null; event?: string; delivery?: string; endpointKey?: string;
 } = {}): PluginWebhookInput {
   const rawBody = options.rawBody ?? JSON.stringify({
-    action: "completed", organization: { login: "Acme" }, repository: { full_name: "Acme/Widget" },
+    action: "completed", organization: { login: "Acme" }, repository: { full_name: "Acme/Widget", owner: { login: "Acme" } },
     check_suite: { head_sha: HEAD, conclusion: "success", pull_requests: [] }, ...options.payload,
   });
   const headers: Record<string, string> = {
@@ -487,7 +487,29 @@ describe("CI runtime polling and durable wake outcomes", () => {
     if (change === "branch") h.workspace.branchName = "feature/moved";
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
-    expect(h.ledger().waits[0]?.status).toBe("open");
+    expect(h.ledger().waits[0]?.status).toBe(change === "workspace" || change === "branch" ? "retired" : "open");
+    if (change === "workspace" || change === "branch") {
+      expect(h.ledger().waits[0]).toMatchObject({ reason: "binding_changed", finishedAt: START });
+      expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "poll", outcome: "binding_changed" });
+      const attempts = github.pull.mock.calls.length;
+      await h.runtime.poll();
+      expect(github.pull).toHaveBeenCalledTimes(attempts);
+    }
+  });
+
+  it.each(["issue", "workspace"] as const)("keeps the wait retryable after a transient %s read failure", async (target) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    const read = target === "issue" ? h.issueGet : h.workspaceGet;
+    read.mockRejectedValueOnce(new Error("temporary host read failure"));
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open" });
+    expect(h.ledger().waits[0]?.finishedAt).toBeUndefined();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
   it("resolves fresh credentials per operation and retains only a credential-scoped token-free cache", async () => {
@@ -890,6 +912,39 @@ describe("signed check_suite hints", () => {
     expect(h.ledger().deliveries[`${COMPANY}:${DELIVERY}`]).toBe(START);
   });
 
+  it("accepts a signed user-owned repository hint without an organization field", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.webhook(webhook({ payload: { organization: undefined } }));
+    expect(h.resolveSecret).toHaveBeenCalledWith(WEBHOOK_REF, { companyId: COMPANY, configPath: "webhookSecretRef" });
+    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main");
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, null, 42, "attacker"])("refuses a signed hint with a missing or mismatched repository owner (%j)", async (owner) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    h.resolveSecret.mockClear();
+    github.pull.mockClear();
+    await expect(h.runtime.webhook(webhook({ payload: {
+      organization: undefined, repository: { full_name: "Acme/Widget", owner: { login: owner } },
+    } }))).rejects.toThrow("webhook_signature_refused");
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().deliveries).toEqual({});
+  });
+
+  it("still verifies raw-body HMAC for a user-owned repository", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.pull.mockClear();
+    await expect(h.runtime.webhook(webhook({ payload: { organization: undefined }, signature: `sha256=${"0".repeat(64)}` }))).rejects.toThrow("webhook_signature_refused");
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().deliveries).toEqual({});
+  });
+
   it.each([
     ["wrong", `sha256=${"0".repeat(64)}`], ["missing", null],
     ["sha1", `sha1=${"0".repeat(40)}`],
@@ -1085,6 +1140,38 @@ describe("CI runtime bounded retention and work quotas", () => {
     h.advance(1);
     await h.runtime.poll();
     expect(h.ledger().waits).toEqual([]);
+  });
+
+  it("preserves audit evidence while disabled, still recovering, expiring and compacting waits", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const ledger = h.ledger();
+    const original = ledger.waits[0]!;
+    ledger.waits = Array.from({ length: LIMITS.active }, (_, index) => ({ ...original, waitId: `active-${index}`, prNumber: 100 + index }));
+    ledger.waits.push({ ...original, waitId: "interrupted", status: "waking" });
+    ledger.waits.push({ ...original, waitId: "old", status: "woken", finishedAt: START - LIMITS.retentionMs });
+    ledger.audits = Array.from({ length: LIMITS.audit }, (_, index) => ({ at: START, operation: "wake", outcome: index % 2 ? "woken" : "unconfirmed" }));
+    h.seed(ledger);
+    h.rawConfig.enabled = false;
+    h.resolveSecret.mockClear();
+    github.pull.mockClear();
+    h.set.mockClear();
+    for (let tick = 0; tick < 3; tick += 1) {
+      await h.runtime.poll();
+      h.advance(4 * 60_000);
+    }
+    expect(h.ledger().audits).toEqual(ledger.audits);
+    expect(h.ledger().waits.find((wait) => wait.waitId === "interrupted")?.status).toBe("unconfirmed");
+    expect(h.ledger().waits.some((wait) => wait.waitId === "old")).toBe(false);
+    expect(h.ledger().waits.filter((wait) => wait.status === "open")).toHaveLength(LIMITS.active);
+    expect(h.set).toHaveBeenCalledTimes(6);
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    h.advance(LIMITS.waitMs);
+    await h.runtime.poll();
+    expect(h.ledger().waits.filter((wait) => wait.status === "open")).toEqual([]);
+    expect(h.ledger().audits).toEqual(ledger.audits);
   });
 
   it("bounds the audit log while preserving the latest refusal", async () => {

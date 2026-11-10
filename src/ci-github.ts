@@ -460,7 +460,9 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   const suites = snapshot.suites;
   const completions = snapshot.suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
   const lastSuiteCompletedAt = completions.length ? Math.max(...completions) : null;
-  const missingSince = snapshot.suites.length === 0 ? timing.registeredAt : lastSuiteCompletedAt;
+  // A partial set of completions cannot start grace while another suite may still register checks.
+  const missingSince = suites.length === 0 ? timing.registeredAt
+    : completions.length === suites.length ? lastSuiteCompletedAt : null;
   const missingFailAt = missingSince === null ? null : missingSince + 2 * timing.medianMs;
   const failed: string[] = [];
   const missing: string[] = [];

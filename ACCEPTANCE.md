@@ -32,8 +32,8 @@ This matrix indexes tests to be executed in Actions; it is not a claim that ever
 
 - Dependency preparation: `npm ci --ignore-scripts` completed; this does **not** prove tests/builds pass.
 - Full local suite / local CI mirror: **not run**, intentionally; GitHub Actions is CI of record.
-- Typecheck, Vitest, package build: **pending exact-head Actions run/job links**.
-- Fresh-context diff review and finding disposition: **pending**.
+- Reviewed baseline `72b5efe4b5a2ab84128255b7f57c69d8576a4979`: [Actions check job](https://github.com/TogetherWeOwn/paperclip-plugin-pr-doer-wake/actions/runs/42759532185/job/129641696961) passed typecheck, 220 tests across three files, and package build. [CodeQL](https://github.com/TogetherWeOwn/paperclip-plugin-pr-doer-wake/actions/runs/42759526548) and [PR standards](https://github.com/TogetherWeOwn/paperclip-plugin-pr-doer-wake/actions/runs/42759532176/job/129641696723) also passed at that SHA. This evidence does **not** cover later repair commits; those require fresh exact-head Actions evidence on [PR #6](https://github.com/TogetherWeOwn/paperclip-plugin-pr-doer-wake/pull/6).
+- One fresh-context diff review completed with seven findings, repaired together in `72b5efe` and statically accepted by that reviewer. Subsequent automated and native review requested a delta repair: conservative missing-check grace, user-owned webhook hints, obsolete-binding retirement, disabled-poll audit preservation, and this evidence reconciliation. Regression fixtures were written before behavior fixes; no red-before execution is claimed. Existing finding threads carry the fixed/rejected/duplicate dispositions; their acceptance and fresh exact-head checks remain merge gates. No native approval or host qualification is inferred.
 - Native Security acceptance: **pending**, must name exact source/artifact/configuration/permission envelope.
 - Native QA verdict: **pending**, must use exact-head Actions and applicable review gates.
 
