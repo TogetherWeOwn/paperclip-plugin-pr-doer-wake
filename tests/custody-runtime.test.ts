@@ -147,8 +147,79 @@ describe("custody native effects", () => {
       if (Object.values(value.receipts).some((r: any) => r.status === "attempting")) throw new Error("storage unavailable");
       return original(key, value);
     });
-    await expect(h.runtime.poll()).rejects.toThrow("storage unavailable");
+    await h.runtime.poll();
+    await h.restart().poll();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "pending" })]);
+  });
+  it.each(["create", "wake"])("restores a never-started %s after intent persistence crosses the deadline", async (phase) => {
+    const h = fixture({ cards: [card({ status: phase === "create" ? "done" : "in_progress" })] });
+    if (phase === "create") h.activity.mockResolvedValue(NOW);
+    const original = h.ctx.state.set.getMockImplementation()!;
+    let delayed = false;
+    h.ctx.state.set.mockImplementation(async (key, value) => {
+      await original(key, value);
+      if (!delayed && Object.values(value.receipts ?? {}).some((r: any) => r.status === "attempting" && r.phase === phase)) {
+        delayed = true;
+        h.advance(240_000);
+      }
+    });
+    await h.runtime.poll();
+    expect(phase === "create" ? h.ctx.issues.create : h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "pending" })]);
+    await h.restart().poll();
+    await h.restart().poll();
+    expect(h.ctx.issues.create).toHaveBeenCalledTimes(phase === "create" ? 1 : 0);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "woken" })]);
+  });
+  it.each(["create", "wake"])("recovers a one-shot %s intent-write failure without losing delivery", async (phase) => {
+    const h = fixture({ cards: [card({ status: phase === "create" ? "done" : "in_progress" })] });
+    if (phase === "create") h.activity.mockResolvedValue(NOW);
+    const original = h.ctx.state.set.getMockImplementation()!;
+    let failed = false;
+    h.ctx.state.set.mockImplementation(async (key, value) => {
+      if (!failed && Object.values(value.receipts ?? {}).some((r: any) => r.status === "attempting" && r.phase === phase)) {
+        failed = true;
+        throw new Error("one-shot storage failure");
+      }
+      return original(key, value);
+    });
+    await h.runtime.poll();
+    expect(phase === "create" ? h.ctx.issues.create : h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    await h.restart().poll();
+    await h.restart().poll();
+    expect(h.ctx.issues.create).toHaveBeenCalledTimes(phase === "create" ? 1 : 0);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    new Error("Company cannot start work while completed runs await accounting."),
+    new Error("Agent cannot start work while completed runs await accounting."),
+    new Error("Project cannot start work while completed runs await accounting."),
+    new Error("New work must wait while a native run recovers its unfinished accounting."),
+    new Error("worker RPC host is not running"),
+    Object.assign(new Error("Plugin is held for idle sleep"), { code: -32000 }),
+  ])("retries an explicit pre-enqueue refusal: %s", async (error) => {
+    const h = fixture();
+    h.ctx.issues.requestWakeup.mockRejectedValueOnce(error);
+    await h.runtime.poll();
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "pending" })]);
+    await h.restart().poll();
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "woken" })]);
+  });
+  it.each([
+    new Error("Plugin is held for idle sleep"),
+    Object.assign(new Error("reply lost"), { code: -32000 }),
+    new Error("Company cannot start work while completed runs await accounting. reply lost"),
+  ])("does not broaden explicit refusal classification: %s", async (error) => {
+    const h = fixture();
+    h.ctx.issues.requestWakeup.mockRejectedValue(error);
+    await h.runtime.poll();
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "unconfirmed" })]);
   });
   it("does not repeat creation after its reply is lost", async () => {
     const h = fixture({ cards: [card({ status: "done" })] });
@@ -340,6 +411,77 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.http.fetch.mock.calls.length).toBeLessThanOrEqual(1_200);
     expect(h.ledger().report.complete).toBe(false);
   });
+  it("fairly evaluates a repository's activity tail across restarts within the request cap", async () => {
+    const prs = Array.from({ length: 410 }, (_, i) => pull({ number: i + 1 }));
+    const h = fixture({ open: prs });
+    const evaluated = new Set<number>();
+    let time = NOW;
+    h.activity.mockImplementation(async function (this: any, pr, observedAt) {
+      for (let i = 0; i < 3; i++) await this.fetch("https://api.github.com/graphql", { method: "POST" });
+      evaluated.add(pr.number);
+      return pr.number === 410 ? observedAt! : time;
+    });
+    vi.mocked(CustodyGithub.prototype.pull).mockImplementation(async function (this: any, _repo, number) {
+      await this.fetch(`https://api.github.com/repos/example/project/pulls/${number}`);
+      return { ...prs.find((p) => p.number === number)!, baseBranch: "main", draft: false, mergeable: true };
+    });
+    for (let tick = 0; tick < 4; tick++) {
+      h.ctx.http.fetch.mockClear();
+      await h.restart().poll();
+      expect(h.ctx.http.fetch.mock.calls.length).toBeLessThanOrEqual(1_200);
+      expect(h.ledger().report.effects).toBeLessThanOrEqual(15);
+      if (tick === 2) {
+        expect(evaluated.size).toBe(410);
+        expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+      }
+      h.advance(4 * DAY);
+      time += 4 * DAY;
+    }
+    expect(h.activity.mock.calls.some(([pr, at]) => pr.number === 410 && at === NOW + 4 * DAY)).toBe(true);
+    expect(h.ctx.issues.requestWakeup.mock.calls.some((args) => (args as any)[2].idempotencyKey === `example/project#410|idle|${NOW + 4 * DAY}`)).toBe(true);
+    expect(h.ledger().heads["example/project#1"].at).toBe(NOW);
+  });
+  it("fairly retries deferred effects alongside a newer runnable trigger and daily summary", async () => {
+    const prs = Array.from({ length: 16 }, (_, i) => pull({ number: i + 1 }));
+    prs.push(pull({ number: 100, authorIsBot: true }));
+    const h = fixture({ open: prs });
+    h.activity.mockImplementation(async (pr) => NOW - (pr.number <= 15 ? 9 : 8) * DAY);
+    h.ctx.issues.requestWakeup.mockImplementation(async (...args: any[]) => ({ queued: args[2].idempotencyKey.startsWith("pr-custody-summary|") || args[2].idempotencyKey.startsWith("example/project#16|"), runId: ISSUE }));
+    for (let tick = 0; tick < 3; tick++) {
+      await h.restart().poll();
+      expect(h.ledger().report.effects).toBeLessThanOrEqual(15);
+    }
+    const receipts = Object.entries(h.ledger().receipts);
+    expect(receipts.find(([key]) => key.startsWith("example/project#16|"))?.[1]).toMatchObject({ status: "woken" });
+    expect(h.ledger().receipts["pr-custody-summary|2026-10-20"]).toMatchObject({ status: "woken" });
+    expect(h.ctx.issues.requestWakeup.mock.calls.filter((args) => (args as any)[2].idempotencyKey.startsWith("example/project#16|"))).toHaveLength(1);
+    expect(h.ctx.issues.create).toHaveBeenCalledTimes(1);
+    expect(receipts.filter(([key, value]) => key.startsWith("example/project#") && (value as any).status === "pending")).toHaveLength(15);
+  });
+  it("keeps mapped delivery independent of an unavailable summary archive", async () => {
+    const h = fixture({ open: [pull(), pull({ number: 100, authorIsBot: true })] });
+    const get = h.ctx.state.get.getMockImplementation()!;
+    const { createHash } = await import("node:crypto");
+    const summaryHash = createHash("sha256").update("pr-custody-summary|2026-10-20").digest("hex");
+    h.ctx.state.get.mockImplementation(async (key) => {
+      if (key.stateKey.endsWith(`:receipt:${summaryHash}`)) throw new Error("summary archive unavailable");
+      return get(key);
+    });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ledger().report.unknown).toContain("summary_unknown");
+  });
+  it("preserves clocks and receipts when adding continuation fields to an older ledger", async () => {
+    const h = fixture();
+    await h.runtime.poll();
+    delete h.ledger().activityAfter;
+    delete h.ledger().dispatchSequence;
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW);
+    expect(h.ledger().activityAfter["example/project"]).toBe(42);
+  });
   it("does not refresh an unchanged description disposition after an unrelated card edit", async () => {
     const owner = card({ status: "done", texts: [{ body: "PR disposition: example/project#42 finish; next actor contributor; revisit event", at: NOW - 10 * DAY, ownership: true }] });
     const h = fixture({ cards: [owner] });
@@ -447,7 +589,7 @@ describe("coverage, summary and cursor controls", () => {
       "example/project#42": { sha: "a".repeat(40), at: NOW },
       "example/project#43": { sha: "a".repeat(40), at: NOW + DAY },
     });
-    expect(h.activity).toHaveBeenLastCalledWith(prs[1], NOW + DAY);
+    expect(h.activity).toHaveBeenCalledWith(prs[1], NOW + DAY);
   });
   it.each([false, true])("compacts settled history without losing clocks or replaying effects (uncertain wake: %s)", async (uncertain) => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
@@ -476,7 +618,7 @@ describe("coverage, summary and cursor controls", () => {
     await h.restart().poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
     // An unrelated edit must not refresh the archived directive and suppress the old idle trigger.
-    expect(h.ledger().report.rows[0].triggers).toContain(`example/project#42|idle|${NOW - 8 * DAY}`);
+    expect(h.ledger().report.rows.find((row: any) => row.pr === "example/project#42").triggers).toContain(`example/project#42|idle|${NOW - 8 * DAY}`);
     const get = h.ctx.state.get.getMockImplementation()!;
     h.ctx.state.get.mockImplementation(async (key) => {
       if (key.stateKey.includes(":receipt:")) throw new Error("archive unavailable");

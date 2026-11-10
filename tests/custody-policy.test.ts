@@ -70,6 +70,21 @@ describe("PR-specific trigger policy", () => {
     expect(trigger(card({ texts: [directive("defer", "2026-10-19T12:00:00Z", NOW - 8 * DAY)] }))).toHaveLength(1);
     expect(trigger(card({ texts: [directive("defer", "2026-10-21T12:00:00Z", NOW - 9 * DAY), directive("rework", "event", NOW - 8 * DAY)] }))).toHaveLength(1);
   });
+  it.each([
+    "2027-02-30", "2027-02-29", "2027-04-31", "2027-13-01", "2027-00-01", "2027-03-00",
+    "2027-02-30T12:00:00Z", "2027-03-01T24:00:00Z", "2027-03-01T12:60:00Z", "2027-03-01T12:00:60Z",
+  ])("does not let an invalid revisit establish a future deferral: %s", (revisit) => {
+    const now = Date.parse("2027-03-01T00:00:00Z");
+    const owner = card({ texts: [directive("defer", revisit, now - 8 * DAY)] });
+    expect(latestDisposition(owner, pull())?.revisit).toBeNull();
+    expect(custodyTriggers(pull(), owner, now - 8 * DAY, null, now).map((t) => t.kind)).toEqual(["idle"]);
+  });
+  it.each(["2028-02-29", "2028-02-29T12:34:56Z", "2027-03-02", "2027-03-02T00:00:00Z"])("honors a valid calendar revisit: %s", (revisit) => {
+    const now = Date.parse("2027-03-01T00:00:00Z");
+    const owner = card({ texts: [directive("defer", revisit, now - 8 * DAY)] });
+    expect(latestDisposition(owner, pull())?.revisit).toBe(Date.parse(revisit));
+    expect(custodyTriggers(pull(), owner, now - 8 * DAY, null, now)).toEqual([]);
+  });
   it("does not apply another PR's disposition to this PR", () => {
     expect(latestDisposition(card({ texts: [{ ...directive("defer", "2026-10-21T12:00:00Z", NOW), body: directive("defer", "2026-10-21T12:00:00Z", NOW).body.replace("#42", "#43") }] }), pull())).toBeNull();
   });

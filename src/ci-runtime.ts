@@ -2,6 +2,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
 import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, type CiConfig, type Registration } from "./ci-config.js";
 import { CiGithub, CiGithubCache, evaluateReadiness } from "./ci-github.js";
+import { retryableBeforeQueue } from "./native-wake.js";
 
 export const LIMITS = { active: 20, retained: 2_000, audit: 1_000, deliveries: 2_000, requestsPerTick: 240, wakePerTick: 20, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 180_000 } as const;
 const KEY = { scopeKind: "instance" as const, namespace: "ci-wake-v1", stateKey: "ledger" };
@@ -44,15 +45,6 @@ function header(input: PluginWebhookInput, name: string): string | undefined {
   const key = Object.keys(input.headers).find((k) => k.toLowerCase() === name);
   const value = key ? input.headers[key] : undefined;
   return typeof value === "string" ? value : undefined;
-}
-
-/** These stock-host guards run before enqueue; all other exceptions may be post-dispatch. */
-function retryableBeforeQueue(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return /^(Company|Agent|Project) cannot start work while completed runs await accounting\.$/.test(error.message)
-    || error.message === "New work must wait while a native run recovers its unfinished accounting."
-    || error.message === "worker RPC host is not running"
-    || ((error as { code?: unknown }).code === -32000 && error.message === "Plugin is held for idle sleep");
 }
 
 /** One host-managed worker owns this ledger. All entrypoints share its lock, including overlapping job callbacks. */

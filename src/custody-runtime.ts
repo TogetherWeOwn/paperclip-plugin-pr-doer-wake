@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { retryableBeforeQueue } from "./native-wake.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { CiGithubCache } from "./ci-github.js";
 import { workspaceRepo, UUID } from "./ci-config.js";
@@ -8,7 +9,7 @@ import { loadCustodyCards, type CustodyCard } from "./custody-reader.js";
 import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prReference, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
 
 export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000 } as const;
-type Receipt = { at: number; status: "pending" | "attempting" | "woken" | "unconfirmed" | "cleared"; phase?: "create" | "wake"; issueId?: string; childId?: string };
+type Receipt = { at: number; turn?: number; status: "pending" | "attempting" | "woken" | "unconfirmed" | "cleared"; phase?: "create" | "wake"; issueId?: string; childId?: string };
 function delivered(receipt: Receipt): boolean { return receipt.status === "woken"; }
 interface InventoryRow { pr: string; state: string; cardId: string | null; mapping: string; triggers: string[]; unknown?: boolean }
 interface Audit { at: number; operation: string; outcome: string; key?: string }
@@ -17,12 +18,14 @@ interface Ledger {
   receipts: Record<string, Receipt>;
   cursors: Record<string, number>;
   attempted: Record<string, number>;
+  activityAfter: Record<string, number>;
+  dispatchSequence: number;
   heads: Record<string, { sha: string; at: number }>;
   dispositions: Record<string, number>;
   audits: Audit[];
   report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number };
 }
-const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {}, attempted: {}, heads: {}, dispositions: {}, audits: [], report: { at: now, complete: false, rows: [], unknown: [], effects: 0 } });
+const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions: {}, audits: [], report: { at: now, complete: false, rows: [], unknown: [], effects: 0 } });
 
 /** One host-managed worker; coalesce overlapping hourly/manual runs. No registration or LLM tool surface. */
 export class CustodyRuntime {
@@ -45,6 +48,8 @@ export class CustodyRuntime {
     const stored = await this.ctx.state.get(key) as Ledger | null;
     if (stored && (stored.version !== 1 || !stored.receipts || !stored.cursors || !stored.attempted || !stored.heads || !stored.dispositions || !Array.isArray(stored.audits))) throw new Error("invalid_custody_ledger");
     const ledger = stored ?? empty(this.now());
+    ledger.activityAfter ??= {};
+    ledger.dispatchSequence ??= 0;
     for (const receipt of Object.values(ledger.receipts)) if (receipt.status === "attempting") receipt.status = "unconfirmed";
     ledger.report = { at: this.now(), complete: false, rows: [], unknown: [], effects: 0 };
     const started = this.now();
@@ -60,12 +65,13 @@ export class CustodyRuntime {
     };
     const save = () => this.ctx.state.set(key, ledger);
     // Each trigger spends one slot at its first native mutation, including ambiguous attempts.
-    const effectSlot = () => {
+    const effectSlot = (receipt: Receipt) => {
       let spent = false;
       return () => {
         if (spent) return;
         if (ledger.report.effects >= CUSTODY_LIMITS.effects) throw new Error("effect_budget");
         ledger.report.effects++;
+        receipt.turn = ++ledger.dispatchSequence;
         spent = true;
       };
     };
@@ -139,6 +145,7 @@ export class CustodyRuntime {
       }, token, { now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100 });
       const repos = await github.repositories(config.org);
       const monitored = new Set(repos);
+      for (const repo of Object.keys(ledger.activityAfter)) if (!monitored.has(repo)) delete ledger.activityAfter[repo];
       for (const ref of Object.keys(ledger.heads)) if (!monitored.has(ref.split("#")[0]!)) delete ledger.heads[ref];
       const summaries = new Set<string>();
       const pending: Array<{ pr: CustodyPull; card: CustodyCard; trigger: Trigger; repo: string }> = [];
@@ -159,7 +166,11 @@ export class CustodyRuntime {
           const active = new Set(open.map(prReference));
           for (const ref of Object.keys(ledger.heads)) if (ref.startsWith(`${repo}#`) && !active.has(ref)) delete ledger.heads[ref];
           let complete = true;
-          for (const pr of [...open, ...closed]) {
+          // Rotate expensive evidence reads independently of REST's stable updated-descending order.
+          const ordered = [...open, ...closed].sort((a, b) => a.number - b.number);
+          const next = ordered.findIndex((pr) => pr.number > (ledger.activityAfter[repo] ?? 0));
+          const start = next < 0 ? 0 : next;
+          for (const pr of [...ordered.slice(start), ...ordered.slice(0, start)]) {
             if (ledger.report.rows.length >= CUSTODY_LIMITS.prs) throw new Error("custody_inventory_capacity");
             const mapping = mapCustodyCard(pr, cards, registrations, reposByProject, config.companyId);
             const row: InventoryRow = { pr: prReference(pr), state: pr.state, cardId: mapping.card?.id ?? null, mapping: mapping.source, triggers: [] };
@@ -176,6 +187,7 @@ export class CustodyRuntime {
             let closure: string[] | null = null;
             try {
               if (!inventoryAvailable()) throw new Error("inventory_budget");
+              ledger.activityAfter[repo] = pr.number;
               if (pr.state === "open") {
                 const ref = prReference(pr);
                 let head = ledger.heads[ref];
@@ -197,10 +209,50 @@ export class CustodyRuntime {
       // Persist discovery clocks/removals as one batch before any effect can depend on them.
       await save();
       dispatching = true;
-      // Oldest first, across repositories. No cursor advances past an undispatched closure.
-      for (const item of pending.sort((a, b) => a.trigger.at - b.trigger.at || a.trigger.key.localeCompare(b.trigger.key))) {
-        const { pr, card, trigger, repo } = item;
-        const spend = effectSlot();
+      const dailyKey = `pr-custody-summary|${new Date(this.now()).toISOString().slice(0, 10)}`;
+      let summaryReceipt = ledger.receipts[dailyKey] ?? null;
+      let summaryReadable = true;
+      if (summaries.size && !summaryReceipt) {
+        try { summaryReceipt = await archived("receipt", dailyKey) as Receipt | null; }
+        catch { summaryReadable = false; }
+      }
+      if (summaries.size && summaryReadable && !summaryReceipt && Object.keys(ledger.receipts).length < CUSTODY_LIMITS.receipts) summaryReceipt = ledger.receipts[dailyKey] = { at: this.now(), status: "pending" };
+      const dispatchSummary = async () => {
+        const receipt = summaryReceipt;
+        if (!receipt) { unknown(summaryReadable ? "receipt_capacity" : "summary_unknown"); holdSummaryClosures(); }
+        else if (config.dryRun) {
+          if (receipt.status === "pending") {
+            audit("summary", "would_create", dailyKey);
+            receipt.status = "cleared";
+            await save();
+          }
+        }
+        else if (ledger.report.effects >= CUSTODY_LIMITS.effects) { unknown("effect_budget"); holdSummaryClosures(); }
+        else try {
+          const spend = effectSlot(receipt);
+          await this.confirmConfig(config, guard);
+          const lines = new Set([...summaries].map((s) => `- ${s}`));
+          if (receipt.childId) {
+            guard();
+            const previous = await this.ctx.issues.documents.get(receipt.childId, "pr-custody", config.companyId);
+            for (const line of previous?.body.split("\n") ?? []) if (line.startsWith("- ")) lines.add(line);
+          }
+          const body = `# PR custody: unmapped and bot inventory\n\nNo ownership inferred; no automatic close or reopen.\n\n${[...lines].sort().join("\n")}\n`;
+          if (body.length > 250_000) throw new Error("summary_capacity");
+          const target = await this.child(config, dailyKey, "PR custody: daily unmapped and bot inventory", body, null, guard, audit, save, receipt, spend);
+          guard();
+          spend();
+          await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "Daily PR custody inventory", format: "markdown", body });
+          if (receipt.status === "pending") await this.wake(config, target, config.summaryAgentId, dailyKey, receipt, guard, audit, save);
+          if (!delivered(receipt)) { unknown("summary_deferred_or_unconfirmed"); holdSummaryClosures(); }
+        } catch { unknown("summary_unknown"); holdSummaryClosures(); }
+      };
+      // Least recently effect-admitted first, then oldest. Summaries share the same fair queue.
+      const queue: Array<{ item?: typeof pending[number]; key: string; at: number; turn: number }> = pending.map((item) => ({ item, key: item.trigger.key, at: item.trigger.at, turn: ledger.receipts[item.trigger.key]?.turn ?? 0 }));
+      if (summaries.size) queue.push({ key: dailyKey, at: summaryReceipt?.at ?? this.now(), turn: summaryReceipt?.turn ?? 0 });
+      for (const entry of queue.sort((a, b) => a.turn - b.turn || a.at - b.at || a.key.localeCompare(b.key))) {
+        if (!entry.item) { await dispatchSummary(); continue; }
+        const { pr, card, trigger, repo } = entry.item;
         let receipt = ledger.receipts[trigger.key];
         if (!receipt) {
           try { if (await archived("receipt", trigger.key)) continue; }
@@ -209,6 +261,7 @@ export class CustodyRuntime {
           receipt = ledger.receipts[trigger.key] = { at: this.now(), status: "pending", issueId: card.id };
           await save();
         }
+        const spend = effectSlot(receipt);
         // A fresh disposition acknowledges a terminal trigger; closed rationale remains mandatory on both sides.
         if (trigger.kind === "terminal" && (latestDisposition(card, pr)?.at ?? 0) > receipt.at) receipt.status = "cleared";
         if (receipt.status === "unconfirmed" && receipt.phase === "create") {
@@ -251,38 +304,6 @@ export class CustodyRuntime {
           await this.wake(config, target, card.assigneeAgentId ?? config.summaryAgentId, trigger.key, receipt, guard, audit, save);
           if (!delivered(receipt)) { holdClosure(repo, trigger); unknown(prReference(pr)); }
         } catch { holdClosure(repo, trigger); unknown(prReference(pr)); audit("dispatch", "unknown", trigger.key); }
-      }
-      if (summaries.size) {
-        const dailyKey = `pr-custody-summary|${new Date(this.now()).toISOString().slice(0, 10)}`;
-        let receipt = ledger.receipts[dailyKey] ?? await archived("receipt", dailyKey) as Receipt | null;
-        if (!receipt && Object.keys(ledger.receipts).length < CUSTODY_LIMITS.receipts) receipt = ledger.receipts[dailyKey] = { at: this.now(), status: "pending" };
-        if (!receipt) { unknown("receipt_capacity"); holdSummaryClosures(); }
-        else if (config.dryRun) {
-          if (receipt.status === "pending") {
-            audit("summary", "would_create", dailyKey);
-            receipt.status = "cleared";
-            await save();
-          }
-        }
-        else if (ledger.report.effects >= CUSTODY_LIMITS.effects) { unknown("effect_budget"); holdSummaryClosures(); }
-        else try {
-          const spend = effectSlot();
-          await this.confirmConfig(config, guard);
-          const lines = new Set([...summaries].map((s) => `- ${s}`));
-          if (receipt.childId) {
-            guard();
-            const previous = await this.ctx.issues.documents.get(receipt.childId, "pr-custody", config.companyId);
-            for (const line of previous?.body.split("\n") ?? []) if (line.startsWith("- ")) lines.add(line);
-          }
-          const body = `# PR custody: unmapped and bot inventory\n\nNo ownership inferred; no automatic close or reopen.\n\n${[...lines].sort().join("\n")}\n`;
-          if (body.length > 250_000) throw new Error("summary_capacity");
-          const target = await this.child(config, dailyKey, "PR custody: daily unmapped and bot inventory", body, null, guard, audit, save, receipt, spend);
-          guard();
-          spend();
-          await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "Daily PR custody inventory", format: "markdown", body });
-          if (receipt.status === "pending") await this.wake(config, target, config.summaryAgentId, dailyKey, receipt, guard, audit, save);
-          if (!delivered(receipt)) { unknown("summary_deferred_or_unconfirmed"); holdSummaryClosures(); }
-        } catch { unknown("summary_unknown"); holdSummaryClosures(); }
       }
       for (const [repo, until] of scanned) ledger.cursors[repo] = until;
       ledger.report.complete = ledger.report.unknown.length === 0;
@@ -342,8 +363,8 @@ export class CustodyRuntime {
     audit("create", "intent", originId);
     receipt.phase = "create";
     receipt.status = "attempting";
-    await save();
-    guard();
+    try { await save(); guard(); }
+    catch (error) { receipt.status = "pending"; throw error; }
     const created = await this.ctx.issues.create({ companyId: config.companyId, ...(card ? { parentId: card.id } : {}), title, description: body.slice(0, 16_000), status: "todo", priority: "medium", assigneeAgentId: card?.assigneeAgentId ?? config.summaryAgentId, originKind: CUSTODY_ORIGIN, originId });
     if (!created || created.companyId !== config.companyId || !UUID.test(created.id) || created.originId !== originId || created.originKind !== CUSTODY_ORIGIN) throw new Error("invalid_created_card");
     receipt.childId = created.id;
@@ -364,15 +385,15 @@ export class CustodyRuntime {
     receipt.phase = "wake";
     receipt.status = "attempting";
     audit("wake", "intent", effectKey);
-    await save();
-    guard();
+    try { await save(); guard(); }
+    catch (error) { receipt.status = "pending"; throw error; }
     try {
       const result = await this.ctx.issues.requestWakeup(target, config.companyId, { reason: "pr_disposition_due", contextSource: "plugin.pr-custody", idempotencyKey: effectKey });
       receipt.status = result.queued ? "woken" : "pending";
       audit("wake", result.queued ? "woken" : "host_deferred", effectKey);
-    } catch {
-      receipt.status = "unconfirmed";
-      audit("wake", "unconfirmed", effectKey);
+    } catch (error) {
+      receipt.status = retryableBeforeQueue(error) ? "pending" : "unconfirmed";
+      audit("wake", receipt.status === "pending" ? "host_deferred" : "unconfirmed", effectKey);
     }
     await save();
   }

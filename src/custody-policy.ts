@@ -52,7 +52,9 @@ export function latestDisposition(card: CustodyCard, pr: CustodyPull): Dispositi
     if (!match) continue;
     const revisitText = match[2]!;
     const revisit = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?$/.test(revisitText) ? Date.parse(revisitText) : NaN;
-    found.push({ at: text.at, action: match[1]!.toLowerCase(), revisit: Number.isFinite(revisit) ? revisit : null });
+    const canonical = revisitText.length === 10 ? `${revisitText}T00:00:00Z` : revisitText;
+    const valid = Number.isFinite(revisit) && new Date(revisit).toISOString().replace(".000Z", "Z") === canonical;
+    found.push({ at: text.at, action: match[1]!.toLowerCase(), revisit: valid ? revisit : null });
   }
   return found.sort((a, b) => b.at - a.at)[0] ?? null;
 }
