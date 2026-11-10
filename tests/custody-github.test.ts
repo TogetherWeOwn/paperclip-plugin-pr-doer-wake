@@ -447,6 +447,55 @@ describe("CustodyGithub exact activity", () => {
   });
 });
 
+describe("CustodyGithub head seeding", () => {
+  it("seeds from the latest head check-suite updated_at", async () => {
+    const { client } = fixtures((_url, init) => String(init?.body).includes("checkSuites(")
+      ? response(graphql("checkSuites", connection([suite("s", RECENT)]))) : undefined);
+    expect(await client.seedHead(pr())).toBe(Date.parse(RECENT));
+  });
+
+  it("seeds from the latest submitted review", async () => {
+    const { client } = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([review("r1", UPDATED), review("r2", RECENT)]))) : undefined);
+    expect(await client.seedHead(pr())).toBe(Date.parse(RECENT));
+  });
+
+  it("seeds from the PR disposition line when that is latest", async () => {
+    const { client } = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([review("r1", UPDATED)]))) : undefined);
+    expect(await client.seedHead(pr(), Date.parse(RECENT))).toBe(Date.parse(RECENT));
+  });
+
+  it("takes the maximum across sources and floors at PR creation", async () => {
+    const { client } = fixtures((_url, init) => String(init?.body).includes("checkSuites(")
+      ? response(graphql("checkSuites", connection([suite("s", RECENT)]))) : undefined);
+    expect(await client.seedHead(pr(), Date.parse(UPDATED))).toBe(Date.parse(RECENT));
+    const stale = fixtures();
+    expect(await stale.client.seedHead(pr(), Date.parse("2025-01-01T00:00:00Z"))).toBe(Date.parse(CREATED));
+  });
+
+  it("throws with no evidence so the caller keeps the head UNKNOWN", async () => {
+    const { client } = fixtures();
+    await expect(client.seedHead(pr())).rejects.toMatchObject({ code: "response" });
+    const pendingOnly = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([{ id: "r1", state: "PENDING", submittedAt: null }]))) : undefined);
+    await expect(pendingOnly.client.seedHead(pr())).rejects.toMatchObject({ code: "response" });
+  });
+
+  it.each([NaN, -1, 8_640_000_000_000_001])("rejects invalid disposition clocks before requests: %s", async (clock) => {
+    const { client, calls } = fixtures();
+    await expect(client.seedHead(pr(), clock)).rejects.toMatchObject({ code: "input" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("requires the head commit and refuses closed PRs", async () => {
+    const wrongHead = fixtures((_url, init) => String(init?.body).includes("checkSuites(")
+      ? response(graphql("checkSuites", connection([suite()]), {}, 2)) : undefined);
+    await expect(wrongHead.client.seedHead(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(wrongHead.client.seedHead(pr({ state: "closed", closedAt: Date.parse(UPDATED) }))).rejects.toMatchObject({ code: "input" });
+  });
+});
+
 describe("CustodyGithub inherited security transport", () => {
   it("reuses REST ETags but never caches GraphQL POST queries by URL", async () => {
     const cache = new CiGithubCache();

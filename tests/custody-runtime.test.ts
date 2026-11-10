@@ -60,10 +60,11 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
     return { ...pr, baseBranch: "main", draft: false, mergeable: true };
   });
   const activity = vi.spyOn(CustodyGithub.prototype, "activity").mockResolvedValue(NOW - 8 * DAY);
+  const seedHead = vi.spyOn(CustodyGithub.prototype, "seedHead").mockImplementation(async () => now);
   vi.spyOn(CustodyGithub.prototype, "closureTexts").mockResolvedValue([]);
   const runtime = new CustodyRuntime(ctx as unknown as PluginContext, () => now);
   const ledger = () => [...state.entries()].find(([key]) => key.includes("pr-custody-v1"))?.[1];
-  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, advance: (ms: number) => { now += ms; }, restart: () => new CustodyRuntime(ctx as unknown as PluginContext, () => now) };
+  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => new CustodyRuntime(ctx as unknown as PluginContext, () => now) };
 }
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); });
 
@@ -850,6 +851,38 @@ describe("coverage, summary and cursor controls", () => {
   it("coalesces overlapping scheduled callbacks", async () => {
     const h = fixture();
     await Promise.all([h.runtime.poll(), h.runtime.poll()]);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("seeds first-observed heads so already-idle PRs trigger without a fresh seven-day warmup", async () => {
+    const h = fixture();
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }), undefined);
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW - 8 * DAY);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
+  });
+
+  it("passes the PR disposition clock as seeding evidence", async () => {
+    const h = fixture({ cards: [card({ texts: [{ id: "description", body: "PR disposition: example/project#42 finish; next actor contributor; revisit 2026-01-01T00:00:00Z", at: NOW - 12 * DAY, ownership: true }], })] });
+    h.seedHead.mockResolvedValue(NOW - 12 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }), NOW - 12 * DAY);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 12 * DAY}` }));
+  });
+
+  it("keeps heads with no seeding evidence UNKNOWN and retries next tick", async () => {
+    const h = fixture();
+    h.seedHead.mockRejectedValue(new Error("no evidence"));
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().heads["example/project#42"]).toBeUndefined();
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
 });

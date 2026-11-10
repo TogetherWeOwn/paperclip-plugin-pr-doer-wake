@@ -143,12 +143,51 @@ export class CustodyGithub extends CiGithub {
   }
 
   /**
+   * Seed a newly observed head from the latest available evidence instead of
+   * wall-clock arrival: head check-suite updated_at, latest submitted review
+   * and the caller's PR-specific disposition time. PR created_at is only a
+   * floor. With no evidence from any of those sources this throws, so the
+   * caller treats the head as UNKNOWN and retries next tick rather than
+   * inventing activity. Seeded epochs never claim push time; they only keep
+   * already-idle PRs from waiting out a fresh seven-day warmup.
+   */
+  async seedHead(pr: CustodyPull, dispositionAt?: number): Promise<number> {
+    const { headSha } = identity(pr);
+    if (pr.state !== "open" || (dispositionAt !== undefined
+        && (!Number.isFinite(dispositionAt) || dispositionAt < 0 || dispositionAt > 8_640_000_000_000_000))) throw new CiGithubError("input");
+    const commits = await this.connection(pr, "commits", (value) => {
+      const oid = sha(object(object(value).commit).oid);
+      return { key: oid, value: oid };
+    });
+    if (!commits.length || commits.at(-1) !== headSha) return invalid();
+    const reviews = await this.connection(pr, "reviews", (value) => {
+      const review = object(value);
+      if (!["PENDING", "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(text(review.state))) return invalid();
+      const at = review.state === "PENDING" ? nullableTimestamp(review.submittedAt) : timestamp(review.submittedAt);
+      if (review.state === "PENDING" && at !== null) return invalid();
+      return { key: text(review.id), value: at };
+    });
+    const suites = await this.connection(pr, "checkSuites", (value) => {
+      const suite = object(value);
+      if (!["QUEUED", "IN_PROGRESS", "COMPLETED", "REQUESTED", "WAITING", "PENDING"].includes(text(suite.status))) return invalid();
+      const createdAt = timestamp(suite.createdAt);
+      const updatedAt = timestamp(suite.updatedAt);
+      if (updatedAt < createdAt) return invalid();
+      return { key: text(suite.id), value: updatedAt };
+    }, commits.length);
+    const evidence = [...reviews.filter((value): value is number => value !== null), ...suites, ...(dispositionAt !== undefined ? [dispositionAt] : [])];
+    if (!evidence.length) return invalid();
+    return Math.max(pr.createdAt, ...evidence);
+  }
+
+  /**
    * Commit/push, submitted review, and head suite activity (even running).
    * REST commit dates alone do not establish push time; PR updated_at also
    * changes for metadata, which could postpone custody forever.
    * GitHub retired pushedDate. Activity is UNKNOWN unless the caller supplies a
-   * persisted first-observed timestamp for this exact head SHA. That upper bound
-   * starts a conservative idle warmup on discovery/head changes, never metadata.
+   * persisted first-observed timestamp for this exact head SHA (seeded by
+   * seedHead). That upper bound starts a conservative idle warmup on
+   * discovery/head changes, never metadata.
    */
   async activity(pr: CustodyPull, observedHeadAt?: number): Promise<number> {
     const { headSha } = identity(pr);
