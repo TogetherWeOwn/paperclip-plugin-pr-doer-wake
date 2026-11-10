@@ -78,7 +78,7 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       # Isolated fixture override; does not alter the lockfile or qualify installed bytes.
-      - run: npm install --no-save --ignore-scripts --package-lock=false @paperclipai/plugin-sdk@2026.1106.0 @paperclipai/shared@2026.1106.0
+      - run: npm install --no-save --ignore-scripts @paperclipai/plugin-sdk@2026.1106.0 @paperclipai/shared@2026.1106.0
       - name: Verify exact SDK and shared versions
         run: |
           node --input-type=module <<'JS'
