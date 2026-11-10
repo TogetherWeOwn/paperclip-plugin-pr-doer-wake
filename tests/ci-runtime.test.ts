@@ -217,6 +217,22 @@ describe("native CI plugin entrypoint", () => {
       .toMatchObject({ ok: false, errors: expect.any(Array) });
   });
 
+  it("accepts custody fields in the combined configuration without weakening either validator", async () => {
+    expect(validateCiConfig(config({ custodyEnabled: false }))).toEqual([]);
+    expect(await ciPlugin.definition.onValidateConfig!(config({ custodyEnabled: false }))).toEqual({ ok: true });
+    expect(validateCiConfig(config({ custodyEnabled: true, custodyDryRun: false }))).toEqual([]);
+    expect(await ciPlugin.definition.onValidateConfig!(config({
+      custodyEnabled: true, custodyDryRun: false, custodyCompanyId: COMPANY,
+      custodySummaryAgentId: AGENT, custodyOrg: "acme", custodyClosedSince: "2026-11-03T00:00:00Z",
+    }))).toEqual({ ok: true });
+    // Custody validation is not bypassed: enabling custody with missing sibling fields fails combined validation.
+    expect(await ciPlugin.definition.onValidateConfig!(config({ custodyEnabled: true })))
+      .toMatchObject({ ok: false, errors: expect.any(Array) });
+    // Unknown fields and ambiguous authentication remain rejected.
+    expect(validateCiConfig(config({ custodyEnabled: false, custodyTypo: true })).length).toBeGreaterThan(0);
+    expect(validateCiConfig(config({ custodyEnabled: false, githubAppId: "123" })).length).toBeGreaterThan(0);
+  });
+
   it("declares the explicit CI and custody capability envelopes without source status or comment mutation", () => {
     expect([...manifest.capabilities].sort()).toEqual([
       "agent.tools.register", "execution.workspaces.read", "http.outbound", "issues.checkout", "issues.read", "issues.wakeup",
@@ -295,6 +311,12 @@ describe("CI registration and configuration parsing", () => {
 });
 
 describe("CI runtime registration authorization", () => {
+  it("registers with an explicit custody flag in the combined configuration", async () => {
+    const h = setup({ custodyEnabled: false });
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ content: "CI wait registered", data: { status: "open", dryRun: false, expiresAt: START + LIMITS.waitMs } });
+  });
+
   it("registers an explicit card/repository/PR/SHA tuple, bound to checkout and execution workspace", async () => {
     const h = setup();
     const result = await h.runtime.register(registration, run);
@@ -1286,6 +1308,27 @@ describe("CI runtime bounded retention and work quotas", () => {
     await h.runtime.poll();
     expect(h.ledger().waits.filter((wait) => wait.status === "open")).toEqual([]);
     expect(h.ledger().audits).toEqual(ledger.audits);
+  });
+
+  it("preserves wake evidence under repeated poll intent audits and still saves each intent before credential access", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const ledger = h.ledger();
+    const evidence = { at: START, operation: "wake", outcome: "unconfirmed", waitId: "earlier-wake" };
+    ledger.audits = [evidence, ...Array.from({ length: LIMITS.audit - 1 }, () => ({ at: START, operation: "poll", outcome: "intent" }))];
+    h.seed(ledger);
+    github.readiness.mockReturnValue(verdict("pending"));
+    h.resolveSecret.mockImplementation(async () => {
+      expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "poll", outcome: "intent", waitId: ledger.waits[0]!.waitId });
+      return TOKEN;
+    });
+    for (let tick = 0; tick < 3; tick += 1) {
+      await h.runtime.poll();
+      h.advance(4 * 60_000);
+    }
+    expect(h.ledger().audits).toHaveLength(LIMITS.audit);
+    expect(h.ledger().audits).toContainEqual(evidence);
+    expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
   it("bounds the audit log while preserving the latest refusal", async () => {

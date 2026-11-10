@@ -9,6 +9,7 @@ export interface CiConfig {
   dryRun: boolean;
   allowedRepos: string[];
   githubTokenSecretRef: SecretRef | null;
+  githubApp: { appId: string; installationId: string; privateKeySecretRef: SecretRef } | null;
   webhooksEnabled: boolean;
   webhookSecretRef: SecretRef | null;
   /** Cold-start baseline only; measured successful waits replace it. */
@@ -28,6 +29,10 @@ function secretRef(value: unknown): SecretRef | null {
   return ref as unknown as SecretRef;
 }
 
+function githubId(value: unknown): value is string {
+  return typeof value === "string" && /^[1-9][0-9]{0,15}$/.test(value) && Number.isSafeInteger(Number(value));
+}
+
 export function parseCiConfig(raw: Record<string, unknown>): CiConfig {
   const repos = Array.isArray(raw.allowedRepos) ? raw.allowedRepos : [];
   const medians: Record<string, number> = Object.create(null);
@@ -41,6 +46,8 @@ export function parseCiConfig(raw: Record<string, unknown>): CiConfig {
     dryRun: raw.dryRun !== false,
     allowedRepos: repos.filter((r): r is string => typeof r === "string" && REPO.test(r) && !r.endsWith("/.") && !r.endsWith("/..")).slice(0, 100).map((r) => r.toLowerCase()),
     githubTokenSecretRef: secretRef(raw.githubTokenSecretRef),
+    githubApp: githubId(raw.githubAppId) && githubId(raw.githubInstallationId) && secretRef(raw.githubAppPrivateKeySecretRef)
+      ? { appId: raw.githubAppId, installationId: raw.githubInstallationId, privateKeySecretRef: secretRef(raw.githubAppPrivateKeySecretRef)! } : null,
     webhooksEnabled: raw.webhooksEnabled === true,
     webhookSecretRef: secretRef(raw.webhookSecretRef),
     repoMedianMs: medians,
@@ -50,8 +57,17 @@ export function parseCiConfig(raw: Record<string, unknown>): CiConfig {
 export function validateCiConfig(raw: Record<string, unknown>): string[] {
   const config = parseCiConfig(raw);
   const errors: string[] = [];
+  // The manifest's combined instance config also declares the custody keys
+  // validated by custody-config; the CI validator must recognize them here
+  // (without validating them) so shared configs are not rejected as unknown.
+  const keys = ["enabled", "dryRun", "allowedRepos", "githubTokenSecretRef", "githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef", "webhooksEnabled", "webhookSecretRef", "repoMedianMs", "custodyEnabled", "custodyDryRun", "custodyCompanyId", "custodyOrg", "custodySummaryAgentId", "custodyClosedSince"];
+  if (Object.keys(raw).some((key) => !keys.includes(key))) errors.push("unknown configuration field");
+  const bearer = Object.hasOwn(raw, "githubTokenSecretRef");
+  const app = ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"].some((key) => Object.hasOwn(raw, key));
+  if (bearer && app || bearer && !config.githubTokenSecretRef || app && !config.githubApp || config.enabled && !bearer && !app) {
+    errors.push("configure exactly one complete authentication mode: githubTokenSecretRef OR githubAppId, githubInstallationId and githubAppPrivateKeySecretRef");
+  }
   if (!config.enabled) return errors;
-  if (!config.githubTokenSecretRef) errors.push("githubTokenSecretRef must be a secret_ref");
   if (!config.allowedRepos.length || !Array.isArray(raw.allowedRepos) || config.allowedRepos.length !== raw.allowedRepos.length) errors.push("allowedRepos must contain 1-100 valid owner/repo entries");
   if (config.webhooksEnabled && !config.webhookSecretRef) errors.push("webhooksEnabled requires webhookSecretRef");
   if (raw.repoMedianMs !== undefined && (!raw.repoMedianMs || typeof raw.repoMedianMs !== "object" || Array.isArray(raw.repoMedianMs) || Object.keys(raw.repoMedianMs).length !== Object.keys(config.repoMedianMs).length)) errors.push("repoMedianMs must map valid repos to integer durations from 60000 to 86400000 ms");

@@ -34,10 +34,31 @@ describe("stock manifest and config contract", () => {
   it("accepts actual secret-picker objects without requiring a webhook in polling mode", () => {
     expect(validateInstanceConfig(enabled, manifest.instanceConfigSchema!).valid).toBe(true);
     expect(validateCiConfig(enabled)).toEqual([]);
-    expect(collectSecretRefPaths(manifest.instanceConfigSchema)).toEqual(new Set(["githubTokenSecretRef", "webhookSecretRef"]));
+    expect(collectSecretRefPaths(manifest.instanceConfigSchema)).toEqual(new Set(["githubTokenSecretRef", "githubAppPrivateKeySecretRef", "webhookSecretRef"]));
     expect(parseCiConfig(enabled)).toMatchObject({ dryRun: true, webhooksEnabled: false });
     expect(validateCiConfig({ ...enabled, webhooksEnabled: true })).toContain("webhooksEnabled requires webhookSecretRef");
     expect(validateCiConfig({ ...enabled, webhooksEnabled: true, webhookSecretRef: ref })).toEqual([]);
+  });
+
+  it("accepts custody fields alongside either authentication mode in the combined configuration", () => {
+    const app = { enabled: true, allowedRepos: ["example/project"], githubAppId: "123", githubInstallationId: "456", githubAppPrivateKeySecretRef: ref };
+    expect(validateCiConfig({ ...enabled, custodyEnabled: false })).toEqual([]);
+    expect(validateCiConfig({ ...enabled, custodyEnabled: false, custodyDryRun: true })).toEqual([]);
+    expect(validateCiConfig({ ...app, custodyEnabled: false })).toEqual([]);
+    expect(validateCiConfig({ ...enabled, custodyEnabled: false, custodyTypo: true }).length).toBeGreaterThan(0);
+  });
+
+  it("accepts App secret-picker fields and rejects partial or ambiguous authentication at both validation layers", () => {
+    const app = { enabled: true, allowedRepos: ["example/project"], githubAppId: "123", githubInstallationId: "456", githubAppPrivateKeySecretRef: ref };
+    expect(validateInstanceConfig(app, manifest.instanceConfigSchema!).valid).toBe(true);
+    expect(validateCiConfig(app)).toEqual([]);
+    for (const config of [
+      { ...app, githubTokenSecretRef: ref }, { ...app, githubAppPrivateKeySecretRef: "raw" },
+      { enabled: false, githubAppId: "123" }, { enabled: true, allowedRepos: ["example/project"] },
+    ]) {
+      expect(validateInstanceConfig(config, manifest.instanceConfigSchema!).valid).toBe(false);
+      expect(validateCiConfig(config).length).toBeGreaterThan(0);
+    }
   });
 
   it("rejects raw credentials, legacy heuristic settings and malformed resource configuration", () => {

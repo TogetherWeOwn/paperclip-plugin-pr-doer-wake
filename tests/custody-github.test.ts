@@ -223,6 +223,54 @@ describe("CustodyGithub REST enumeration", () => {
     await expect(client.pulls(REPO, "open")).rejects.toMatchObject({ code: "pages" });
   });
 
+  it("keeps custody inventory when PR title/body contain token-like examples, without retaining them in the ETag cache", async () => {
+    const sample = "ghp_synthetic_example_not_a_credential";
+    const cache = new CiGithubCache();
+    const { client } = fixtures(() => response([
+      rawPull(1, { title: `Example ${sample} title`, body: `See ${sample} for format` }),
+      rawPull(2, { title: "Unrelated PR", body: "Owning card ACME-456" }),
+    ], 200, { etag: '"safe"' }), { cache });
+    const values = await client.pulls(REPO, "open");
+    expect(values).toHaveLength(2);
+    const flagged = values.find((value) => value.number === 1)!;
+    expect(flagged.title).not.toContain(sample);
+    expect(flagged.body).not.toContain(sample);
+    expect(flagged.title).toContain("[REDACTED]");
+    expect(flagged.body).toContain("[REDACTED]");
+    const unrelated = values.find((value) => value.number === 2)!;
+    expect(unrelated.title).toBe("Unrelated PR");
+    expect(unrelated.body).toBe("Owning card ACME-456");
+    const cached = cache.get(`https://api.github.com/repos/${REPO}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=1`)!;
+    expect(cached.body).not.toContain(sample);
+  });
+
+  it("keeps closure rationale when closure comments contain token-like examples", async () => {
+    const sample = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJleGFtcGxlIn0.abcdefghijklmnop";
+    const { client } = fixtures((url) => url.pathname.endsWith("/comments") ? response([
+      { id: 1, body: `Closed unmerged: duplicate of #2\nExample: ${sample}`, created_at: CREATED, updated_at: UPDATED },
+    ]) : undefined);
+    const texts = await client.closureTexts(pr({ state: "closed", closedAt: Date.parse(UPDATED) }));
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain("Closed unmerged: duplicate of #2");
+    expect(texts[1]).not.toContain(sample);
+    expect(texts[1]).toContain("[REDACTED]");
+  });
+
+  it("redacts a PEM block in custody prose without retaining key material", async () => {
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIIE synthetic material\n-----END PRIVATE KEY-----";
+    const { client } = fixtures(() => response([rawPull(1, { body: `Example\n${pem}` })]));
+    const values = await client.pulls(REPO, "open");
+    expect(values).toHaveLength(1);
+    expect(values[0]!.body).not.toContain("MIIE synthetic material");
+    expect(values[0]!.body).not.toContain("PRIVATE KEY");
+    expect(values[0]!.body).toContain("[REDACTED]");
+  });
+
+  it("still refuses the active credential reflected in custody prose", async () => {
+    const { client } = fixtures(() => response([rawPull(1, { body: `Issued ${TOKEN} here` })]));
+    await expect(client.pulls(REPO, "open")).rejects.toMatchObject({ code: "response" });
+  });
+
   it("gets all issue comments for closure rationale, including comments beyond 100", async () => {
     const { client } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
       ? Array.from({ length: 100 }, (_, index) => ({ id: index + 1, body: "discussion", created_at: CREATED, updated_at: UPDATED }))

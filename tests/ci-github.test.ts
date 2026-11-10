@@ -991,6 +991,36 @@ describe("CiGithub caching, backoff, and caps", () => {
     await expect(new CiGithub(async () => response(pullData()), TOKEN, { maxBodyBytes: 1 }).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
   });
 
+  it.each(["ghp_sample_credential_not_in_use", "-----BEGIN PRIVATE KEY-----", "eyJhbGciOiJub25lIn0.eyJzdWIiOiJleGFtcGxlIn0.abcdefghijklmnop"])("ignores unused token-like PR/CI text without retaining it in the ETag cache (%s)", async (sample) => {
+    const cache = new CiGithubCache();
+    let conditional = false;
+    const fetch: CiFetch = async () => conditional ? { status: 304, headers: {}, body: "" }
+      : response({ ...pullData(), body: `Example: ${sample}`, [sample]: "unused" }, 200, { etag: '"safe"' });
+    expect((await new CiGithub(fetch, TOKEN, { cache }).pull(REPO, 1)).headSha).toBe(SHA);
+    const cached = cache.get(`https://api.github.com/repos/${REPO}/pulls/1`)!;
+    expect(cached.body).not.toContain(sample);
+    conditional = true;
+    expect((await new CiGithub(fetch, `${TOKEN}-renewed`, { cache }).pull(REPO, 1)).headSha).toBe(SHA);
+    const f = fixtures((url) => {
+      if (url.pathname.endsWith("check-runs")) return response({ total_count: 1, check_runs: [{ ...rawRun(), output: { summary: sample, text: sample } }] });
+      if (url.pathname.endsWith("statuses")) return response([{ id: 1, context: "build", state: "success", description: sample }]);
+    });
+    const observed = await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(observed, timing).kind).toBe("pass");
+  });
+
+  it.each(["author", "check", "rule", "etag", "link"])("still refuses token-like values in consumed %s fields", async (field) => {
+    const sample = "ghs_previous_credential_not_in_use";
+    const f = fixtures((url) => {
+      if (field === "author" && url.pathname.includes("/pulls/")) return response({ ...pullData(), user: { login: sample } });
+      if (field === "check" && url.pathname.endsWith("check-runs")) return response({ total_count: 1, check_runs: [rawRun(1, sample)] });
+      if (field === "rule" && url.pathname.includes("/rules/branches/")) return response([{ type: "required_status_checks", parameters: { required_status_checks: [{ context: sample }] } }]);
+      if (field === "etag" || field === "link") return response(pullData(), 200, { [field]: sample });
+    });
+    const github = new CiGithub(f.fetch, TOKEN);
+    await expect(field === "check" || field === "rule" ? github.snapshot(REPO, SHA, "main") : github.pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+  });
+
   it("does not expose upstream error bodies, network errors, or reflected credentials", async () => {
     for (const status of [401, 403, 404, 422, 500]) {
       const github = new CiGithub(async () => response({ message: `${TOKEN} private failure` }, status), TOKEN);

@@ -7,6 +7,11 @@ export interface CiHttpResponse {
   body: string;
 }
 export type CiFetch = (url: string, init?: RequestInit) => Promise<CiHttpResponse | Response>;
+export type CiTokenExchange = (installationId: string, jwt: string, body: { repositories: string[]; permissions: Record<string, string> }) => Promise<unknown>;
+export interface CiTokenSource {
+  token(path: string, exchange: CiTokenExchange): Promise<string>;
+  invalidate(): void;
+}
 export interface CiGithubOptions {
   /** Counts every attempted fetch, including 304s and failed requests, for this instance. */
   maxRequests?: number;
@@ -23,6 +28,8 @@ export interface CiGithubOptions {
   now?: () => number;
   /** Token-free state, scoped by the caller to one company/credential identity. */
   cache?: CiGithubCache;
+  /** Installation quota only; may span companies, never contains response data. */
+  backoff?: { until: number };
 }
 export interface CiRequiredContext {
   context: string;
@@ -91,7 +98,7 @@ export interface CiReadiness {
   missingSince: number | null;
   missingFailAt: number | null;
 }
-export type CiGithubErrorCode = "input" | "http" | "network" | "response" | "budget" | "pages" | "backoff" | "timeout";
+export type CiGithubErrorCode = "input" | "auth" | "http" | "network" | "response" | "budget" | "pages" | "backoff" | "timeout";
 /** Deliberately contains neither response bodies, request headers, tokens, nor upstream errors. */
 export class CiGithubError extends Error {
   constructor(
@@ -106,6 +113,13 @@ export class CiGithubError extends Error {
 
 const ORIGIN = "https://api.github.com";
 const PAGE_SIZE = 100;
+// Recognize provider credential shapes without retaining expired/previous tokens.
+const SECRET_SHAPE = /(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{16,}|-----BEGIN (?:RSA )?PRIVATE KEY-----/;
+const SECRET_SHAPE_GLOBAL = new RegExp(SECRET_SHAPE.source, "g");
+// GitHub PR/issue free-text fields custody consumes as prose. Only these are
+// redacted in place; every other credential-shaped string is dropped so strict
+// identifier projections keep failing closed. Neither field can hold an identifier.
+const FREE_TEXT_KEYS = new Set(["title", "body"]);
 type JsonObject = Record<string, unknown>;
 function invalid(): never { throw new CiGithubError("response"); }
 function object(value: unknown): JsonObject {
@@ -216,6 +230,8 @@ export class CiGithub {
   private readonly now: () => number;
   private requests = 0;
   private readonly cache: CiGithubCache;
+  private readonly backoff: { until: number };
+  #credential: string | CiTokenSource;
   private readonly beforeRequest: (() => void) | undefined;
   private readonly onRequestAdmitted: (() => Promise<void>) | undefined;
 
@@ -224,15 +240,17 @@ export class CiGithub {
 
   constructor(
     private readonly fetch: PluginContext["http"]["fetch"] | CiFetch,
-    private readonly token: string,
+    credential: string | CiTokenSource,
     options: CiGithubOptions = {},
   ) {
-    if (typeof token !== "string" || !token.trim() || /[\r\n]/.test(token)) throw new CiGithubError("input");
+    if (typeof credential === "string" ? !credential.trim() || /[\r\n]/.test(credential) : !credential || typeof credential.token !== "function") throw new CiGithubError("input");
+    this.#credential = credential;
     this.maxRequests = bounded(options.maxRequests, 100, 10_000);
     this.maxPages = bounded(options.maxPages, 20, 100);
     this.maxBodyBytes = bounded(options.maxBodyBytes, 2 * 1024 * 1024, 8 * 1024 * 1024);
     this.requestTimeoutMs = bounded(options.requestTimeoutMs, 15_000, 30_000);
     this.cache = options.cache ?? new CiGithubCache(options);
+    this.backoff = options.backoff ?? { until: 0 };
     this.now = options.now ?? Date.now;
     this.beforeRequest = options.beforeRequest;
     this.onRequestAdmitted = options.onRequestAdmitted;
@@ -440,6 +458,7 @@ export class CiGithub {
     if ((status === 429 || (status === 403 && (!permissionDenied || retry !== undefined))) && until <= now) until = now + 60_000;
     if (remaining === "0" && until <= now) until = now + 60_000;
     this.cache.backoffUntil = Math.max(this.cache.backoffUntil, until);
+    this.backoff.until = Math.max(this.backoff.until, until);
   }
 
   private async deadline<T>(operation: () => Promise<T>): Promise<T> {
@@ -456,34 +475,48 @@ export class CiGithub {
     }
   }
 
-  private async attempt(url: string, headers: Record<string, string>, graphqlBody?: string): Promise<CiHttpResponse | Response> {
-    if (this.now() < this.cache.backoffUntil) throw new CiGithubError("backoff", undefined, this.cache.backoffUntil);
+  private async attempt(url: string, headers: Record<string, string>, body?: string): Promise<CiHttpResponse | Response> {
+    if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     this.beforeRequest?.();
     this.requests++;
     // Caller persistence is not a transport failure and must not trigger a conditional retry.
     if (this.onRequestAdmitted) await this.onRequestAdmitted();
-    try { return await this.deadline(() => this.fetch(url, { method: graphqlBody === undefined ? "GET" : "POST", headers, redirect: "error", ...(graphqlBody === undefined ? {} : { body: graphqlBody }) })); }
+    try { return await this.deadline(() => this.fetch(url, { method: body === undefined ? "GET" : "POST", headers, redirect: "error", ...(body === undefined ? {} : { body }) })); }
     catch (error) {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
       throw new CiGithubError("network");
     }
   }
 
-  protected async request(path: string, graphqlBody?: string): Promise<Page> {
-    // POST is reserved for fixed-origin GraphQL; it must never reuse a URL-only ETag.
-    if (!path.startsWith("/") || path.startsWith("//") || (graphqlBody !== undefined && path !== "/graphql")) throw new CiGithubError("input");
+  protected async request(path: string, graphqlBody?: string, exchange?: { jwt: string; body: string }): Promise<Page> {
+    // POSTs are reserved for fixed-origin GraphQL and the installation-token exchange; neither reuses a URL-only ETag.
+    if (!path.startsWith("/") || path.startsWith("//") || (graphqlBody !== undefined && path !== "/graphql") || (exchange !== undefined && !/^\/app\/installations\/[1-9][0-9]{0,15}\/access_tokens$/.test(path))) throw new CiGithubError("input");
+    if (graphqlBody !== undefined && exchange !== undefined) throw new CiGithubError("input");
+    // Backoff/budget apply before secret resolution as well as to every fetch.
+    if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
+    if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
+    const token = exchange ? exchange.jwt : typeof this.#credential === "string" ? this.#credential
+      : await this.deadline(() => (this.#credential as CiTokenSource).token(path, async (installationId, jwt, body) => {
+        if (!/^[1-9][0-9]{0,15}$/.test(installationId)) throw new CiGithubError("input");
+        return (await this.request(`/app/installations/${installationId}/access_tokens`, undefined, { jwt, body: JSON.stringify(body) })).data;
+      })).catch((error: unknown) => {
+        (this.#credential as CiTokenSource).invalidate();
+        if (error instanceof CiGithubError) throw error;
+        throw new CiGithubError("auth");
+      });
     const url = `${ORIGIN}${path}`;
-    const cached = graphqlBody === undefined ? this.cache.get(url) : undefined;
+    const cached = graphqlBody === undefined && !exchange ? this.cache.get(url) : undefined;
     const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json", Authorization: `Bearer ${this.token}`,
+      Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
       "X-GitHub-Api-Version": "2022-11-28",
+      ...(exchange ? { "Content-Type": "application/json" } : {}),
     };
     if (cached) headers["If-None-Match"] = cached.etag;
     if (graphqlBody !== undefined) headers["Content-Type"] = "application/json";
     let response: CiHttpResponse | Response;
     let unconditionalRetry = false;
-    try { response = await this.attempt(url, headers, graphqlBody); }
+    try { response = await this.attempt(url, headers, exchange?.body ?? graphqlBody); }
     catch (error) {
       if (!cached || !(error instanceof CiGithubError) || error.code !== "network") throw error;
       // Some stock SDKs construct Response("", {status:304}) and throw. Never assume
@@ -501,9 +534,10 @@ export class CiGithub {
     this.rateLimit(response.status, response.headers, await this.permissionDenied(response));
     if (response.status === 304) {
       if (!cached || unconditionalRetry) return invalid();
-      return { data: this.parse(cached.body), link: cached.link };
+      return { data: this.parse(cached.body, token), link: cached.link };
     }
-    if (response.status !== 200) {
+    if (response.status !== (exchange ? 201 : 200)) {
+      if (!exchange && response.status === 401 && typeof this.#credential !== "string") this.#credential.invalidate();
       throw new CiGithubError("http", response.status, this.cache.backoffUntil > this.now() ? this.cache.backoffUntil : undefined);
     }
     let body: string;
@@ -512,22 +546,43 @@ export class CiGithub {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
       throw new CiGithubError("response");
     }
-    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > this.maxBodyBytes) return invalid();
-    const data = this.parse(body);
+    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > (exchange ? Math.min(this.maxBodyBytes, 16_384) : this.maxBodyBytes)) return invalid();
+    const data = this.parse(body, token, exchange !== undefined);
+    // Installation-token responses must never enter the ETag cache.
+    if (exchange) return { data, link: "" };
     const link = header(response.headers, "link") ?? "";
     const etag = header(response.headers, "etag");
-    if (link.includes(this.token) || etag?.includes(this.token)) return invalid();
-    if (etag && graphqlBody === undefined) this.cache.remember(url, { body, etag, link, bytes: Buffer.byteLength(body + etag + link + url, "utf8") });
+    if (link.includes(token) || etag?.includes(token) || SECRET_SHAPE.test(link) || etag && SECRET_SHAPE.test(etag)) return invalid();
+    const safeBody = JSON.stringify(data);
+    if (etag && graphqlBody === undefined) this.cache.remember(url, { body: safeBody, etag, link, bytes: Buffer.byteLength(safeBody + etag + link + url, "utf8") });
     else if (cached) this.cache.delete(url);
     return { data, link };
   }
 
-  private parse(body: string): unknown {
+  private parse(body: string, token?: string, exchange = false): unknown {
     try {
-      if (body.includes(this.token)) return invalid();
+      if (token && body.includes(token)) return invalid();
       // A reviver also catches reflection hidden by JSON escapes, including property names.
       return JSON.parse(body, (key: string, value: unknown) => {
-        if (key.includes(this.token) || (typeof value === "string" && value.includes(this.token))) return invalid();
+        if (token && (key.includes(token) || (typeof value === "string" && value.includes(token)))) return invalid();
+        if (SECRET_SHAPE.test(key)) {
+          if (exchange) return invalid();
+          return undefined;
+        }
+        if (typeof value === "string" && !(exchange && key === "token") && SECRET_SHAPE.test(value)) {
+          if (exchange) return invalid();
+          // Custody consumes PR/issue prose as text: redact credential shapes
+          // in place so inventory survives without retaining them in the cache.
+          // A PEM block's base64 body is credential material even though only
+          // its header matches SECRET_SHAPE, so redact the whole block.
+          if (FREE_TEXT_KEYS.has(key)) return value
+            .replace(/-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA )?PRIVATE KEY-----/g, "[REDACTED]")
+            .replace(/-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*$/g, "[REDACTED]")
+            .replace(SECRET_SHAPE_GLOBAL, "[REDACTED]");
+          // Drop token-like unused prose before caching. A consumed field removed
+          // here still fails its strict projection; unused PR/CI prose does not.
+          return undefined;
+        }
         return value;
       }) as unknown;
     } catch { throw new CiGithubError("response"); }

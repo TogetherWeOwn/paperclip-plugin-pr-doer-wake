@@ -2,7 +2,7 @@
 
 The CI-specific sections below preserve prior source-review evidence. They do not accept the custody expansion; its new matrix and pending gates are listed at the end.
 
-**NOT ACCEPTED FOR INSTALLATION.** Fill exact source/artifact/host evidence through the native Security and QA review, then the Operator canary. A completed test implementation is not an observed passing test.
+**NOT ACCEPTED FOR INSTALLATION.** Fill exact source/artifact/host evidence through native Security and QA review, exact-artifact/host/configuration Security sign-off and applicable production authorization before Operator installation. A completed test implementation is not an observed passing test.
 
 ## Inventory and authority
 
@@ -11,7 +11,7 @@ The CI-specific sections below preserve prior source-review evidence. They do no
 - CI path's original permission envelope: eleven capabilities. The current manifest additionally declares custody's core reads, issue creation and document writes; see the custody expansion below. No issue-update/comment creation or core SQL write is exposed.
 - Source/artifact digest/config envelope: **pending native review evidence**.
 - Threat model and runbook: [THREAT-MODEL.md](THREAT-MODEL.md), [README.md](README.md).
-- SDK fixture target: `@paperclipai/plugin-sdk@2026.1023.0`, lockfile; REST `2022-11-28`. Installed target-host version: **pending Operator evidence**.
+- SDK fixture targets: `@paperclipai/plugin-sdk@2026.1023.0` in lockfile and exact `2026.1106.0` in isolated Actions compatibility job; REST `2022-11-28`. The target host is reported as `2026.1106.0`; exact-version fixture compatibility is not actual host proof.
 
 ## Policy-to-test matrix
 
@@ -21,9 +21,10 @@ The CI-specific sections below preserve prior source-review evidence. They do no
 | No guessed mapping | `tests/ci-runtime.test.ts`: unregistered branch/body hints cannot wake; registration requires host ownership and matching current PR |
 | Required readiness | `tests/ci-github.test.ts`: pending/green/fail/missing, unknown conclusions, rerun, app-bound requirements, no-required suite gates; same-attempt optional jobs, exact Actions run/attempt/job/check binding, generation changes, missing/partial targets, unavailable Actions and status deferral |
 | Completeness / bounds | `tests/ci-github.test.ts`: more than 100 runs, rules/suite/status pagination, page/request/body/cache bounds, partial/denied errors |
-| Conditional reads / failure | `tests/ci-github.test.ts`: ETag/304, conditional-wrapper failure and authoritative reread, rate limits, timeout, redirects |
+| Conditional reads / failure | `tests/ci-github.test.ts`: ETag/304, conditional-wrapper failure and authoritative reread, rate limits, timeout, redirects; `tests/ci-sdk.test.ts`: actual SDK RPC Response reconstruction for App POST/GET/304 and one authoritative unconditional recovery |
+| App authentication | `tests/ci-auth.test.ts`: mutually exclusive closed config, RS256 JWT, expiry/renewal/cycle cap, one-repo/fixed-permission validation, denied/revoked responses, shared budgets/backoff, concurrency and credential-free serialization; `tests/ci-ledger.test.ts`: registration/poll/signed-hint use the same App auth |
 | HMAC / replay | `tests/ci-runtime.test.ts`: raw SHA-256 signature, wrong/missing/algorithm, replay, parsed-body spoofing, repo allowlist, hint/verification budgets |
-| Once-only / crash / races | `tests/ci-runtime.test.ts`: same-run retry, joining alias, new-run rerun, head-move retirement, concurrent poll/register, deferred host, lost reply/restart, intent-write failure |
+| Once-only / crash / races | `tests/ci-ledger.test.ts`: non-deduplicating host fixture, poll/hint/registration/restart/ambiguous reply, explicit new-run rearming limitation; `tests/ci-runtime.test.ts`: same-run retry, joining alias, new-run rerun, head-move retirement, concurrent poll/register, deferred host, lost reply/restart, intent-write failure |
 | Credential hygiene | Both fixture files: distinctive synthetic credentials absent from results/errors/logs/state, reflected upstream payloads refused |
 | TTL / caps / audit | `tests/ci-runtime.test.ts`: immutable wait expiry, bounded open/retained ledger, audit intents/refusals/outcomes, dry-run and no-wake behavior |
 | Manifest / host schema | `tests/ci-manifest.test.ts`: exact capability set, closed tool schema, stock manifest and secret-picker schema contract |
@@ -47,17 +48,19 @@ Record evidence, not screenshots alone, for:
 
 1. `ctx.tools.register` calls traverse the intended native tool-governance evaluator and immutable audit path; missing governance is an explicit acceptance gap, not an inferred grant.
 2. Host checkout-owner enforcement binds company/agent/run, and workspace reads enforce company access.
-3. Real SDK conditional 304 behavior, redirect refusal/authorization handling, bounded network work and secret-trace hygiene. Worker timeouts do not prove host request cancellation.
-4. One worker per ledger, state durability, stable host idempotency, ambiguous reply and restart handling. No unsupported cross-worker fencing claim.
+3. Real SDK conditional 304 behavior, redirect refusal/authorization handling and secret-trace hygiene. Exact `2026.1106.0` Actions fixture proof is distinct from actual host proof. Reported host buffering is **200 MiB with no cancellation**: 16 KiB exchange/other worker acceptance caps and deadlines do not bound host allocation or cancel requests. Independent Security must accept/reject/disposition the exact residual before install; author acknowledgment is not acceptance.
+4. **Host does not deduplicate wake idempotency keys.** `tests/ci-ledger.test.ts` deliberately models every host call as a new effect: repeated poll/hint/same-run registration and restart/ambiguous replies rely on the plugin's durable ledger. New-run explicit re-registration of an already-terminal head can dispatch again, and tombstones expire; no per-SHA exactly-once guarantee. State has **no CAS/fencing**: independently verified single-worker-per-ledger deployment and durable writes remain mandatory external assumptions, not solved by tokens.
 5. Optional webhook ingress pre-storage retention/rate controls and owner acceptance of delivery-table growth. Phase two stays disabled until accepted and owner-created secret/webhook exist.
-6. Actual read credential grant, allowlist, canary repository and measured baseline median; no expanded credential or paid runner authorized by this record.
+6. Actual read credential/App grant, installation repository coverage, allowlist and measured baseline median; no agent GitHub credentials as qualification. Verify actual returned repository scope, all six read permissions (pull_requests/checks/statuses/actions/administration/metadata) and endpoint sufficiency without exposing tokens. Assess a supported scoped-token broker route before choosing direct key resolution. Security must explicitly disposition the chosen route: direct key custody retains the broader App-key authority regardless of token narrowing; a broker route needs proved authorization, isolation and availability. Also disposition one-hour GitHub expiry, lack of explicit token revocation and crash/ambiguous-mint cleanup. No expanded credential, App repository addition or paid runner authorized by this record. These auth, SDK, ledger, single-worker and buffering points each need an authorized review disposition before install.
 
-## Canary / handoff evidence
+## Production / handoff evidence
 
-- Operator install of the Security-accepted artifact: **pending**.
-- Dry-run first 20 distinct registered heads: **pending**; require 0 premature, 0 missed beyond one poll, 0 duplicate wakes with per-head GitHub/check and poll timestamps.
-- Live host queue/run receipt: **pending**, only after dry-run exit and accepted live configuration.
-- Agent registration/backstop instruction adoption: **pending**, only after canary/live acceptance through the normal instruction reviewer/applier.
+- Exact-final-head Actions, CodeQL, completed Devin analysis, finding dispositions and native Security → QA: **pending for the final source revision**; earlier-head results do not qualify a changed head.
+- Exact-artifact/host/configuration Security sign-off: **pending**, independently of source-only acceptance.
+- Applicable Release Manager production authorization: **pending**, required before Operator installation/activation.
+- Operator install of the Security-accepted artifact with `enabled: true`, `dryRun: false`: **pending**. No canary trial, twenty-head dry-run acceptance gate or disabled-first rollout is required. `dryRun` remains a configuration/rollback switch.
+- Authorized live host queue/run receipt: **pending**, within the accepted configuration and production authorization.
+- Agent registration/backstop instruction adoption: **pending**, through the normal instruction reviewer/applier; source merge alone does not authorize it.
 - Rollback/revocation proof: **pending**; runbook specifies dryRun/disable, remove bindings/tool access, owner disables optional webhook, retain card backstops.
 
 Do not erase the ledger to replay an unconfirmed wake or reinstall the old ownership heuristic as an automatic rollback. No installation or security exception is granted by merging source.
