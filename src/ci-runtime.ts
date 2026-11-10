@@ -4,7 +4,11 @@ import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID
 import { CiGithub, CiGithubCache, evaluateReadiness } from "./ci-github.js";
 import { retryableBeforeQueue } from "./native-wake.js";
 
-export const LIMITS = { active: 20, retained: 2_000, audit: 1_000, deliveries: 2_000, requestsPerTick: 240, wakePerTick: 20, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 180_000 } as const;
+export const LIMITS = { active: 20, retained: 2_000, audit: 1_000, deliveries: 2_000, requestsPerTick: 240, wakePerTick: 20, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 180_000, secretResolveMs: 15_000 } as const;
+export interface CiWakeRuntimeOptions {
+  /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
+  secretResolveTimeoutMs?: number;
+}
 const KEY = { scopeKind: "instance" as const, namespace: "ci-wake-v1", stateKey: "ledger" };
 type WaitStatus = "open" | "waking" | "woken" | "would_wake" | "unconfirmed" | "retired";
 export interface Wait extends Registration {
@@ -58,7 +62,35 @@ export class CiWakeRuntime {
   private readonly caches = new Map<string, CiGithubCache>();
   private webhookBudget = { since: 0, used: 0 };
 
-  constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now) {}
+  private readonly secretResolveTimeoutMs: number;
+
+  constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now, options: CiWakeRuntimeOptions = {}) {
+    const timeoutMs = options.secretResolveTimeoutMs ?? LIMITS.secretResolveMs;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("invalid_secret_resolve_timeout");
+    this.secretResolveTimeoutMs = timeoutMs;
+  }
+
+  /**
+   * Bound every secret RPC. A never-settling resolve must not hold the
+   * serialized queue: on timeout the caller fails closed and a late settle
+   * causes no fetch, client construction, or ledger effect.
+   */
+  private async resolveSecret(ref: NonNullable<CiConfig["githubTokenSecretRef"]>, companyId: string, configPath: string): Promise<string> {
+    const pending = Promise.resolve().then(() => this.ctx.secrets.resolve(ref, { companyId, configPath }));
+    // A late rejection after the deadline must not surface as unhandled.
+    pending.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("secret_resolution_timeout")), this.secretResolveTimeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
 
   private serialized<T>(fn: () => Promise<T>): Promise<T> {
     const next = this.lock.then(fn, fn);
@@ -104,7 +136,7 @@ export class CiWakeRuntime {
   }
 
   private async client(companyId: string, config: CiConfig, fetch: PluginContext["http"]["fetch"] = this.ctx.http.fetch.bind(this.ctx.http)): Promise<CiGithub> {
-    const token = await this.ctx.secrets.resolve(config.githubTokenSecretRef!, { companyId, configPath: "githubTokenSecretRef" });
+    const token = await this.resolveSecret(config.githubTokenSecretRef!, companyId, "githubTokenSecretRef");
     const key = `${companyId}:${config.githubTokenSecretRef!.secretId}:${config.githubTokenSecretRef!.version ?? "latest"}`;
     if (!this.caches.has(key)) {
       if (this.caches.size >= 8) this.caches.delete(this.caches.keys().next().value!);
@@ -249,6 +281,17 @@ export class CiWakeRuntime {
         const freshConfig = await this.config(wait.companyId);
         if (!freshConfig.allowedRepos.includes(wait.repo) || freshConfig.dryRun !== config.dryRun) throw new Error("configuration_changed");
         const current = await github.pull(wait.repo, wait.prNumber);
+        // The final GitHub read is the last external I/O before durable wake
+        // intent. Revalidate binding, enablement, allowlist, dry-run and the
+        // credential identity immediately after it: a change during that
+        // await must not be followed by a stale-authority requestWakeup.
+        // Missing evidence throws (retryable, never woken); a confirmed
+        // binding move retires via BindingChanged in the outer catch.
+        await this.checkBinding(wait);
+        const revalidated = await this.config(wait.companyId);
+        const sameCredential = (revalidated.githubTokenSecretRef?.secretId ?? null) === (config.githubTokenSecretRef?.secretId ?? null)
+          && (revalidated.githubTokenSecretRef?.version ?? "latest") === (config.githubTokenSecretRef?.version ?? "latest");
+        if (!revalidated.allowedRepos.includes(wait.repo) || revalidated.dryRun !== config.dryRun || !sameCredential) throw new Error("configuration_changed");
         if (current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo || current.headBranch !== wait.branch) {
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
@@ -346,7 +389,7 @@ export class CiWakeRuntime {
         if (this.now() - this.webhookBudget.since >= 60_000) this.webhookBudget = { since: this.now(), used: 0 };
         if (++this.webhookBudget.used > 6) throw new Error("webhook_verification_budget");
         let secret: string;
-        try { secret = await this.ctx.secrets.resolve(config.webhookSecretRef, { companyId, configPath: "webhookSecretRef" }); } catch { continue; }
+        try { secret = await this.resolveSecret(config.webhookSecretRef!, companyId, "webhookSecretRef"); } catch { continue; }
         if (!verifyCiSignature(secret, input.rawBody, signature)) continue;
         const replayKey = `${companyId}:${delivery}`;
         if (ledger.deliveries[replayKey]) return;

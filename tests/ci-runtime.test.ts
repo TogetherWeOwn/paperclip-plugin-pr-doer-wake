@@ -80,7 +80,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function setup(overrides: Record<string, unknown> = {}) {
+function setup(overrides: Record<string, unknown> = {}, runtimeOptions?: { secretResolveTimeoutMs?: number }) {
   let durable: Ledger | null = null;
   let now = START;
   let failWakingWrite = false;
@@ -137,7 +137,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     issues: { get: issueGet, assertCheckoutOwner, requestWakeup },
     executionWorkspaces: { get: workspaceGet }, secrets: { resolve: resolveSecret }, http: { fetch }, logger,
   } as unknown as PluginContext;
-  const runtime = new CiWakeRuntime(ctx, () => now);
+  const runtime = new CiWakeRuntime(ctx, () => now, runtimeOptions);
   return {
     ctx, runtime, rawConfig, issue, workspace, ownership, get, set, writes, assertCheckoutOwner, requestWakeup,
     issueGet, workspaceGet, resolveSecret, fetch, logger, configGet,
@@ -1181,6 +1181,154 @@ describe("signed check_suite hints", () => {
     await expect(h.runtime.webhook(webhook())).rejects.toThrow("webhook_signature_refused");
     expect(h.resolveSecret).not.toHaveBeenCalled();
     expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+});
+
+describe("bounded secret resolution", () => {
+  function hangingSecret() {
+    let settle!: (value: string) => void;
+    const promise = new Promise<string>((resolve) => { settle = resolve; });
+    return { promise, settle: (value: string) => settle(value) };
+  }
+
+  it("times out a never-settling register secret, releases serialization, and late resolve causes no fetch", async () => {
+    const h = setup({}, { secretResolveTimeoutMs: 20 });
+    const hanging = hangingSecret();
+    const normal = h.resolveSecret.getMockImplementation();
+    h.resolveSecret.mockImplementationOnce(() => hanging.promise);
+    const result = await h.runtime.register(registration, run);
+    expect(result).toHaveProperty("error");
+    expect(github.construct).not.toHaveBeenCalled();
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.fetch).not.toHaveBeenCalled();
+    expect(h.ledger().waits).toEqual([]);
+    // Late settle must not construct a client or fetch.
+    hanging.settle(TOKEN);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(github.construct).not.toHaveBeenCalled();
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(JSON.stringify(h.ledger())).not.toContain(TOKEN);
+    // The queue was released: a later registration on the same runtime succeeds.
+    h.resolveSecret.mockImplementation(normal as never);
+    const retry = await h.runtime.register(registration, run);
+    expect(retry).toMatchObject({ data: { status: "open" } });
+    expect(h.ledger().waits).toHaveLength(1);
+  });
+
+  it("times out a never-settling poll secret, keeps the wait retryable, and late resolve causes no fetch", async () => {
+    const h = setup({}, { secretResolveTimeoutMs: 20 });
+    await h.runtime.register(registration, run);
+    const hanging = hangingSecret();
+    const normal = h.resolveSecret.getMockImplementation();
+    h.resolveSecret.mockImplementationOnce(() => hanging.promise);
+    github.snapshot.mockClear();
+    github.pull.mockClear();
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open" });
+    expect(github.snapshot).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "poll", outcome: "retryable" });
+    hanging.settle(TOKEN);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(github.snapshot).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    // Queue released: next poll with a healthy secret proceeds.
+    h.resolveSecret.mockImplementation(normal as never);
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds webhook secret resolution the same way and releases serialization", async () => {
+    const h = setup({}, { secretResolveTimeoutMs: 20 });
+    await h.runtime.register(registration, run);
+    const hanging = hangingSecret();
+    const normal = h.resolveSecret.getMockImplementation();
+    h.resolveSecret.mockImplementation(async (ref: { secretId: string }) => {
+      if (ref.secretId === WEBHOOK_REF.secretId) return hanging.promise;
+      return normal!(ref, undefined as never) as Promise<string>;
+    });
+    github.snapshot.mockClear();
+    await expect(h.runtime.webhook(webhook())).rejects.toThrow("webhook_signature_refused");
+    expect(github.snapshot).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().deliveries).toEqual({});
+    hanging.settle(SECRET);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(github.snapshot).not.toHaveBeenCalled();
+    // Queue released: a healthy later webhook is admitted and wakes.
+    h.resolveSecret.mockImplementation(normal as never);
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.webhook(webhook({ delivery: NEXT_DELIVERY }));
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("final-read authorization revalidation", () => {
+  // Mutate during the final github.pull (second pull of the poll) and prove
+  // no durable wake intent follows. Config changes stay retryable (open);
+  // confirmed binding moves retire.
+  async function pollWithFinalReadMutation(mutate: (h: ReturnType<typeof setup>) => void) {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    github.pull.mockClear();
+    let calls = 0;
+    github.pull.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 2) mutate(h);
+      return pull();
+    });
+    await h.runtime.poll();
+    return h;
+  }
+
+  it.each([
+    ["disabling", (h: ReturnType<typeof setup>) => { h.rawConfig.enabled = false; }],
+    ["dry-run enablement", (h: ReturnType<typeof setup>) => { h.rawConfig.dryRun = true; }],
+    ["repo revocation", (h: ReturnType<typeof setup>) => { h.rawConfig.allowedRepos = ["acme/other"]; }],
+    ["credential change", (h: ReturnType<typeof setup>) => { h.rawConfig.githubTokenSecretRef = { type: "secret_ref", secretId: OTHER }; }],
+  ] as const)("prevents dispatch when %s lands during the final PR read", async (_name, mutate) => {
+    const h = await pollWithFinalReadMutation(mutate);
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    expect(h.ledger().waits.some((wait) => wait.status === "waking")).toBe(false);
+    expect(h.ledger().audits.some((entry) => entry.operation === "wake")).toBe(false);
+  });
+
+  it.each([
+    ["project rebinding", (h: ReturnType<typeof setup>) => { h.issue.projectId = OTHER; }],
+    ["workspace rebinding", (h: ReturnType<typeof setup>) => { h.issue.executionWorkspaceId = OTHER; h.workspace.id = OTHER; }],
+    ["branch rebinding", (h: ReturnType<typeof setup>) => { h.workspace.branchName = "feature/moved"; }],
+    ["repository rebinding", (h: ReturnType<typeof setup>) => { h.workspace.repoUrl = "https://github.com/acme/other"; }],
+  ] as const)("retires without dispatch on %s during the final PR read", async (_name, mutate) => {
+    const h = await pollWithFinalReadMutation(mutate);
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "retired", reason: "binding_changed" });
+    expect(h.ledger().waits.some((wait) => wait.status === "waking")).toBe(false);
+  });
+
+  it("does not dispatch when binding evidence goes missing during the final PR read", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    github.pull.mockClear();
+    let calls = 0;
+    github.pull.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 2) h.issueGet.mockResolvedValueOnce(null as never);
+      return pull();
+    });
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    expect(h.ledger().waits.some((wait) => wait.status === "waking")).toBe(false);
+  });
+
+  it("still wakes when nothing changes during the final PR read", async () => {
+    const h = await pollWithFinalReadMutation(() => undefined);
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 });
 
