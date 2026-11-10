@@ -859,30 +859,22 @@ describe("coverage, summary and cursor controls", () => {
     h.seedHead.mockResolvedValue(NOW - 8 * DAY);
     h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
     await h.runtime.poll();
-    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }), undefined);
+    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }));
     expect(h.ledger().heads["example/project#42"].at).toBe(NOW - 8 * DAY);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
   });
 
-  it("passes the PR disposition clock as seeding evidence", async () => {
-    const h = fixture({ cards: [card({ texts: [{ id: "description", body: "PR disposition: example/project#42 finish; next actor contributor; revisit 2026-01-01T00:00:00Z", at: NOW - 12 * DAY, ownership: true }], })] });
-    h.seedHead.mockResolvedValue(NOW - 12 * DAY);
-    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
-    await h.runtime.poll();
-    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }), NOW - 12 * DAY);
-    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 12 * DAY}` }));
-  });
-
-  it("keeps heads with no seeding evidence UNKNOWN and retries next tick", async () => {
+  it("falls back to a fresh warmup when no head-bound seeding evidence exists", async () => {
     const h = fixture();
-    h.seedHead.mockRejectedValue(new Error("no evidence"));
-    await h.runtime.poll();
-    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
-    expect(h.ledger().report.unknown).toContain("example/project#42");
-    expect(h.ledger().heads["example/project#42"]).toBeUndefined();
-    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    h.seedHead.mockResolvedValue(null);
     h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
     await h.runtime.poll();
-    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    // No evidence ever wakes immediately, but the head is staged so the
+    // inventory completes and the PR gets its conservative seven-day warmup
+    // instead of staying UNKNOWN forever (e.g. a repo with no CI).
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().report.unknown).not.toContain("example/project#42");
+    expect(h.ledger().report.complete).toBe(true);
   });
 });

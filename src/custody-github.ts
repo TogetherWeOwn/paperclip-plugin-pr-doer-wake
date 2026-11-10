@@ -143,18 +143,20 @@ export class CustodyGithub extends CiGithub {
   }
 
   /**
-   * Seed a newly observed head from the latest available evidence instead of
-   * wall-clock arrival: head check-suite updated_at, latest submitted review
-   * and the caller's PR-specific disposition time. PR created_at is only a
-   * floor. With no evidence from any of those sources this throws, so the
-   * caller treats the head as UNKNOWN and retries next tick rather than
-   * inventing activity. Seeded epochs never claim push time; they only keep
-   * already-idle PRs from waiting out a fresh seven-day warmup.
+   * Seed a newly observed head from the latest head-bound evidence instead of
+   * wall-clock arrival: head check-suite updated_at (scoped to the head
+   * commit) and submitted reviews on the head commit itself. PR created_at
+   * is only a floor. PR-wide evidence such as reviews of earlier commits or
+   * the card disposition line cannot prove this SHA was present at their
+   * time, so they never date a head; disposition still feeds the trigger
+   * epoch in custodyTriggers. With no head-bound evidence this returns null
+   * so the caller falls back to a conservative now() warmup rather than
+   * staying UNKNOWN forever. Seeded epochs never claim push time; they only
+   * keep already-idle PRs from waiting out a fresh seven-day warmup.
    */
-  async seedHead(pr: CustodyPull, dispositionAt?: number): Promise<number> {
+  async seedHead(pr: CustodyPull): Promise<number | null> {
     const { headSha } = identity(pr);
-    if (pr.state !== "open" || (dispositionAt !== undefined
-        && (!Number.isFinite(dispositionAt) || dispositionAt < 0 || dispositionAt > 8_640_000_000_000_000))) throw new CiGithubError("input");
+    if (pr.state !== "open") throw new CiGithubError("input");
     const commits = await this.connection(pr, "commits", (value) => {
       const oid = sha(object(object(value).commit).oid);
       return { key: oid, value: oid };
@@ -165,7 +167,7 @@ export class CustodyGithub extends CiGithub {
       if (!["PENDING", "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(text(review.state))) return invalid();
       const at = review.state === "PENDING" ? nullableTimestamp(review.submittedAt) : timestamp(review.submittedAt);
       if (review.state === "PENDING" && at !== null) return invalid();
-      return { key: text(review.id), value: at };
+      return { key: text(review.id), value: { at, oid: sha(object(review.commit).oid) } };
     });
     const suites = await this.connection(pr, "checkSuites", (value) => {
       const suite = object(value);
@@ -175,8 +177,9 @@ export class CustodyGithub extends CiGithub {
       if (updatedAt < createdAt) return invalid();
       return { key: text(suite.id), value: updatedAt };
     }, commits.length);
-    const evidence = [...reviews.filter((value): value is number => value !== null), ...suites, ...(dispositionAt !== undefined ? [dispositionAt] : [])];
-    if (!evidence.length) return invalid();
+    // Only reviews on this exact commit establish it was present then.
+    const evidence = [...reviews.filter((value) => value.at !== null && value.oid === headSha).map((value) => value.at!), ...suites];
+    if (!evidence.length) return null;
     return Math.max(pr.createdAt, ...evidence);
   }
 
@@ -230,7 +233,7 @@ export class CustodyGithub extends CiGithub {
     const { repo, number, headSha } = identity(pr);
     const [owner, name] = repo.split("/");
     const selection = kind === "commits" ? "commits(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid committedDate}}}"
-      : kind === "reviews" ? "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id state submittedAt}}"
+      : kind === "reviews" ? "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id state submittedAt commit{oid}}}"
         : "commits(last:1){totalCount nodes{commit{oid checkSuites(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id status createdAt updatedAt}}}}}";
     const query = `query CustodyActivity($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){nameWithOwner pullRequest(number:$number){number state headRefOid createdAt repository{nameWithOwner} ${selection}}}}`;
     const values: T[] = [];

@@ -216,10 +216,10 @@ export class CustodyRuntime {
                 let head = ledger.heads[ref];
                 if (!head || head.sha !== pr.headSha) {
                   if (!head && Object.keys(ledger.heads).length >= CUSTODY_LIMITS.prs) throw new Error("head_capacity");
-                  // Seed first observation from evidence (head suite, latest
-                  // review, PR disposition). No evidence throws, leaving the
-                  // head unstaged so the next tick retries seeding.
-                  const at = await github.seedHead(pr, latestDisposition(owner, pr)?.at);
+                  // Seed first observation from head-bound evidence (head
+                  // suite, review on the head commit). No evidence falls back
+                  // to arrival time, keeping liveness for CI-less repos.
+                  const at = (await github.seedHead(pr)) ?? this.now();
                   head = ledger.heads[ref] = { sha: pr.headSha, at };
                 }
                 activity = await github.activity(pr, head.at);
