@@ -42,7 +42,7 @@ Before the wake API call, persist a `waking` intent and stable `(repo, headSha, 
 
 **No cross-worker CAS is provided by stock plugin state.** Run one installed worker/ledger, not overlapping independent installations. A process-local lock is not evidence of distributed fencing. Security must accept or reject this deployment envelope explicitly.
 
-Webhook verification uses timingSafeEqual, raw bytes, SHA-256 only, delivery UUID replay entries for 24 hours, repository/organization allowlists, 20-second head debounce and six hints/minute. Six secret verifications/minute prevent forged traffic consuming the host's entire secret-resolution quota. Malformed/oversized payloads are rejected. Payloads without an existing exact-head registration create no wait. Dropped hints never bypass readiness; the independent four-minute poll catches them.
+Webhook verification uses timingSafeEqual, raw bytes, SHA-256 only, delivery UUID replay entries for 24 hours, repository/organization allowlists, 20-second head debounce and six hints/minute. Admission before the worker queue is limited to two outstanding hints and six candidate bodies/minute, before any ledger/configuration RPC. Six secret verifications/minute independently limit consumption of the host secret-resolution quota. Malformed/oversized payloads are rejected. Payloads without an existing exact-head registration create no wait. Dropped hints never bypass readiness; the independent four-minute poll catches them.
 
 ## Caps, expiry and audit
 

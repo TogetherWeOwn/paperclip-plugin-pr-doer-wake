@@ -45,10 +45,23 @@ function header(input: PluginWebhookInput, name: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/** These stock-host guards run before enqueue; all other exceptions may be post-dispatch. */
+function retryableBeforeQueue(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /^(Company|Agent|Project) cannot start work while completed runs await accounting\.$/.test(error.message)
+    || error.message === "New work must wait while a native run recovers its unfinished accounting."
+    || error.message === "worker RPC host is not running"
+    || ((error as { code?: unknown }).code === -32000 && error.message === "Plugin is held for idle sleep");
+}
+
 /** One host-managed worker owns this ledger. All entrypoints share its lock, including overlapping job callbacks. */
 export class CiWakeRuntime {
   private lock: Promise<unknown> = Promise.resolve();
   private pollInFlight = false;
+  private targetedPoll = false;
+  private fullPollRequested = false;
+  private pendingWebhooks = 0;
+  private webhookAdmissions = { since: 0, used: 0 };
   private readonly caches = new Map<string, CiGithubCache>();
   private webhookBudget = { since: 0, used: 0 };
 
@@ -130,11 +143,15 @@ export class CiWakeRuntime {
         waitId = createHash("sha256").update(JSON.stringify([run.companyId, run.runId, registration.issueId, registration.repo, registration.prNumber, registration.headSha])).digest("hex");
         const existing = ledger.waits.find((w) => w.waitId === waitId || w.aliases.includes(waitId!));
         if (existing) {
+          if (existing.status === "open" && (existing.projectId !== binding.projectId || existing.workspaceId !== binding.workspaceId || existing.branch !== binding.branch)) {
+            existing.status = "retired"; existing.finishedAt = this.now(); existing.reason = "binding_changed";
+            throw new Error("registration_requires_new_run");
+          }
           this.audit(ledger, "register", "duplicate", run, waitId);
           await this.save(ledger);
           return { content: "CI wait already registered", data: { waitId: existing.waitId, status: existing.status, expiresAt: existing.expiresAt } };
         }
-        const active = ledger.waits.find((w) => w.companyId === run.companyId && w.issueId === registration.issueId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.headSha === registration.headSha && w.status === "open");
+        const active = ledger.waits.find((w) => w.companyId === run.companyId && w.issueId === registration.issueId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.headSha === registration.headSha && w.status === "open" && w.projectId === binding.projectId && w.workspaceId === binding.workspaceId && w.branch === binding.branch);
         if (active) {
           if (active.aliases.length >= 100) throw new Error("wait_alias_capacity");
           active.aliases.push(waitId);
@@ -170,9 +187,24 @@ export class CiWakeRuntime {
   }
 
   async poll(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
-    if (this.pollInFlight) return;
+    if (this.pollInFlight) {
+      if (!only && this.targetedPoll) this.fullPollRequested = true;
+      return;
+    }
     this.pollInFlight = true;
-    try { await this.serialized(() => this.pollLocked(only)); } finally { this.pollInFlight = false; }
+    this.targetedPoll = only !== undefined;
+    try {
+      await this.serialized(() => this.pollLocked(only));
+      if (this.fullPollRequested) {
+        this.targetedPoll = false;
+        this.fullPollRequested = false;
+        await this.serialized(() => this.pollLocked());
+      }
+    } finally {
+      this.pollInFlight = false;
+      this.targetedPoll = false;
+      this.fullPollRequested = false;
+    }
   }
 
   private async pollLocked(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
@@ -236,20 +268,29 @@ export class CiWakeRuntime {
           // Persist before calling the host. Restart/ambiguous replies NEVER repeat an attempted effect.
           wait.status = "waking";
           this.audit(ledger, "wake", "intent", undefined, wait.waitId);
-          await this.save(ledger);
-          wakes += 1;
-          try {
-            const result = await this.ctx.issues.requestWakeup(wait.issueId, wait.companyId, { reason, contextSource: "plugin.ci-wake", idempotencyKey: `ci-wake:${wait.repo}:${wait.headSha}:${wait.waitId}` });
-            wait.status = result.queued ? "woken" : "open";
-            if (result.queued) wait.finishedAt = this.now();
-            this.audit(ledger, "wake", result.queued ? "woken" : "host_deferred", undefined, wait.waitId);
-            await this.save(ledger);
-          } catch {
-            wait.status = "unconfirmed"; wait.finishedAt = this.now();
-            this.audit(ledger, "wake", "unconfirmed", undefined, wait.waitId);
-            await this.save(ledger);
-            this.ctx.logger.warn("ci-wake: wake unconfirmed; use the card backstop", { waitId: wait.waitId });
+          try { await this.save(ledger); } catch {
+            // The write may have committed, but no wake call has been made: restoring open is safe.
+            wait.status = "open";
+            throw new Error("wake_intent_write_failed");
           }
+          wakes += 1;
+          let result: Awaited<ReturnType<PluginContext["issues"]["requestWakeup"]>>;
+          try {
+            result = await this.ctx.issues.requestWakeup(wait.issueId, wait.companyId, { reason, contextSource: "plugin.ci-wake", idempotencyKey: `ci-wake:${wait.repo}:${wait.headSha}:${wait.waitId}` });
+          } catch (error) {
+            const deferred = retryableBeforeQueue(error);
+            wait.status = deferred ? "open" : "unconfirmed";
+            if (!deferred) wait.finishedAt = this.now();
+            this.audit(ledger, "wake", deferred ? "host_deferred" : "unconfirmed", undefined, wait.waitId);
+            await this.save(ledger);
+            if (!deferred) this.ctx.logger.warn("ci-wake: wake unconfirmed; use the card backstop", { waitId: wait.waitId });
+            continue;
+          }
+          wait.status = result.queued ? "woken" : "open";
+          if (result.queued) wait.finishedAt = this.now();
+          this.audit(ledger, "wake", result.queued ? "woken" : "host_deferred", undefined, wait.waitId);
+          // Recording failures after dispatch are never classified as a pre-queue refusal.
+          await this.save(ledger);
         }
       } catch {
         this.audit(ledger, "poll", "retryable", undefined, wait.waitId);
@@ -271,6 +312,15 @@ export class CiWakeRuntime {
     const repo = typeof payload.repository?.full_name === "string" ? payload.repository.full_name.toLowerCase() : "";
     const sha = payload.check_suite?.head_sha;
     if (typeof sha !== "string" || !SHA.test(sha)) throw new Error("invalid_webhook_payload");
+    if (this.now() - this.webhookAdmissions.since >= 60_000) this.webhookAdmissions = { since: this.now(), used: 0 };
+    if (this.pendingWebhooks >= 2 || this.webhookAdmissions.used >= 6) throw new Error("webhook_admission_budget");
+    this.webhookAdmissions.used += 1;
+    this.pendingWebhooks += 1;
+    try { await this.webhookAdmitted(input, repo, sha, signature, delivery); } finally { this.pendingWebhooks -= 1; }
+  }
+
+  private async webhookAdmitted(input: PluginWebhookInput, repo: string, sha: string, signature: string, delivery: string): Promise<void> {
+    const payload = JSON.parse(input.rawBody) as Record<string, any>;
     let target: { companyId: string; repo: string; sha: string } | undefined;
     await this.serialized(async () => {
       const ledger = await this.load();

@@ -84,7 +84,9 @@ function setup(overrides: Record<string, unknown> = {}) {
   let durable: Ledger | null = null;
   let now = START;
   let failWakingWrite = false;
+  let commitWakingWrite = false;
   let failIntentWrite = false;
+  let outcomeWriteError: Error | null = null;
   const rawConfig = config(overrides);
   const issue = {
     id: ISSUE, companyId: COMPANY, projectId: PROJECT, executionWorkspaceId: WORKSPACE,
@@ -104,7 +106,13 @@ function setup(overrides: Record<string, unknown> = {}) {
     writes.push(clone(ledger));
     if (failWakingWrite && ledger.waits.some((wait) => wait.status === "waking")) {
       failWakingWrite = false;
+      if (commitWakingWrite) durable = clone(ledger);
       throw new Error("state unavailable before wake mark");
+    }
+    if (outcomeWriteError && ledger.waits.some((wait) => wait.status === "woken")) {
+      const error = outcomeWriteError;
+      outcomeWriteError = null;
+      throw error;
     }
     if (failIntentWrite && ledger.audits.at(-1)?.outcome === "intent") {
       failIntentWrite = false;
@@ -137,8 +145,9 @@ function setup(overrides: Record<string, unknown> = {}) {
     clock: () => now,
     ledger: () => clone(durable!),
     seed: (ledger: Ledger) => { durable = clone(ledger); },
-    failWakingWrite: () => { failWakingWrite = true; },
+    failWakingWrite: (committed = false) => { failWakingWrite = true; commitWakingWrite = committed; },
     failIntentWrite: () => { failIntentWrite = true; },
+    failOutcomeWrite: (error: Error) => { outcomeWriteError = error; },
   };
 }
 
@@ -552,6 +561,68 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
+  it.each([
+    new Error("Company cannot start work while completed runs await accounting."),
+    new Error("Agent cannot start work while completed runs await accounting."),
+    new Error("Project cannot start work while completed runs await accounting."),
+    new Error("New work must wait while a native run recovers its unfinished accounting."),
+    new Error("worker RPC host is not running"),
+    Object.assign(new Error("Plugin is held for idle sleep"), { code: -32000 }),
+  ])("retries an exact known pre-queue host guard without retiring the wait (%s)", async (error) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    h.requestWakeup.mockRejectedValueOnce(error);
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    expect(h.ledger().waits[0]?.finishedAt).toBeUndefined();
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "wake", outcome: "host_deferred" });
+    expect(h.logger.warn).not.toHaveBeenCalled();
+    const restarted = new CiWakeRuntime(h.ctx, h.clock);
+    await restarted.poll();
+    await restarted.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(h.requestWakeup.mock.calls[0]).toEqual(h.requestWakeup.mock.calls[1]);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
+  });
+
+  it.each([
+    { label: "accounting text embedded in an unknown error", error: new Error("Wake reply lost: Company cannot start work while completed runs await accounting.") },
+    { label: "non-exact SDK shutdown text", error: new Error("Worker RPC host is not running") },
+    { label: "idle sleep without the SDK code", error: new Error("Plugin is held for idle sleep") },
+    { label: "idle sleep with a different code", error: Object.assign(new Error("Plugin is held for idle sleep"), { code: -32001 }) },
+    { label: "an untyped object resembling an accounting error", error: { message: "Company cannot start work while completed runs await accounting." } },
+  ])("does not retry ambiguous lookalike host errors: $label", async ({ error }) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    h.requestWakeup.mockRejectedValueOnce(error);
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]?.status).toBe("unconfirmed");
+    await new CiWakeRuntime(h.ctx, h.clock).poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().audits.some((entry) => entry.outcome === "host_deferred")).toBe(false);
+  });
+
+  it.each([
+    "Company cannot start work while completed runs await accounting.",
+    "New work must wait while a native run recovers its unfinished accounting.",
+  ])("never classifies an outcome-save failure as a pre-queue host guard after a queued wake (%s)", async (message) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    h.failOutcomeWrite(new Error(message));
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
+    expect(h.ledger().audits.some((entry) => entry.outcome === "host_deferred")).toBe(false);
+    const restarted = new CiWakeRuntime(h.ctx, h.clock);
+    expect(await restarted.register(registration, run)).toMatchObject({ data: { status: "woken" } });
+    await restarted.poll();
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("treats an ambiguous host exception as unconfirmed and never repeats it across restart or same-run retry", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
@@ -582,16 +653,21 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
-  it("does not call the host if durable state is unavailable before wake intent", async () => {
+  it.each([false, true])("restores an undispatched wait to open after a failed waking save, including a lost write reply (committed=%s)", async (committed) => {
     const h = setup();
     await h.runtime.register(registration, run);
+    const waitId = h.ledger().waits[0]!.waitId;
     github.readiness.mockReturnValue(verdict("pass"));
-    h.failWakingWrite();
+    h.failWakingWrite(committed);
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
-    expect(h.ledger().waits[0]?.status).not.toBe("woken");
-    await new CiWakeRuntime(h.ctx, h.clock).poll();
-    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ waitId, status: "open" });
+    expect(h.ledger().waits[0]?.finishedAt).toBeUndefined();
+    const restarted = new CiWakeRuntime(h.ctx, h.clock);
+    await restarted.poll();
+    await restarted.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]).toMatchObject({ waitId, status: "woken" });
   });
 
   it("fails closed on a state read outage without credentials or host effects", async () => {
@@ -626,6 +702,45 @@ describe("CI wait identity and serialization", () => {
     const joined = await h.runtime.register(registration, { ...run, runId: NEXT_RUN });
     expect(joined).toMatchObject({ content: "Joined active CI wait", data: { waitId: waitData(first).waitId, expiresAt: START + LIMITS.waitMs } });
     expect(h.ledger().waits).toHaveLength(1);
+  });
+
+  it("creates a new wait for a new authorized run after workspace replacement despite an unchanged branch, repo and head", async () => {
+    const h = setup();
+    const first = await h.runtime.register(registration, run);
+    h.issue.executionWorkspaceId = OTHER;
+    h.workspace.id = OTHER;
+    h.ownership.runId = NEXT_RUN;
+    const replacement = await h.runtime.register(registration, { ...run, runId: NEXT_RUN });
+    expect(replacement).toMatchObject({ content: "CI wait registered", data: { status: "open" } });
+    expect(waitData(replacement).waitId).not.toBe(waitData(first).waitId);
+    expect(h.ledger().waits).toEqual([
+      expect.objectContaining({ waitId: waitData(first).waitId, workspaceId: WORKSPACE, status: "retired", reason: "superseded", aliases: [] }),
+      expect.objectContaining({ waitId: waitData(replacement).waitId, workspaceId: OTHER, branch: BRANCH, repo: REPO, headSha: HEAD, runId: NEXT_RUN, status: "open" }),
+    ]);
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({
+      idempotencyKey: `ci-wake:${REPO}:${HEAD}:${waitData(replacement).waitId}`,
+    }));
+  });
+
+  it("refuses a same-run workspace replacement, retaining the retired wait instead of rearming its identity", async () => {
+    const h = setup();
+    const first = await h.runtime.register(registration, run);
+    h.issue.executionWorkspaceId = OTHER;
+    h.workspace.id = OTHER;
+    h.resolveSecret.mockClear();
+    expect(await h.runtime.register(registration, run)).toHaveProperty("error");
+    expect(h.ledger().waits).toEqual([
+      expect.objectContaining({ waitId: waitData(first).waitId, workspaceId: WORKSPACE, status: "retired", reason: "binding_changed" }),
+    ]);
+    expect(await h.runtime.register(registration, run)).toMatchObject({ data: { waitId: waitData(first).waitId, status: "retired" } });
+    github.readiness.mockReturnValue(verdict("pass"));
+    await new CiWakeRuntime(h.ctx, h.clock).poll();
+    expect(h.ledger().waits).toHaveLength(1);
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
   it("remembers a joining run's alias after settlement so its retry cannot rearm the wait", async () => {
@@ -697,6 +812,40 @@ describe("CI wait identity and serialization", () => {
     expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
+  it("follows a targeted poll with a full pass when a scheduled poll arrives in flight, covering the other registered wait", async () => {
+    const h = setup();
+    const otherWorkspace = { ...h.workspace, id: "66666666-6666-4666-8666-666666666667", branchName: "feature/second-opaque-branch" };
+    const otherIssue = { ...h.issue, id: OTHER, executionWorkspaceId: otherWorkspace.id };
+    h.issueGet.mockImplementation(async (id) => clone(id === OTHER ? otherIssue : h.issue));
+    h.workspaceGet.mockImplementation(async (id) => clone(id === otherWorkspace.id ? otherWorkspace : h.workspace));
+    h.assertCheckoutOwner.mockImplementation(async (input) => {
+      if (![ISSUE, OTHER].includes(input.issueId) || input.companyId !== COMPANY || input.actorAgentId !== AGENT || input.actorRunId !== RUN) {
+        throw new Error("not the checkout owner");
+      }
+    });
+    github.pull.mockImplementation(async (_repo, number) => pull(number === 18
+      ? { number: 18, headSha: NEXT_HEAD, headBranch: otherWorkspace.branchName }
+      : {}));
+    expect(await h.runtime.register(registration, run)).toMatchObject({ data: { status: "open" } });
+    expect(await h.runtime.register({ ...registration, issueId: OTHER, prNumber: 18, headSha: NEXT_HEAD }, run)).toMatchObject({ data: { status: "open" } });
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    github.readiness.mockReturnValue(verdict("pass"));
+    const targeted = h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+    await entered.promise;
+    const fullJob = h.runtime.poll();
+    await fullJob;
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    release.resolve();
+    await targeted;
+    expect(github.snapshot.mock.calls.map(([, sha]) => sha)).toEqual([HEAD, NEXT_HEAD]);
+    expect(h.requestWakeup.mock.calls.map(([issueId]) => issueId)).toEqual([ISSUE, OTHER]);
+    expect(h.ledger().waits.map((wait) => wait.status)).toEqual(["woken", "woken"]);
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(2);
+  });
+
   it("coalesces an overlapping poll while a terminal poll and registration retry are in flight", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
@@ -755,7 +904,7 @@ describe("signed check_suite hints", () => {
     expect(h.ledger().deliveries).toEqual({});
   });
 
-  it("bounds secret resolution for invalid signatures and replenishes the verification budget after a minute", async () => {
+  it("admits at most six structurally valid bodies per minute and rejects excess before ledger, config or secret reads", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
     h.resolveSecret.mockClear();
@@ -763,12 +912,46 @@ describe("signed check_suite hints", () => {
     for (let index = 0; index < 6; index += 1) {
       await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_signature_refused");
     }
-    await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_verification_budget");
+    const reads = h.get.mock.calls.length;
+    const configReads = h.configGet.mock.calls.length;
+    await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_admission_budget");
+    expect(h.get).toHaveBeenCalledTimes(reads);
+    expect(h.configGet).toHaveBeenCalledTimes(configReads);
     expect(h.resolveSecret).toHaveBeenCalledTimes(6);
     expect(h.requestWakeup).not.toHaveBeenCalled();
     h.advance(60_000);
     await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_signature_refused");
     expect(h.resolveSecret).toHaveBeenCalledTimes(7);
+  });
+
+  it("allows only two outstanding webhooks and rejects overflow before serialization while the runtime lock is occupied", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    const poll = h.runtime.poll();
+    await entered.promise;
+    h.get.mockClear();
+    h.configGet.mockClear();
+    h.resolveSecret.mockClear();
+    const first = h.runtime.webhook(webhook());
+    const second = h.runtime.webhook(webhook({ delivery: NEXT_DELIVERY }));
+    try {
+      for (let index = 0; index < 3; index += 1) {
+        await expect(h.runtime.webhook(webhook())).rejects.toThrow("webhook_admission_budget");
+      }
+      expect(h.get).not.toHaveBeenCalled();
+      expect(h.configGet).not.toHaveBeenCalled();
+      expect(h.resolveSecret).not.toHaveBeenCalled();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await Promise.all([poll, first, second]);
+    }
+    // Rejected overflow did not consume admissions or strand outstanding slots.
+    await h.runtime.webhook(webhook({ delivery: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac" }));
+    expect(h.ledger().deliveries[`${COMPANY}:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac`]).toBe(START);
   });
 
   it("does not let a replay trigger a second poll, including while the registration remains open", async () => {

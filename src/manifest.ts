@@ -50,7 +50,7 @@ const manifest: PaperclipPluginManifestV1 = {
     properties: {
       enabled: { type: "boolean", default: false },
       dryRun: { type: "boolean", default: true },
-      allowedRepos: { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", maxLength: 140, pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$" }, default: [] },
+      allowedRepos: { type: "array", minItems: 0, maxItems: 100, uniqueItems: true, items: { type: "string", maxLength: 140, pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$" }, default: [] },
       githubTokenSecretRef: { ...secretRef, description: "Existing read-only GitHub credential: pull requests, checks, commit statuses and branch rules/protection. Resolved only at call time." },
       webhooksEnabled: { type: "boolean", default: false },
       webhookSecretRef: { ...secretRef, description: "Phase two only: webhook HMAC secret stored by the owner in Paperclip." },

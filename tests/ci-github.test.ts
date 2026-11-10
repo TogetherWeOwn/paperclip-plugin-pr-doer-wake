@@ -153,6 +153,25 @@ describe("evaluateReadiness", () => {
       .toMatchObject({ kind: "pending", missingSince: null, missingFailAt: null });
   });
 
+  it.each([false, true])("waits for missing-check grace despite an existing failure (has suites: %s)", (hasSuites) => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }, { context: "lint", appId: null }],
+      runs: [run(1, { conclusion: "failure" })], suites: hasSuites ? [suite()] : [],
+    });
+    const deadline = (hasSuites ? 5_000 : timing.registeredAt) + 2 * timing.medianMs;
+    expect(evaluateReadiness(input, { ...timing, now: deadline - 1 })).toMatchObject({
+      kind: "pending", failed: ["build [app 7]"], missing: ["lint"], missingFailAt: deadline,
+    });
+    expect(evaluateReadiness(input, { ...timing, now: deadline })).toMatchObject({
+      kind: "fail", failed: ["build [app 7]"], missing: ["lint"], missingFailAt: deadline,
+    });
+    input.required.push({ context: "test", appId: 7 });
+    input.runs.push(run(2, { name: "test", status: "queued", conclusion: null }));
+    expect(evaluateReadiness(input, { ...timing, now: deadline })).toMatchObject({
+      kind: "pending", failed: ["build [app 7]"], missing: ["lint"], pending: ["test [app 7]"],
+    });
+  });
+
   it("does not expire missing checks while a present required context is pending", () => {
     const input = snapshot({
       required: [{ context: "build", appId: 7 }, { context: "lint", appId: null }],

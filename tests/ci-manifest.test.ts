@@ -20,6 +20,14 @@ describe("stock manifest and config contract", () => {
     expect(manifest.jobs?.[0]?.schedule).toBe("*/4 * * * *");
   });
 
+  it("accepts disabled defaults and allowlist revocation but refuses enabling an empty allowlist", () => {
+    for (const config of [{}, { enabled: false, allowedRepos: [] }, { enabled: false, dryRun: true, allowedRepos: [] }]) {
+      expect(validateInstanceConfig(config, manifest.instanceConfigSchema!).valid).toBe(true);
+      expect(validateCiConfig(config)).toEqual([]);
+    }
+    expect(validateCiConfig({ ...enabled, allowedRepos: [] }).length).toBeGreaterThan(0);
+  });
+
   it("accepts actual secret-picker objects without requiring a webhook in polling mode", () => {
     expect(validateInstanceConfig(enabled, manifest.instanceConfigSchema!).valid).toBe(true);
     expect(validateCiConfig(enabled)).toEqual([]);

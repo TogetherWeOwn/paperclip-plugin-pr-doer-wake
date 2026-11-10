@@ -489,7 +489,7 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   }
   const missingExpired = missing.length > 0 && pending.length === 0 && missingFailAt !== null && timing.now >= missingFailAt;
   return {
-    kind: pending.length ? "pending" : failed.length || missingExpired ? "fail" : missing.length ? "pending" : "pass",
+    kind: pending.length || (missing.length && !missingExpired) ? "pending" : failed.length || missingExpired ? "fail" : "pass",
     failed: [...new Set(failed)], missing: [...new Set(missing)], pending: [...new Set(pending)],
     lastSuiteCompletedAt, missingSince, missingFailAt,
   };
