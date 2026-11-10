@@ -36,6 +36,11 @@ function host(data: { cards?: Row[]; comments?: Row[]; documents?: Row[] } = {})
   const tables = {
     issues: data.cards ?? [card()], issue_comments: data.comments ?? [], issue_documents: data.documents ?? [],
   };
+  const ordered = {
+    issues: [...tables.issues].sort((a, b) => (a.id as string).localeCompare(b.id as string)),
+    issue_comments: [...tables.issue_comments].sort((a, b) => (a.id as string).localeCompare(b.id as string)),
+    issue_documents: [...tables.issue_documents].sort((a, b) => (a.id as string).localeCompare(b.id as string)),
+  };
   const guard = vi.fn<() => void>();
   const trace: string[] = [];
   guard.mockImplementation(() => { trace.push("guard"); });
@@ -58,10 +63,21 @@ function host(data: { cards?: Row[]; comments?: Row[]; documents?: Row[] } = {})
       expect(typeof selected).toBe("string");
       issueIds = (selected as string).slice(1, -1).split(",");
     }
-    return tables[table].filter((row) => row.company_id === company
-      && (cursor === null || (row.id as string) > (cursor as string))
-      && (!issueIds || issueIds.includes(row.issue_id as string)))
-      .sort((a, b) => (a.id as string).localeCompare(b.id as string)).slice(0, limit as number);
+    // Model the database's ordered keyset access, not a full-table sort per page.
+    const rows = ordered[table];
+    let low = 0;
+    let high = rows.length;
+    if (cursor !== null) while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if ((rows[mid]!.id as string) <= (cursor as string)) low = mid + 1;
+      else high = mid;
+    }
+    const result: Row[] = [];
+    for (let i = low; i < rows.length && result.length < (limit as number); i++) {
+      const row = rows[i]!;
+      if (row.company_id === company && (!issueIds || issueIds.includes(row.issue_id as string))) result.push(row);
+    }
+    return result;
   });
   const get = vi.fn(async (issueId: string, key: string, companyId: string): Promise<Row | null> => {
     trace.push("get");
