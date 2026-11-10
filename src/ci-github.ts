@@ -115,6 +115,11 @@ const ORIGIN = "https://api.github.com";
 const PAGE_SIZE = 100;
 // Recognize provider credential shapes without retaining expired/previous tokens.
 const SECRET_SHAPE = /(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{16,}|-----BEGIN (?:RSA )?PRIVATE KEY-----/;
+const SECRET_SHAPE_GLOBAL = new RegExp(SECRET_SHAPE.source, "g");
+// GitHub PR/issue free-text fields custody consumes as prose. Only these are
+// redacted in place; every other credential-shaped string is dropped so strict
+// identifier projections keep failing closed. Neither field can hold an identifier.
+const FREE_TEXT_KEYS = new Set(["title", "body"]);
 type JsonObject = Record<string, unknown>;
 function invalid(): never { throw new CiGithubError("response"); }
 function object(value: unknown): JsonObject {
@@ -560,9 +565,21 @@ export class CiGithub {
       // A reviver also catches reflection hidden by JSON escapes, including property names.
       return JSON.parse(body, (key: string, value: unknown) => {
         if (token && (key.includes(token) || (typeof value === "string" && value.includes(token)))) return invalid();
-        if (SECRET_SHAPE.test(key) || typeof value === "string" && !(exchange && key === "token") && SECRET_SHAPE.test(value)) {
+        if (SECRET_SHAPE.test(key)) {
           if (exchange) return invalid();
-          // Drop token-like free text before caching. A consumed field removed
+          return undefined;
+        }
+        if (typeof value === "string" && !(exchange && key === "token") && SECRET_SHAPE.test(value)) {
+          if (exchange) return invalid();
+          // Custody consumes PR/issue prose as text: redact credential shapes
+          // in place so inventory survives without retaining them in the cache.
+          // A PEM block's base64 body is credential material even though only
+          // its header matches SECRET_SHAPE, so redact the whole block.
+          if (FREE_TEXT_KEYS.has(key)) return value
+            .replace(/-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA )?PRIVATE KEY-----/g, "[REDACTED]")
+            .replace(/-----BEGIN (?:RSA )?PRIVATE KEY-----[\s\S]*$/g, "[REDACTED]")
+            .replace(SECRET_SHAPE_GLOBAL, "[REDACTED]");
+          // Drop token-like unused prose before caching. A consumed field removed
           // here still fails its strict projection; unused PR/CI prose does not.
           return undefined;
         }
