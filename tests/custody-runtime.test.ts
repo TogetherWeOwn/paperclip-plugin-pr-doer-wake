@@ -788,8 +788,8 @@ describe("coverage, summary and cursor controls", () => {
     expect(Object.keys(h.ledger().heads)).toHaveLength(10_000);
     await h.restart().poll();
     expect(h.ledger().heads).toEqual({
-      "example/project#42": { sha: "a".repeat(40), at: NOW },
-      "example/project#43": { sha: "a".repeat(40), at: NOW + DAY },
+      "example/project#42": { sha: "a".repeat(40), at: NOW, provenance: "seeded" },
+      "example/project#43": { sha: "a".repeat(40), at: NOW + DAY, provenance: "seeded" },
     });
     expect(h.activity).toHaveBeenCalledWith(prs[1], NOW + DAY);
   });
@@ -864,17 +864,143 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
   });
 
-  it("falls back to a fresh warmup when no head-bound seeding evidence exists", async () => {
+  it("keeps a head with no seeding evidence UNKNOWN for idle, then adopts later evidence", async () => {
     const h = fixture();
     h.seedHead.mockResolvedValue(null);
     h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
     await h.runtime.poll();
-    // No evidence ever wakes immediately, but the head is staged so the
-    // inventory completes and the PR gets its conservative seven-day warmup
-    // instead of staying UNKNOWN forever (e.g. a repo with no CI).
-    expect(h.ledger().heads["example/project#42"].at).toBe(NOW);
+    // No evidence stays UNKNOWN for idle: no fabricated arrival epoch, so a
+    // seven-day passage without genuine evidence must never wake either.
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: null });
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
-    expect(h.ledger().report.unknown).not.toContain("example/project#42");
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().report.complete).toBe(false);
+    h.advance(8 * DAY);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"].at).toBeNull();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    // Genuine head-bound evidence arriving later is still discoverable and
+    // seeds the retained head without waiting out another warmup.
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW - 8 * DAY);
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
+  });
+
+  it("revalidates a legacy numeric head epoch that may be a synthesized arrival fallback", async () => {
+    const h = fixture();
+    // Preload the base-version ledger shape: a numeric head epoch with no
+    // provenance, as written by the old seedHead(...) ?? now() fallback.
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const legacy = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW - 8 * DAY } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), legacy);
+    h.seedHead.mockResolvedValue(null);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    // An unproven legacy epoch is revalidated from head-bound evidence:
+    // with no evidence the head stays UNKNOWN and never wakes, even though
+    // the legacy epoch is already 8 days old.
+    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }));
+    expect(h.ledger().heads["example/project#42"].at).toBeNull();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    // Later genuine evidence is still adopted on the same retained head.
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: NOW - 8 * DAY, provenance: "seeded" });
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
+  });
+
+  it("preserves a legacy changed-head warmup instead of adopting older stale evidence", async () => {
+    const h = fixture();
+    // A legacy numeric epoch with no provenance may be an intentional
+    // changed-SHA warmup (a force-push revert records arrival time). Older
+    // head-bound evidence from the same SHA predates that warmup and must
+    // not shorten it into an early wake.
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const legacy = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW - DAY } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), legacy);
+    h.seedHead.mockResolvedValue(NOW - 20 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }));
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: NOW - DAY, provenance: "warmup" });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    // The preserved warmup still completes seven days after the legacy
+    // timestamp without reseeding.
+    h.seedHead.mockClear();
+    h.advance(7 * DAY);
+    await h.runtime.poll();
+    expect(h.seedHead).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - DAY}` }));
+  });
+
+  it("keeps the legacy warmup floor across a no-evidence tick and restart instead of adopting older stale evidence", async () => {
+    const h = fixture();
+    // Recent legacy warmup (1 day old, so 6 days remain). A valid null tick
+    // must park this bound in `floor` while staying UNKNOWN, and the bound
+    // must survive restart so older stale evidence on the next tick still
+    // cannot wake early (it would otherwise become a seeded 20-day epoch).
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const legacy = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW - DAY } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), legacy);
+    h.seedHead.mockResolvedValue(null);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: null, floor: NOW - DAY });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    // After restart, older stale evidence arrives: the parked floor wins, so
+    // no early idle wake fires.
+    h.seedHead.mockResolvedValue(NOW - 20 * DAY);
+    h.advance(60 * 60 * 1000);
+    await h.restart().poll();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: NOW - DAY, provenance: "warmup" });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    // The preserved warmup still completes seven days after the legacy timestamp.
+    h.seedHead.mockClear();
+    h.advance(6 * DAY);
+    await h.restart().poll();
+    expect(h.seedHead).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - DAY}` }));
+  });
+
+  it("adopts newer head-bound evidence over a legacy numeric epoch", async () => {
+    const h = fixture();
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const legacy = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW - 8 * DAY } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), legacy);
+    h.seedHead.mockResolvedValue(NOW - 2 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: NOW - 2 * DAY, provenance: "seeded" });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().report.complete).toBe(true);
+  });
+
+  it("trusts a provenanced seeded epoch without reseeding it", async () => {
+    const h = fixture();
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const ledger = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW - 8 * DAY, provenance: "seeded" } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), ledger);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.seedHead).not.toHaveBeenCalled();
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
+  });
+
+  it("preserves an intentional warmup epoch without reseeding it", async () => {
+    const h = fixture();
+    const key = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
+    const ledger = { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: { "example/project#42": { sha: "a".repeat(40), at: NOW, provenance: "warmup" } }, dispositions: {}, audits: [], report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } };
+    h.state.set(JSON.stringify(key), ledger);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.seedHead).not.toHaveBeenCalled();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "a".repeat(40), at: NOW, provenance: "warmup" });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger().report.complete).toBe(true);
   });
 
@@ -893,7 +1019,7 @@ describe("coverage, summary and cursor controls", () => {
     h.advance(3 * DAY);
     await h.runtime.poll();
     expect(h.seedHead).not.toHaveBeenCalled();
-    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "b".repeat(40), at: NOW + 3 * DAY });
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "b".repeat(40), at: NOW + 3 * DAY, provenance: "warmup" });
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
 });

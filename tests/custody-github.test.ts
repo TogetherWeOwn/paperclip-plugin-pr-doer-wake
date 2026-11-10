@@ -463,8 +463,8 @@ describe("CustodyGithub head seeding", () => {
   it("does not date a fresh head from reviews of earlier commits", async () => {
     // A review submitted Oct 1 on a previous head cannot prove the current
     // head SHA was present then; with no head-bound evidence the seed is
-    // null so the caller applies the conservative warmup instead of waking
-    // a freshly pushed PR.
+    // null so the caller keeps the head UNKNOWN for idle (no wake) instead
+    // of waking a freshly pushed PR.
     const { client } = fixtures((_url, init) => String(init?.body).includes("reviews(")
       ? response(graphql("reviews", connection([review("r1", "2026-01-01T00:00:00Z", "b".repeat(40))]))) : undefined);
     expect(await client.seedHead(pr())).toBeNull();
@@ -479,7 +479,7 @@ describe("CustodyGithub head seeding", () => {
     expect(await stale.client.seedHead(pr())).toBe(Date.parse(CREATED));
   });
 
-  it("returns null with no head-bound evidence so the caller applies the now() warmup", async () => {
+  it("returns null with no head-bound evidence so the caller keeps the head UNKNOWN for idle", async () => {
     const { client } = fixtures();
     expect(await client.seedHead(pr())).toBeNull();
     const pendingOnly = fixtures((_url, init) => String(init?.body).includes("reviews(")
