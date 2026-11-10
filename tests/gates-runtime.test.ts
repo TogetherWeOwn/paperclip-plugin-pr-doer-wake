@@ -431,4 +431,24 @@ describe("gates status runtime", () => {
     expect(github.createStatus).toHaveBeenCalledTimes(1);
     expect(flaky.ledger().queue).toEqual([]);
   });
+
+  it("durably enqueues on a transient config-read failure and publishes on sweep without a new event", async () => {
+    const h = setup();
+    let failures = 2;
+    h.ctx.config.get = (async () => {
+      if (failures-- > 0) throw new Error("config host unavailable");
+      return gatesConfig();
+    }) as never;
+    await h.enqueue();
+    // The transient failure must not lose the event: the entry survives
+    // for sweep retry instead of disappearing like the pre-fix path.
+    expect(github.createStatus).not.toHaveBeenCalled();
+    expect(h.ledger().queue).toHaveLength(1);
+    h.advance(120_000);
+    await h.runtime.drain();
+    expect(github.createStatus).toHaveBeenCalledTimes(1);
+    expect(github.createStatus).toHaveBeenCalledWith(REPO, SHA_A, "success", expect.any(String));
+    expect(h.ledger().queue).toEqual([]);
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
+  });
 });

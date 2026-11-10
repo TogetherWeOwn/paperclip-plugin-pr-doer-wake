@@ -170,8 +170,23 @@ export class GatesStatusRuntime {
     const companyId = event.companyId.toLowerCase();
     // Disabled/invalid publisher: return before any ledger I/O, so the
     // default-disabled configuration costs no state writes per update.
-    const { config, invalid } = await this.config(companyId);
-    if (invalid || !config!.gatesStatusEnabled || !config!.releaseManagerAgentId) return;
+    let cfg: { config: CiConfig | null; invalid: boolean };
+    try {
+      cfg = await this.config(companyId);
+    } catch {
+      // A transient config-read failure must not lose the event: persist
+      // the issue ID so the sweep retries config reads from the saved
+      // entry, instead of losing the decision until another update.
+      await this.enqueueIssue(companyId, issueId);
+      await this.drain({ companyId, issueId });
+      return;
+    }
+    if (cfg.invalid || !cfg.config!.gatesStatusEnabled || !cfg.config!.releaseManagerAgentId) return;
+    await this.enqueueIssue(companyId, issueId);
+    await this.drain({ companyId, issueId });
+  }
+
+  private async enqueueIssue(companyId: string, issueId: string): Promise<void> {
     await this.serialized(async () => {
       const ledger = await this.load();
       this.compact(ledger);
@@ -194,7 +209,6 @@ export class GatesStatusRuntime {
         await this.save(ledger);
       }
     });
-    await this.drain({ companyId, issueId });
   }
 
   async drain(only?: { companyId: string; issueId: string }): Promise<void> {
