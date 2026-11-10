@@ -132,14 +132,15 @@ function setup(overrides: Record<string, unknown> = {}) {
   const fetch = vi.fn(async (..._args: unknown[]) => ({ status: 200, headers: {}, body: "{}" }));
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const configGet = vi.fn(async (_companyId: string) => clone(rawConfig));
+  const eventsOn = vi.fn();
   const ctx = {
-    state: { get, set }, config: { get: configGet },
-    issues: { get: issueGet, assertCheckoutOwner, requestWakeup },
+    state: { get, set }, config: { get: configGet }, events: { on: eventsOn },
+    issues: { get: issueGet, assertCheckoutOwner, requestWakeup, listInteractions: async () => [] },
     executionWorkspaces: { get: workspaceGet }, secrets: { resolve: resolveSecret }, http: { fetch }, logger,
   } as unknown as PluginContext;
   const runtime = new CiWakeRuntime(ctx, () => now);
   return {
-    ctx, runtime, rawConfig, issue, workspace, ownership, get, set, writes, assertCheckoutOwner, requestWakeup,
+    ctx, runtime, rawConfig, issue, workspace, ownership, get, set, writes, assertCheckoutOwner, requestWakeup, eventsOn,
     issueGet, workspaceGet, resolveSecret, fetch, logger, configGet,
     advance: (ms: number) => { now += ms; },
     clock: () => now,
@@ -193,6 +194,8 @@ describe("native CI plugin entrypoint", () => {
       expect(registerJob).toHaveBeenCalledWith("ci-wake-poll", expect.any(Function));
       const tool = registerTool.mock.calls[0]![2];
       expect(registerJob).toHaveBeenCalledWith("pr-custody", expect.any(Function));
+      expect(registerJob).toHaveBeenCalledWith("gates-status-sweep", expect.any(Function));
+      expect(h.eventsOn).toHaveBeenCalledWith("issue.updated", expect.any(Function));
       const poll = registerJob.mock.calls.find(([key]) => key === "ci-wake-poll")![1];
       const job = { jobKey: "ci-wake-poll", runId: OTHER, trigger: "schedule" as const, scheduledAt: new Date(START).toISOString() };
       expect(await tool(registration, run)).toMatchObject({ data: { status: "open" } });
@@ -233,17 +236,19 @@ describe("native CI plugin entrypoint", () => {
     expect(validateCiConfig(config({ custodyEnabled: false, githubAppId: "123" })).length).toBeGreaterThan(0);
   });
 
-  it("declares the explicit CI and custody capability envelopes without source status or comment mutation", () => {
+  it("declares the explicit CI, gates and custody capability envelopes without source status or comment mutation", () => {
     expect([...manifest.capabilities].sort()).toEqual([
       "agent.tools.register", "execution.workspaces.read", "http.outbound", "issues.checkout", "issues.read", "issues.wakeup",
       "jobs.schedule", "plugin.state.read", "plugin.state.write", "secrets.read-ref", "webhooks.receive",
       "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
       "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
+      "events.subscribe", "issue.interactions.read",
     ].sort());
     expect(manifest.tools).toEqual([registrationTool]);
     expect(registrationTool.parametersSchema).toMatchObject({ additionalProperties: false, required: ["issueId", "repo", "prNumber", "headSha"] });
     expect(manifest.jobs).toEqual([
       expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/4 * * * *" }),
+      expect.objectContaining({ jobKey: "gates-status-sweep", schedule: "*/4 * * * *" }),
       expect.objectContaining({ jobKey: "pr-custody", schedule: "17 * * * *" }),
     ]);
     expect(manifest.capabilities).not.toContain("issues.update");
