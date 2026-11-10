@@ -17,8 +17,9 @@ export function prUrl(pr: Pick<CustodyPull, "repo" | "number">): string { return
 export function containsPrUrl(body: string, pr: Pick<CustodyPull, "repo" | "number">): boolean {
   return new RegExp(`(^|\\s|<|\\]\\()${escape(prUrl(pr))}(?=$|[\\s<>),;#?\\]])`, "i").test(body);
 }
-function containsReference(body: string, pr: Pick<CustodyPull, "repo" | "number">): boolean {
-  return new RegExp(`(^|\\s|<)${escape(prReference(pr))}(?=$|[\\s>;,.)])`, "i").test(body) || containsPrUrl(body, pr);
+function isSourceReference(body: string, pr: Pick<CustodyPull, "repo" | "number">): boolean {
+  const url = escape(prUrl(pr));
+  return new RegExp(`^(?:${escape(prReference(pr))}|${url}|<${url}>|\\[[^\\]#:/]*\\]\\(${url}\\))$`, "i").test(body);
 }
 
 /** The first nonempty tier wins; multiple matches at that tier are UNMAPPED, never a primary-owner guess. */
@@ -56,7 +57,13 @@ export function latestDisposition(card: CustodyCard, pr: CustodyPull): Dispositi
   return found.sort((a, b) => b.at - a.at)[0] ?? null;
 }
 export function hasCardClosure(card: CustodyCard, pr: CustodyPull): boolean {
-  return card.texts.some((t) => t.body.split(/\r?\n/).some((line) => /^Closed unmerged:\s+\S/i.test(line) && containsReference(line, pr)));
+  return card.texts.some((t) => t.body.split(/\r?\n/).some((line) => {
+    if (!/^Closed unmerged:\s+\S/i.test(line)) return false;
+    const sources = line.split(";").slice(1).map((field) => field.trim()).filter((field) => /^source\b/i.test(field));
+    if (sources.length !== 1) return false;
+    const source = /^source\s+(.+)$/i.exec(sources[0]!);
+    return source !== null && isSourceReference(source[1]!, pr);
+  }));
 }
 export function hasPrClosure(texts: string[]): boolean {
   return texts.some((body) => body.split(/\r?\n/).some((line) => /^Closed unmerged:\s+(?:duplicate of|superseded by|need lost|mismatch|burden)\b/i.test(line)));

@@ -175,12 +175,12 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
-  it("retains closed cursor on denied activity but can act on independently proven terminal state", async () => {
+  it("reports denied open activity UNKNOWN without pinning unrelated closure coverage", async () => {
     const h = fixture({ cards: [card({ status: "done" })] });
     h.activity.mockRejectedValue(new Error("partial GraphQL"));
     await h.runtime.poll();
     expect(h.ledger().report.complete).toBe(false);
-    expect(h.ledger().cursors).toEqual({});
+    expect(h.ledger().cursors["example/project"]).toBe(NOW);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
   it("catches closures between polls from REST closed inventory, not only an open-set diff", async () => {
@@ -227,6 +227,7 @@ describe("coverage, summary and cursor controls", () => {
     h.ctx.issues.create.mockRejectedValue(new Error("lost reply"));
     await h.runtime.poll();
     expect(h.ctx.issues.create).toHaveBeenCalledTimes(15);
+    expect(h.ledger().cursors["example/project"]).toBe(NOW);
   });
   it("persists a conservative head observation floor across restart, resetting it only for a new head", async () => {
     const pr = pull();
@@ -329,6 +330,120 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.ledger().report.complete).toBe(false);
     expect(h.ledger().cursors).toEqual({});
+  });
+  it("rotates inventory to a budget-skipped repository on subsequent ticks", async () => {
+    const h = fixture({ open: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    h.listing.mockImplementation(async () => { h.advance(210_000); return []; });
+    await h.runtime.poll();
+    expect(h.ledger().attempted["example/tail"]).toBeUndefined();
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.listing).toHaveBeenCalledWith("example/tail", "open");
+  });
+  it.each(["idle", "terminal"])("advances closure coverage despite an uncertain %s wake across repeated restarts", async (kind) => {
+    const h = fixture({ cards: [card({ status: kind === "terminal" ? "done" : "in_progress" })] });
+    if (kind === "terminal") h.activity.mockResolvedValue(NOW);
+    h.ctx.issues.requestWakeup.mockRejectedValue(new Error("reply lost"));
+    for (let tick = 0; tick < 3; tick++) {
+      await h.restart().poll();
+      expect(h.ledger().cursors["example/project"]).toBe(NOW + tick * DAY);
+      expect(h.ledger().report.complete).toBe(false);
+      h.advance(DAY);
+    }
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "unconfirmed" })]);
+  });
+  it("does not pin closure coverage for an uncertain open-only daily summary", async () => {
+    const h = fixture({ cards: [], open: [pull()] });
+    h.ctx.issues.requestWakeup.mockRejectedValue(new Error("summary reply lost"));
+    await h.runtime.poll();
+    expect(h.ledger().cursors["example/project"]).toBe(NOW);
+    h.advance(60_000);
+    await h.restart().poll();
+    expect(h.ledger().cursors["example/project"]).toBe(NOW + 60_000);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().report.complete).toBe(false);
+  });
+  it("retires heads outside the complete monitored repository set", async () => {
+    const h = fixture();
+    await h.runtime.poll();
+    h.ledger().heads["example/archived#1"] = { sha: "b".repeat(40), at: NOW };
+    await h.restart().poll();
+    expect(Object.keys(h.ledger().heads)).toEqual(["example/project#42"]);
+  });
+  it("retires absent heads only after complete open inventory and preserves active warmup", async () => {
+    const prs = [pull()];
+    const h = fixture({ open: prs });
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt!);
+    await h.runtime.poll();
+    for (let i = 0; i < 9_999; i++) h.ledger().heads[`example/project#${i + 100}`] = { sha: "b".repeat(40), at: NOW - DAY };
+    prs.push(pull({ number: 43 }));
+    h.advance(DAY);
+    h.listing.mockRejectedValueOnce(new Error("partial open inventory"));
+    await h.restart().poll();
+    expect(Object.keys(h.ledger().heads)).toHaveLength(10_000);
+    await h.restart().poll();
+    expect(h.ledger().heads).toEqual({
+      "example/project#42": { sha: "a".repeat(40), at: NOW },
+      "example/project#43": { sha: "a".repeat(40), at: NOW + DAY },
+    });
+    expect(h.activity).toHaveBeenLastCalledWith(prs[1], NOW + DAY);
+  });
+  it.each([false, true])("compacts settled history without losing clocks or replaying effects (uncertain wake: %s)", async (uncertain) => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: "description", body, at: NOW - 10 * DAY, ownership: true }] });
+    const prs = [pull()];
+    const h = fixture({ cards: [owner], open: prs });
+    if (uncertain) h.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("reply lost"));
+    await h.runtime.poll();
+    const clock = Object.keys(h.ledger().dispositions)[0]!;
+    for (let i = 0; i < 19_997; i++) h.ledger().receipts[`example/project#${i + 100}|idle|1`] = { at: NOW - DAY, status: "woken" };
+    h.ledger().receipts.pending = { at: NOW, status: "pending" };
+    h.ledger().receipts.uncertain = { at: NOW, status: "unconfirmed", phase: "wake" };
+    for (let i = 0; i < 19_999; i++) h.ledger().dispositions[`historical-${i}`] = NOW - DAY;
+    prs.push(pull({ number: 43 }));
+    owner.texts[0]!.at = NOW + DAY;
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(h.ledger().report.complete).toBe(!uncertain);
+    if (uncertain) expect(h.ledger().receipts[`example/project#42|idle|${NOW - 8 * DAY}`].status).toBe("unconfirmed");
+    expect(Object.keys(h.ledger().receipts).length).toBeLessThan(20_000);
+    expect(h.ledger().receipts.pending.status).toBe("pending");
+    expect(h.ledger().receipts.uncertain.status).toBe("unconfirmed");
+    expect(h.ledger().dispositions[clock]).toBeUndefined();
+    expect(h.state.size).toBeGreaterThan(2);
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    // An unrelated edit must not refresh the archived directive and suppress the old idle trigger.
+    expect(h.ledger().report.rows[0].triggers).toContain(`example/project#42|idle|${NOW - 8 * DAY}`);
+    const get = h.ctx.state.get.getMockImplementation()!;
+    h.ctx.state.get.mockImplementation(async (key) => {
+      if (key.stateKey.includes(":receipt:")) throw new Error("archive unavailable");
+      return get(key);
+    });
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(h.ledger().report.complete).toBe(false);
+  });
+  it.each([false, true])("never evicts a hot tombstone on a failed archive reply (write occurred: %s)", async (written) => {
+    const h = fixture();
+    await h.runtime.poll();
+    for (let i = 0; i < 19_999; i++) h.ledger().receipts[`example/project#${i + 100}|idle|1`] = { at: NOW, status: "woken" };
+    const set = h.ctx.state.set.getMockImplementation()!;
+    h.ctx.state.set.mockImplementation(async (key, value) => {
+      if (key.stateKey.includes(":receipt:")) {
+        if (written) await set(key, value);
+        throw new Error("archive reply failed");
+      }
+      return set(key, value);
+    });
+    await h.restart().poll();
+    expect(Object.keys(h.ledger().receipts)).toHaveLength(20_000);
+    expect(h.ledger().receipts[`example/project#42|idle|${NOW - 8 * DAY}`].status).toBe("woken");
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
   it("coalesces overlapping scheduled callbacks", async () => {
     const h = fixture();

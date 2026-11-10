@@ -90,6 +90,36 @@ describe("PR-specific trigger policy", () => {
     expect(custodyTriggers({ ...pr, merged: true }, card(), null, [], NOW)).toEqual([]);
     expect(custodyTriggers(pr, card(), null, null, NOW)).toEqual([]);
   });
+  it("attributes card closure to the source, not its successor", () => {
+    const owner = card({ texts: [{ body: "Closed unmerged: superseded by example/project#42; source example/project#43", at: NOW, ownership: true }] });
+    expect(hasCardClosure(owner, pull({ number: 43 }))).toBe(true);
+    expect(hasCardClosure(owner, pull())).toBe(false);
+  });
+  it.each([
+    "example/project#42",
+    "https://github.com/example/project/pull/42",
+    "<https://github.com/example/project/pull/42>",
+    "[PR](https://github.com/example/project/pull/42)",
+  ])("accepts an explicit, unique source %s", (source) => {
+    expect(hasCardClosure(card({ texts: [{ body: `Closed unmerged: superseded by example/project#43; source ${source}; unique work: kept`, at: NOW, ownership: true }] }), pull())).toBe(true);
+  });
+  it.each([
+    "Closed unmerged: superseded by example/project#42",
+    "Closed unmerged: burden; notes example/project#42",
+    "Closed unmerged: burden; source example/project#420",
+    "Closed unmerged: burden; source other/project#42",
+    "Closed unmerged: burden; source example/project#42; source example/project#43",
+    "Closed unmerged: burden; source example/project#43; source example/project#42",
+    "Closed unmerged: burden; source example/project#42; source example/project#42",
+    "Closed unmerged: burden; source example/project#42; source",
+    "Closed unmerged: burden; source example/project#42 and example/project#43",
+    "Closed unmerged: burden; source example/project#43, example/project#42",
+    "Closed unmerged: burden; source https://evil.test/?u=https://github.com/example/project/pull/42",
+    "Closed unmerged: burden; source https://github.com/example/project/pull/420",
+    "> Closed unmerged: burden; source example/project#42",
+  ])("rejects missing, ambiguous or invalid card sources: %s", (body) => {
+    expect(hasCardClosure(card({ texts: [{ body, at: NOW, ownership: true }] }), pull())).toBe(false);
+  });
   it("does not borrow card rationale from a different PR or quotes", () => {
     expect(hasCardClosure(card({ texts: [{ body: "Closed unmerged: superseded by example/project#43", at: NOW, ownership: true }] }), pull())).toBe(false);
     expect(hasPrClosure(["> Closed unmerged: superseded by #99"])).toBe(false);

@@ -59,12 +59,39 @@ export class CustodyRuntime {
       ledger.audits = ledger.audits.filter((a) => this.now() - a.at < 30 * DAY).slice(-CUSTODY_LIMITS.audits);
     };
     const save = () => this.ctx.state.set(key, ledger);
+    const archiveKey = (kind: "receipt" | "disposition", id: string) => ({ ...key, stateKey: `${key.stateKey}:${kind}:${createHash("sha256").update(id).digest("hex")}` });
+    const archived = async (kind: "receipt" | "disposition", id: string): Promise<Receipt | number | null> => {
+      guard();
+      const entry = await this.ctx.state.get(archiveKey(kind, id)) as { version: number; key: string; value: Receipt | number } | null;
+      if (!entry) return null;
+      if (entry.version !== 1 || entry.key !== id || (kind === "disposition"
+        ? typeof entry.value !== "number" || !Number.isFinite(entry.value)
+        : typeof entry.value !== "object" || entry.value === null || !["woken", "cleared"].includes(entry.value.status))) throw new Error("invalid_custody_archive");
+      return entry.value;
+    };
+    // Write through before evicting hot history. Archives are exact-key tombstones, never TTLs.
+    const compact = async (kind: "receipt" | "disposition", entries: Record<string, Receipt | number>) => {
+      if (Object.keys(entries).length < CUSTODY_LIMITS.receipts - 128) return;
+      let moved = 0;
+      for (const [id, value] of Object.entries(entries)) {
+        if (typeof value !== "number" && !["woken", "cleared"].includes(value.status)) continue;
+        if (await archived(kind, id) === null) {
+          guard();
+          await this.ctx.state.set(archiveKey(kind, id), { version: 1, key: id, value });
+        }
+        delete entries[id];
+        if (++moved >= 128) break;
+      }
+    };
     const unknown = (scope: string) => { if (!ledger.report.unknown.includes(scope)) ledger.report.unknown.push(scope); };
     try {
       guard();
       const current = parseCustodyConfig(await this.ctx.config.get(config.companyId));
       if (!current || JSON.stringify(current) !== JSON.stringify(config) || config.closedSince > this.now()) throw new Error("custody_configuration_changed");
       audit("inventory", "intent");
+      await save();
+      await compact("receipt", ledger.receipts);
+      await compact("disposition", ledger.dispositions);
       await save();
       const cards = await loadCustodyCards(this.ctx, config.companyId, guard);
       const reposByProject = new Map<string, Set<string>>();
@@ -101,18 +128,26 @@ export class CustodyRuntime {
         return this.ctx.http.fetch(url, init);
       }, token, { now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100 });
       const repos = await github.repositories(config.org);
+      const monitored = new Set(repos);
+      for (const ref of Object.keys(ledger.heads)) if (!monitored.has(ref.split("#")[0]!)) delete ledger.heads[ref];
       const summaries = new Set<string>();
       const pending: Array<{ pr: CustodyPull; card: CustodyCard; trigger: Trigger; repo: string }> = [];
       const scanned = new Map<string, number>();
+      const summaryClosures = new Set<string>();
+      const holdClosure = (repo: string, trigger: Trigger) => { if (trigger.kind === "closed") scanned.delete(repo); };
+      const holdSummaryClosures = () => { for (const repo of summaryClosures) scanned.delete(repo); };
       for (const repo of repos.sort((a, b) => (ledger.attempted[a] ?? 0) - (ledger.attempted[b] ?? 0))) {
-        ledger.attempted[repo] = this.now();
         try {
           if (!inventoryAvailable()) throw new Error("inventory_budget");
+          ledger.attempted[repo] = this.now();
           // GitHub REST timestamps have second precision; retain inclusive same-second overlap.
           const until = Math.floor(this.now() / 1000) * 1000;
           const open = await github.pulls(repo, "open");
           const closed = await github.pulls(repo, "closed", ledger.cursors[repo] ?? config.closedSince);
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
+          // A complete open snapshot proves absence. Reopened PRs start a fresh safe warmup.
+          const active = new Set(open.map(prReference));
+          for (const ref of Object.keys(ledger.heads)) if (ref.startsWith(`${repo}#`) && !active.has(ref)) delete ledger.heads[ref];
           let complete = true;
           for (const pr of [...open, ...closed]) {
             if (ledger.report.rows.length >= CUSTODY_LIMITS.prs) throw new Error("custody_inventory_capacity");
@@ -121,11 +156,12 @@ export class CustodyRuntime {
             ledger.report.rows.push(row);
             if (pr.authorIsBot || !mapping.card) {
               summaries.add(`${prReference(pr)} ${pr.state} ${pr.authorIsBot ? "bot" : mapping.candidates.length > 1 ? "ambiguous" : "unmapped"}`);
+              if (pr.state === "closed") summaryClosures.add(repo);
               continue;
             }
             let owner: CustodyCard;
-            try { owner = this.dispositionClock(mapping.card, pr, ledger); }
-            catch { complete = false; row.unknown = true; unknown(prReference(pr)); continue; }
+            try { owner = await this.dispositionClock(mapping.card, pr, ledger, async (id) => await archived("disposition", id) as number | null); }
+            catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); continue; }
             let activity: number | null = null;
             let closure: string[] | null = null;
             try {
@@ -140,7 +176,7 @@ export class CustodyRuntime {
                 }
                 activity = await github.activity(pr, head.at);
               } else if (!pr.merged) closure = await github.closureTexts(pr);
-            } catch { complete = false; row.unknown = true; unknown(prReference(pr)); }
+            } catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); }
             // Missing activity cannot erase an independently established terminal-card trigger.
             const triggers = custodyTriggers(pr, owner, activity, closure, this.now());
             row.triggers = triggers.map((t) => t.key);
@@ -155,7 +191,9 @@ export class CustodyRuntime {
         const { pr, card, trigger, repo } = item;
         let receipt = ledger.receipts[trigger.key];
         if (!receipt) {
-          if (Object.keys(ledger.receipts).length >= CUSTODY_LIMITS.receipts) { unknown("receipt_capacity"); scanned.delete(repo); continue; }
+          try { if (await archived("receipt", trigger.key)) continue; }
+          catch { unknown(trigger.key); holdClosure(repo, trigger); continue; }
+          if (Object.keys(ledger.receipts).length >= CUSTODY_LIMITS.receipts) { unknown("receipt_capacity"); holdClosure(repo, trigger); continue; }
           receipt = ledger.receipts[trigger.key] = { at: this.now(), status: "pending", issueId: card.id };
           await save();
         }
@@ -166,14 +204,14 @@ export class CustodyRuntime {
           try { await this.child(config, trigger.key, "", "", card, guard, audit, save, receipt); }
           catch { /* Ambiguous creation remains a backstop responsibility. */ }
         }
-        if (receipt.status === "unconfirmed") { unknown(trigger.key); scanned.delete(repo); continue; }
+        if (receipt.status === "unconfirmed") { unknown(trigger.key); holdClosure(repo, trigger); continue; }
         if (receipt.status !== "pending") continue;
         if (config.dryRun) {
           audit("wake", "would_wake", trigger.key);
           this.ctx.logger.info("pr-custody: would wake", { key: trigger.key, issueId: card.id });
           continue;
         }
-        if (ledger.report.effects >= CUSTODY_LIMITS.effects) { scanned.delete(repo); unknown("effect_budget"); continue; }
+        if (ledger.report.effects >= CUSTODY_LIMITS.effects) { holdClosure(repo, trigger); unknown("effect_budget"); continue; }
         // A creation that fails ambiguously still spends its run's effect slot.
         ledger.report.effects++;
         try {
@@ -198,16 +236,16 @@ export class CustodyRuntime {
           guard();
           await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "PR custody evidence", format: "markdown", body: evidence });
           await this.wake(config, target, card.assigneeAgentId ?? config.summaryAgentId, trigger.key, receipt, guard, audit, save);
-          if (!delivered(receipt)) { scanned.delete(repo); unknown(prReference(pr)); }
-        } catch { scanned.delete(repo); unknown(prReference(pr)); audit("dispatch", "unknown", trigger.key); }
+          if (!delivered(receipt)) { holdClosure(repo, trigger); unknown(prReference(pr)); }
+        } catch { holdClosure(repo, trigger); unknown(prReference(pr)); audit("dispatch", "unknown", trigger.key); }
       }
       if (summaries.size) {
         const dailyKey = `pr-custody-summary|${new Date(this.now()).toISOString().slice(0, 10)}`;
-        let receipt = ledger.receipts[dailyKey];
+        let receipt = ledger.receipts[dailyKey] ?? await archived("receipt", dailyKey) as Receipt | null;
         if (!receipt && Object.keys(ledger.receipts).length < CUSTODY_LIMITS.receipts) receipt = ledger.receipts[dailyKey] = { at: this.now(), status: "pending" };
-        if (!receipt) { unknown("receipt_capacity"); scanned.clear(); }
+        if (!receipt) { unknown("receipt_capacity"); holdSummaryClosures(); }
         else if (config.dryRun) audit("summary", "would_create", dailyKey);
-        else if (ledger.report.effects >= CUSTODY_LIMITS.effects && receipt.status === "pending") { unknown("effect_budget"); scanned.clear(); }
+        else if (ledger.report.effects >= CUSTODY_LIMITS.effects && receipt.status === "pending") { unknown("effect_budget"); holdSummaryClosures(); }
         else try {
           if (receipt.status === "pending") ledger.report.effects++;
           await this.confirmConfig(config, guard);
@@ -223,8 +261,8 @@ export class CustodyRuntime {
           guard();
           await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "Daily PR custody inventory", format: "markdown", body });
           if (receipt.status === "pending") await this.wake(config, target, config.summaryAgentId, dailyKey, receipt, guard, audit, save);
-          if (!delivered(receipt)) { unknown("summary_deferred_or_unconfirmed"); scanned.clear(); }
-        } catch { unknown("summary_unknown"); scanned.clear(); }
+          if (!delivered(receipt)) { unknown("summary_deferred_or_unconfirmed"); holdSummaryClosures(); }
+        } catch { unknown("summary_unknown"); holdSummaryClosures(); }
       }
       for (const [repo, until] of scanned) ledger.cursors[repo] = until;
       ledger.report.complete = ledger.report.unknown.length === 0;
@@ -238,18 +276,19 @@ export class CustodyRuntime {
     this.ctx.logger.info("pr-custody: inventory", { complete: ledger.report.complete, prs: ledger.report.rows.length, unknown: ledger.report.unknown.length, effects: ledger.report.effects, dryRun: config.dryRun });
   }
 
-  private dispositionClock(card: CustodyCard, pr: CustodyPull, ledger: Ledger): CustodyCard {
+  private async dispositionClock(card: CustodyCard, pr: CustodyPull, ledger: Ledger, archived: (id: string) => Promise<number | null>): Promise<CustodyCard> {
     const texts: CustodyCard["texts"] = [];
     for (const text of card.texts) for (const line of text.body.split(/\r?\n/)) {
       const entry = { ...text, body: line };
       if (latestDisposition({ ...card, texts: [entry] }, pr)) {
         const key = createHash("sha256").update(JSON.stringify([card.id, text.id ?? "legacy", line])).digest("hex");
-        if (ledger.dispositions[key] === undefined) {
+        let at = ledger.dispositions[key] ?? await archived(key);
+        if (at === null) {
           if (Object.keys(ledger.dispositions).length >= CUSTODY_LIMITS.receipts) throw new Error("disposition_capacity");
-          ledger.dispositions[key] = Math.min(text.at, this.now());
+          at = ledger.dispositions[key] = Math.min(text.at, this.now());
         }
-        // Generic card/document timestamps cannot refresh an unchanged directive.
-        entry.at = ledger.dispositions[key]!;
+        // Generic card/document timestamps cannot refresh an unchanged directive, even after compaction.
+        entry.at = at;
       }
       texts.push(entry);
     }
