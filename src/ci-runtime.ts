@@ -1,0 +1,306 @@
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
+import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, type CiConfig, type Registration } from "./ci-config.js";
+import { CiGithub, CiGithubCache, evaluateReadiness } from "./ci-github.js";
+
+export const LIMITS = { active: 20, retained: 2_000, audit: 1_000, deliveries: 2_000, requestsPerTick: 240, wakePerTick: 20, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 180_000 } as const;
+const KEY = { scopeKind: "instance" as const, namespace: "ci-wake-v1", stateKey: "ledger" };
+type WaitStatus = "open" | "waking" | "woken" | "would_wake" | "unconfirmed" | "retired";
+export interface Wait extends Registration {
+  waitId: string;
+  companyId: string;
+  projectId: string;
+  workspaceId: string;
+  branch: string;
+  runId: string;
+  aliases: string[];
+  registeredAt: number;
+  expiresAt: number;
+  status: WaitStatus;
+  finishedAt?: number;
+  lastAttemptAt?: number;
+  reason?: string;
+}
+interface Audit { at: number; operation: string; runId?: string; companyId?: string; waitId?: string; outcome: string }
+interface Ledger {
+  version: 1;
+  waits: Wait[];
+  audits: Audit[];
+  deliveries: Record<string, number>;
+  hints: Record<string, number>;
+  samples: Record<string, Array<{ sha: string; ms: number }>>;
+}
+const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} });
+
+export function verifyCiSignature(secret: string, rawBody: string, signature: string | undefined): boolean {
+  if (!secret || !signature || !/^sha256=[0-9a-f]{64}$/.test(signature)) return false;
+  const expected = Buffer.from(`sha256=${createHmac("sha256", secret).update(rawBody, "utf8").digest("hex")}`);
+  const supplied = Buffer.from(signature);
+  return expected.length === supplied.length && timingSafeEqual(expected, supplied);
+}
+
+function header(input: PluginWebhookInput, name: string): string | undefined {
+  const key = Object.keys(input.headers).find((k) => k.toLowerCase() === name);
+  const value = key ? input.headers[key] : undefined;
+  return typeof value === "string" ? value : undefined;
+}
+
+/** One host-managed worker owns this ledger. All entrypoints share its lock, including overlapping job callbacks. */
+export class CiWakeRuntime {
+  private lock: Promise<unknown> = Promise.resolve();
+  private pollInFlight = false;
+  private readonly caches = new Map<string, CiGithubCache>();
+  private webhookBudget = { since: 0, used: 0 };
+
+  constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now) {}
+
+  private serialized<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.lock.then(fn, fn);
+    this.lock = next.catch(() => undefined);
+    return next;
+  }
+
+  private async load(): Promise<Ledger> {
+    const ledger = await this.ctx.state.get(KEY) as Ledger | null;
+    if (!ledger) return empty();
+    if (ledger.version !== 1 || !Array.isArray(ledger.waits) || !Array.isArray(ledger.audits) || !ledger.deliveries || !ledger.hints || !ledger.samples) throw new Error("invalid_ledger");
+    return ledger;
+  }
+
+  private async save(ledger: Ledger): Promise<void> {
+    await this.ctx.state.set(KEY, ledger);
+  }
+
+  private audit(ledger: Ledger, operation: string, outcome: string, run?: ToolRunContext, waitId?: string): void {
+    ledger.audits.push({ at: this.now(), operation, outcome, ...(run && UUID.test(run.runId) && UUID.test(run.companyId) ? { runId: run.runId, companyId: run.companyId } : {}), ...(waitId ? { waitId } : {}) });
+    ledger.audits = ledger.audits.slice(-LIMITS.audit);
+  }
+
+  private compact(ledger: Ledger): void {
+    const now = this.now();
+    for (const wait of ledger.waits) {
+      if (wait.status === "waking") { wait.status = "unconfirmed"; wait.finishedAt = now; }
+      if (wait.status === "open" && wait.expiresAt <= now) { wait.status = "retired"; wait.finishedAt = now; wait.reason = "wait_expired"; }
+    }
+    ledger.waits = ledger.waits.filter((w) => w.status === "open" || now - (w.finishedAt ?? w.registeredAt) < LIMITS.retentionMs);
+    const retainedRepos = new Set(ledger.waits.map((w) => `${w.companyId}:${w.repo}`));
+    for (const repo of Object.keys(ledger.samples)) if (!retainedRepos.has(repo)) delete ledger.samples[repo];
+    for (const [id, at] of Object.entries(ledger.deliveries)) if (now - at >= LIMITS.replayMs) delete ledger.deliveries[id];
+    for (const [id, at] of Object.entries(ledger.hints)) if (now - at >= 60_000) delete ledger.hints[id];
+  }
+
+  private async config(companyId: string): Promise<CiConfig> {
+    const raw = await this.ctx.config.get(companyId);
+    if (validateCiConfig(raw).length) throw new Error("invalid_configuration");
+    const config = parseCiConfig(raw);
+    if (!config.enabled) throw new Error("plugin_disabled");
+    return config;
+  }
+
+  private async client(companyId: string, config: CiConfig, fetch: PluginContext["http"]["fetch"] = this.ctx.http.fetch.bind(this.ctx.http)): Promise<CiGithub> {
+    const token = await this.ctx.secrets.resolve(config.githubTokenSecretRef!, { companyId, configPath: "githubTokenSecretRef" });
+    const key = `${companyId}:${config.githubTokenSecretRef!.secretId}:${config.githubTokenSecretRef!.version ?? "latest"}`;
+    if (!this.caches.has(key)) {
+      if (this.caches.size >= 8) this.caches.delete(this.caches.keys().next().value!);
+      this.caches.set(key, new CiGithubCache());
+    }
+    return new CiGithub(fetch, token, { now: this.now, cache: this.caches.get(key)! });
+  }
+
+  private async binding(wait: Registration, companyId: string, projectId?: string): Promise<{ workspaceId: string; projectId: string; branch: string }> {
+    const issue = await this.ctx.issues.get(wait.issueId, companyId);
+    if (!issue || issue.companyId !== companyId || !issue.projectId || (projectId && issue.projectId !== projectId) || !issue.executionWorkspaceId) throw new Error("issue_binding_refused");
+    const workspace = await this.ctx.executionWorkspaces.get(issue.executionWorkspaceId, companyId);
+    if (!workspace || workspace.companyId !== companyId || workspace.projectId !== issue.projectId || workspaceRepo(workspace.repoUrl) !== wait.repo || !workspace.branchName) throw new Error("workspace_binding_refused");
+    return { workspaceId: workspace.id, projectId: issue.projectId, branch: workspace.branchName };
+  }
+
+  async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
+    return this.serialized(async () => {
+      const ledger = await this.load();
+      this.compact(ledger);
+      let waitId: string | undefined;
+      try {
+        const registration = parseRegistration(params);
+        if (![run.companyId, run.agentId, run.runId, run.projectId].every((s) => UUID.test(s))) throw new Error("invalid_run_context");
+        const config = await this.config(run.companyId);
+        if (!config.allowedRepos.includes(registration.repo)) throw new Error("repo_refused");
+        await this.ctx.issues.assertCheckoutOwner({ issueId: registration.issueId, companyId: run.companyId, actorAgentId: run.agentId, actorRunId: run.runId });
+        const binding = await this.binding(registration, run.companyId, run.projectId);
+        waitId = createHash("sha256").update(JSON.stringify([run.companyId, run.runId, registration.issueId, registration.repo, registration.prNumber, registration.headSha])).digest("hex");
+        const existing = ledger.waits.find((w) => w.waitId === waitId || w.aliases.includes(waitId!));
+        if (existing) {
+          this.audit(ledger, "register", "duplicate", run, waitId);
+          await this.save(ledger);
+          return { content: "CI wait already registered", data: { waitId: existing.waitId, status: existing.status, expiresAt: existing.expiresAt } };
+        }
+        const active = ledger.waits.find((w) => w.companyId === run.companyId && w.issueId === registration.issueId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.headSha === registration.headSha && w.status === "open");
+        if (active) {
+          if (active.aliases.length >= 100) throw new Error("wait_alias_capacity");
+          active.aliases.push(waitId);
+          this.audit(ledger, "register", "joined", run, active.waitId);
+          await this.save(ledger);
+          return { content: "Joined active CI wait", data: { waitId: active.waitId, status: active.status, expiresAt: active.expiresAt } };
+        }
+        const superseded = ledger.waits.filter((w) => w.companyId === run.companyId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.issueId === registration.issueId && w.status === "open");
+        if (ledger.waits.length >= LIMITS.retained || ledger.waits.filter((w) => w.status === "open").length - superseded.length >= LIMITS.active) throw new Error("wait_capacity");
+        // Audit intent before resolving the credential or making any outbound request.
+        this.audit(ledger, "register", "intent", run, waitId);
+        await this.save(ledger);
+        const github = await this.client(run.companyId, config);
+        const pr = await github.pull(registration.repo, registration.prNumber);
+        if (pr.state !== "open" || pr.merged || pr.headSha !== registration.headSha || pr.headRepo?.toLowerCase() !== registration.repo || pr.headBranch !== binding.branch) throw new Error("pr_binding_refused");
+        // Checkout ownership may have changed while GitHub answered.
+        await this.ctx.issues.assertCheckoutOwner({ issueId: registration.issueId, companyId: run.companyId, actorAgentId: run.agentId, actorRunId: run.runId });
+        const current = await this.binding(registration, run.companyId, run.projectId);
+        if (current.workspaceId !== binding.workspaceId || current.branch !== binding.branch) throw new Error("binding_changed");
+        const now = this.now();
+        for (const old of ledger.waits) if (old.companyId === run.companyId && old.repo === registration.repo && old.prNumber === registration.prNumber && old.issueId === registration.issueId && old.status === "open") { old.status = "retired"; old.finishedAt = now; old.reason = "superseded"; }
+        ledger.waits.push({ ...registration, ...binding, waitId, companyId: run.companyId, runId: run.runId, aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
+        this.audit(ledger, "register", "registered", run, waitId);
+        await this.save(ledger);
+        return { content: "CI wait registered", data: { waitId, status: "open", expiresAt: now + LIMITS.waitMs, dryRun: config.dryRun } };
+      } catch {
+        // Neither host exceptions nor upstream response bodies are safe agent output.
+        this.audit(ledger, "register", "refused", run, waitId);
+        await this.save(ledger);
+        return { error: "CI registration refused; verify checkout, repository/workspace binding, configuration and capacity." };
+      }
+    });
+  }
+
+  async poll(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
+    if (this.pollInFlight) return;
+    this.pollInFlight = true;
+    try { await this.serialized(() => this.pollLocked(only)); } finally { this.pollInFlight = false; }
+  }
+
+  private async pollLocked(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
+    const ledger = await this.load();
+    this.compact(ledger);
+    await this.save(ledger);
+    const started = this.now();
+    let requests = 0;
+    let wakes = 0;
+    const fetch: PluginContext["http"]["fetch"] = async (url, init) => {
+      if (++requests > LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
+      return this.ctx.http.fetch(url, init);
+    };
+    // Oldest last-attempt first prevents one unavailable repository starving others.
+    const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
+    for (const wait of pending) {
+      if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+      wait.lastAttemptAt = this.now();
+      try {
+        const config = await this.config(wait.companyId);
+        if (!config.allowedRepos.includes(wait.repo)) { wait.status = "retired"; wait.reason = "repo_revoked"; wait.finishedAt = this.now(); await this.save(ledger); continue; }
+        const github = await this.client(wait.companyId, config, fetch);
+        const pr = await github.pull(wait.repo, wait.prNumber);
+        if (pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo || pr.headBranch !== wait.branch) {
+          wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
+        }
+        const snapshot = await github.snapshot(wait.repo, wait.headSha, pr.baseBranch);
+        const samples = ledger.samples[`${wait.companyId}:${wait.repo}`] ?? [];
+        const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
+        const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
+        const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs });
+        if (verdict.kind === "pending") continue;
+        const binding = await this.binding(wait, wait.companyId, wait.projectId);
+        if (binding.workspaceId !== wait.workspaceId || binding.branch !== wait.branch) throw new Error("binding_changed");
+        const freshConfig = await this.config(wait.companyId);
+        if (!freshConfig.allowedRepos.includes(wait.repo) || freshConfig.dryRun !== config.dryRun) throw new Error("configuration_changed");
+        const current = await github.pull(wait.repo, wait.prNumber);
+        if (current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo || current.headBranch !== wait.branch) {
+          wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
+        }
+        if (!verdict.missing.length && !samples.some((s) => s.sha === wait.headSha)) {
+          const starts = snapshot.suites.map((s) => s.createdAt).filter((n): n is number => n !== null);
+          const finishes = snapshot.suites.map((s) => s.completedAt).filter((n): n is number => n !== null);
+          if (starts.length && finishes.length && finishes.length === snapshot.suites.length) {
+            const duration = Math.max(...finishes) - Math.min(...starts);
+            if (duration >= 60_000 && duration <= 86_400_000) {
+              ledger.samples[`${wait.companyId}:${wait.repo}`] = [...samples, { sha: wait.headSha, ms: duration }].slice(-31);
+            }
+          }
+        }
+        const failed = verdict.failed.join(", ").slice(0, 1_000);
+        const missing = verdict.missing.join(", ").slice(0, 1_000);
+        const reason = `CI ${verdict.kind} ${wait.repo}@${wait.headSha.slice(0, 7)}${failed ? `: ${failed}` : ""}${missing ? `; required check missing: ${missing}` : ""}`;
+        wait.reason = reason;
+        if (config.dryRun) {
+          wait.status = "would_wake"; wait.finishedAt = this.now();
+          this.audit(ledger, "wake", "would_wake", undefined, wait.waitId);
+          await this.save(ledger);
+          this.ctx.logger.info("ci-wake: would wake", { waitId: wait.waitId, repo: wait.repo, headSha: wait.headSha, verdict: verdict.kind });
+        } else {
+          // Persist before calling the host. Restart/ambiguous replies NEVER repeat an attempted effect.
+          wait.status = "waking";
+          this.audit(ledger, "wake", "intent", undefined, wait.waitId);
+          await this.save(ledger);
+          wakes += 1;
+          try {
+            const result = await this.ctx.issues.requestWakeup(wait.issueId, wait.companyId, { reason, contextSource: "plugin.ci-wake", idempotencyKey: `ci-wake:${wait.repo}:${wait.headSha}:${wait.waitId}` });
+            wait.status = result.queued ? "woken" : "open";
+            if (result.queued) wait.finishedAt = this.now();
+            this.audit(ledger, "wake", result.queued ? "woken" : "host_deferred", undefined, wait.waitId);
+            await this.save(ledger);
+          } catch {
+            wait.status = "unconfirmed"; wait.finishedAt = this.now();
+            this.audit(ledger, "wake", "unconfirmed", undefined, wait.waitId);
+            await this.save(ledger);
+            this.ctx.logger.warn("ci-wake: wake unconfirmed; use the card backstop", { waitId: wait.waitId });
+          }
+        }
+      } catch {
+        this.audit(ledger, "poll", "retryable", undefined, wait.waitId);
+        await this.save(ledger);
+      }
+    }
+    await this.save(ledger);
+  }
+
+  async webhook(input: PluginWebhookInput): Promise<void> {
+    if (input.endpointKey !== "github-ci") throw new Error("unknown_webhook");
+    if (header(input, "x-github-event") !== "check_suite") return;
+    if (Buffer.byteLength(input.rawBody, "utf8") > 65_536) throw new Error("webhook_too_large");
+    const signature = header(input, "x-hub-signature-256");
+    const delivery = header(input, "x-github-delivery");
+    if (!signature || !/^sha256=[0-9a-f]{64}$/.test(signature) || !delivery || !UUID.test(delivery)) throw new Error("invalid_webhook_headers");
+    const payload = JSON.parse(input.rawBody) as Record<string, any>;
+    if (payload?.action !== "completed") return;
+    const repo = typeof payload.repository?.full_name === "string" ? payload.repository.full_name.toLowerCase() : "";
+    const sha = payload.check_suite?.head_sha;
+    if (typeof sha !== "string" || !SHA.test(sha)) throw new Error("invalid_webhook_payload");
+    let target: { companyId: string; repo: string; sha: string } | undefined;
+    await this.serialized(async () => {
+      const ledger = await this.load();
+      this.compact(ledger);
+      const companies = [...new Set(ledger.waits.filter((w) => w.status === "open" && w.repo === repo && w.headSha === sha).map((w) => w.companyId))];
+      for (const companyId of companies) {
+        const config = await this.config(companyId);
+        if (!config.webhooksEnabled || !config.webhookSecretRef || !config.allowedRepos.includes(repo)) continue;
+        if (payload.organization?.login?.toLowerCase() !== repo.split("/")[0]) continue;
+        if (this.now() - this.webhookBudget.since >= 60_000) this.webhookBudget = { since: this.now(), used: 0 };
+        if (++this.webhookBudget.used > 6) throw new Error("webhook_verification_budget");
+        const secret = await this.ctx.secrets.resolve(config.webhookSecretRef, { companyId, configPath: "webhookSecretRef" });
+        if (!verifyCiSignature(secret, input.rawBody, signature)) continue;
+        const replayKey = `${companyId}:${delivery}`;
+        if (ledger.deliveries[replayKey]) return;
+        if (Object.keys(ledger.deliveries).length >= LIMITS.deliveries) throw new Error("replay_capacity");
+        ledger.deliveries[replayKey] = this.now();
+        const hintKey = `${companyId}:${repo}:${sha}`;
+        const recent = Object.values(ledger.hints).filter((at) => this.now() - at < 60_000).length;
+        if (recent < 6 && (ledger.hints[hintKey] === undefined || this.now() - ledger.hints[hintKey]! >= 20_000)) {
+          ledger.hints[hintKey] = this.now();
+          target = { companyId, repo, sha };
+        }
+        this.audit(ledger, "webhook", target ? "hint" : "debounced");
+        await this.save(ledger);
+        return;
+      }
+      // No registration means no mapping, no branch fallback and no wake.
+      if (companies.length) throw new Error("webhook_signature_refused");
+    });
+    if (target) await this.poll(target);
+  }
+}

@@ -1,111 +1,61 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
-import { NAMESPACE_SLUG, PLUGIN_ID, PLUGIN_VERSION, SWEEP_JOB_KEY, WAKE_STATES, WEBHOOK_KEY } from "./constants.js";
 
-/**
- * A Paperclip secret binding. `format: "secret-ref"` makes the host render a secret picker and bind the secret to
- * this plugin (PLUGIN_SPEC.md section 19.8; collectSecretRefPaths in server/src/services/json-schema-secret-refs.ts).
- * The picker stores the object `{ type: "secret_ref", secretId, version? }`, so the type stays "object": with
- * `type: "string"` the host's Ajv check (plugin-config-validator.ts) refuses that object ("must be string"), and a
- * bare UUID string is refused by the secrets handler. The `type: "string"` fields of the bundled sandbox providers
- * are environment config, which environment-config.ts converts before validating.
- */
 const secretRef = {
   type: "object",
   format: "secret-ref",
   required: ["type", "secretId"],
-  additionalProperties: true,
-  properties: { type: { const: "secret_ref" }, secretId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" } },
+  additionalProperties: false,
+  properties: {
+    type: { const: "secret_ref" },
+    secretId: { type: "string", pattern: "^[0-9a-fA-F-]{36}$" },
+    version: { anyOf: [{ type: "integer", minimum: 1 }, { const: "latest" }] },
+  },
+};
+
+export const registrationTool = {
+  name: "ci_wait_register",
+  displayName: "Register CI completion wait",
+  description: "After pushing an owned PR, register its exact issue, repository, PR number and head SHA. The caller must own the checkout, and the PR branch/repository must match the issue execution workspace. Repeated calls in one run are idempotent; after a manual rerun, register from a new run. Never guesses ownership from text or branches.",
+  parametersSchema: {
+    type: "object", additionalProperties: false,
+    required: ["issueId", "repo", "prNumber", "headSha"],
+    properties: {
+      issueId: { type: "string", format: "uuid", maxLength: 36 },
+      repo: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$", maxLength: 140 },
+      prNumber: { type: "integer", minimum: 1, maximum: 2147483647 },
+      headSha: { type: "string", pattern: "^[0-9a-f]{40}$", maxLength: 40 },
+    },
+  },
 };
 
 const manifest: PaperclipPluginManifestV1 = {
-  id: PLUGIN_ID,
+  id: "togetherweown.pr-doer-wake",
   apiVersion: 1,
-  version: PLUGIN_VERSION,
-  displayName: "PR doer wake",
-  description:
-    "Wakes the card that owns an open, non-draft GitHub pull request at most once per (PR, head SHA, state) when a check fails or a merge conflict appears on synchronize. Wakes go through ctx.issues.requestWakeup, so blockers, terminal status, assignee and budget hard-stops are enforced by the host.",
+  version: "0.2.0",
+  displayName: "CI wake",
+  description: "Wakes explicitly registered PR cards once when required CI finishes. Four-minute zero-LLM polling, optional signed check-suite hints, and dry-run by default. No ownership guessing or issue mutation.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
-    "companies.read",
-    "projects.read",
-    "project.workspaces.read",
-    "issues.read",
-    "issue.relations.read",
-    "issues.wakeup",
-    "plugin.state.read",
-    "plugin.state.write",
-    "database.namespace.migrate",
-    "database.namespace.read",
-    "database.namespace.write",
-    "webhooks.receive",
-    "secrets.read-ref",
-    "http.outbound",
-    "jobs.schedule",
+    "webhooks.receive", "jobs.schedule", "issues.read", "issues.wakeup", "issues.checkout",
+    "execution.workspaces.read", "agent.tools.register", "plugin.state.read", "plugin.state.write",
+    "http.outbound", "secrets.read-ref",
   ],
   entrypoints: { worker: "./dist/worker.js" },
-  database: {
-    namespaceSlug: NAMESPACE_SLUG,
-    migrationsDir: "migrations",
-    coreReadTables: ["issues", "issue_comments"],
-  },
-  webhooks: [
-    {
-      endpointKey: WEBHOOK_KEY,
-      displayName: "GitHub organization webhook",
-      description:
-        "GitHub org webhook (content type application/json), events pull_request and check_run only, signed with the configured webhook secret. The host stores every delivery, so subscribe to nothing else.",
-    },
-  ],
-  jobs: [
-    {
-      jobKey: SWEEP_JOB_KEY,
-      displayName: "Wake retries",
-      description:
-        "Re-reads the PR and finishes wakes that failed, stalled or had no eligible owning card yet, with backoff; never repeats a wake that may already have reached the host. Compacts old settled rows into dedupe tombstones.",
-      schedule: "*/5 * * * *",
-    },
-  ],
+  tools: [registrationTool],
+  jobs: [{ jobKey: "ci-wake-poll", displayName: "CI wait poll", description: "Recheck registered open waits without an LLM; retire moved heads and expired waits.", schedule: "*/4 * * * *" }],
+  webhooks: [{ endpointKey: "github-ci", displayName: "GitHub CI hint", description: "Optional phase two: signed check_suite completed events only. Disabled until explicitly configured; payloads never authorize a wake." }],
   instanceConfigSchema: {
-    type: "object",
+    type: "object", additionalProperties: false,
     properties: {
-      enabled: { type: "boolean", default: false, description: "Master switch for this company." },
-      shadow: { type: "boolean", default: true, description: "Record and log what would be woken, but wake nobody." },
-      githubOrg: { type: "string", description: "GitHub organization login whose webhooks this company accepts, e.g. TogetherWeOwn." },
-      webhookSecretRef: { ...secretRef, description: "Paperclip secret holding the GitHub webhook secret." },
-      githubTokenSecretRef: {
-        ...secretRef,
-        description:
-          "Required when enabled. Paperclip secret with a GitHub token that can read pull requests and check runs in githubOrg: a classic token (no scope for public repos, repo for private ones) or a token with Pull requests: read and Checks: read. Fine-grained personal access tokens cannot read check runs. Every wake is revalidated against GitHub first.",
-      },
-      reviewCheckName: {
-        type: "string",
-        default: "Paperclip Review",
-        description: "Check run whose red conclusion wakes as review_findings; every other non-ignored red check wakes as ci_red.",
-      },
-      ignoreChecks: { type: "array", items: { type: "string" }, default: [], description: "Check run names that never wake, the review check included." },
-      stoppedRepos: { type: "array", items: { type: "string" }, default: ["togetherweown/nntune"], description: "Lowercase org/repo that never wake." },
-      excludeAgentIds: { type: "array", items: { type: "string" }, default: [], description: "Agents whose cards never own a PR (the Reviewer)." },
-      wakeStates: {
-        type: "array",
-        items: { type: "string", enum: [...WAKE_STATES] },
-        default: [...WAKE_STATES],
-        description: "States that may wake: review_findings, ci_red, conflict.",
-      },
-      skipBlockedStatus: { type: "boolean", default: true, description: "Hold cards whose own status is blocked, even without a blocker relation." },
-      branchIdentifierPattern: {
-        type: "string",
-        default: "^([A-Z][A-Z0-9]*-[0-9]+)-",
-        description: "Regular expression on the PR head branch; capture group 1 is the owning card's identifier.",
-      },
-      trustedAuthors: {
-        type: "array",
-        items: { type: "string" },
-        default: [],
-        description: "PR author logins trusted besides OWNER/MEMBER/COLLABORATOR, e.g. the agents' GitHub App bot. Fork PRs are never trusted.",
-      },
+      enabled: { type: "boolean", default: false },
+      dryRun: { type: "boolean", default: true },
+      allowedRepos: { type: "array", minItems: 1, maxItems: 100, uniqueItems: true, items: { type: "string", maxLength: 140, pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$" }, default: [] },
+      githubTokenSecretRef: { ...secretRef, description: "Existing read-only GitHub credential: pull requests, checks, commit statuses and branch rules/protection. Resolved only at call time." },
+      webhooksEnabled: { type: "boolean", default: false },
+      webhookSecretRef: { ...secretRef, description: "Phase two only: webhook HMAC secret stored by the owner in Paperclip." },
+      repoMedianMs: { type: "object", maxProperties: 100, additionalProperties: { type: "integer", minimum: 60000, maximum: 86400000 }, description: "Optional measured per-repo cold-start CI medians in milliseconds; absent entries start at 30 minutes. Replaced by a rolling median of settled registered heads." },
     },
   },
 };
-
 export default manifest;

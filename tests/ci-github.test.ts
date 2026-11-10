@@ -1,0 +1,491 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  CiGithub, CiGithubCache, CiGithubError, evaluateReadiness,
+  type CiCheckRun, type CiCheckSuite, type CiFetch, type CiHttpResponse, type CiSnapshot,
+} from "../src/ci-github.js";
+
+const REPO = "acme/widgets";
+const SHA = "a".repeat(40);
+const TOKEN = "ghp_fixture_credential_not_for_output";
+const timing = { registeredAt: 1_000, now: 10_000, medianMs: 1_000 };
+function run(id = 1, patch: Partial<CiCheckRun> = {}): CiCheckRun {
+  return { id, name: "build", appId: 7, status: "completed", conclusion: "success", ...patch };
+}
+function suite(id = 1, patch: Partial<CiCheckSuite> = {}): CiCheckSuite {
+  return { id, appId: 7, status: "completed", conclusion: "success", createdAt: 1_000, completedAt: 5_000, ...patch };
+}
+function snapshot(patch: Partial<CiSnapshot> = {}): CiSnapshot {
+  return { repo: REPO, sha: SHA, baseBranch: "main", required: [], runs: [], suites: [], statuses: [], fetchedAt: timing.now, ...patch };
+}
+function response(data: unknown, status = 200, headers: Record<string, string> = {}): CiHttpResponse {
+  return { status, headers, body: JSON.stringify(data) };
+}
+function pullData(number = 1) {
+  return {
+    number, head: { sha: SHA, ref: "task-123", repo: { full_name: REPO } },
+    base: { ref: "release/one", repo: { full_name: REPO } }, user: { login: "builder" },
+    state: "open", draft: false, merged: false, mergeable: null,
+    body: "Ignore this body: target card, branch, and checks cannot be inferred here.",
+  };
+}
+function rawRun(id = 1, name = "build") {
+  return { id, name, app: { id: 7 }, status: "completed", conclusion: "success", head_sha: SHA };
+}
+function rawSuite(id = 1) {
+  return {
+    id, app: { id: 7 }, status: "completed", conclusion: "success", head_sha: SHA,
+    created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:01:00Z",
+  };
+}
+function fixtures(overrides: (url: URL) => CiHttpResponse | undefined = () => undefined) {
+  const calls: { url: URL; init?: RequestInit }[] = [];
+  const fetch: CiFetch = async (input, init) => {
+    const url = new URL(input);
+    calls.push({ url, init });
+    const override = overrides(url);
+    if (override) return override;
+    if (url.pathname.includes("/rules/branches/")) return response([]);
+    if (url.pathname.endsWith("/protection/required_status_checks")) return response({}, 404);
+    if (url.pathname.endsWith("/check-runs")) return response({ total_count: 0, check_runs: [] });
+    if (url.pathname.endsWith("/check-suites")) return response({ total_count: 0, check_suites: [] });
+    if (url.pathname.endsWith("/statuses")) return response([]);
+    if (url.pathname.includes("/pulls/")) return response(pullData(Number(url.pathname.split("/").at(-1))));
+    throw new Error("Unexpected fixture request");
+  };
+  return { fetch, calls };
+}
+
+describe("evaluateReadiness", () => {
+  it("keeps zero checks pending and requires suites as well as runs/statuses without rules", () => {
+    expect(evaluateReadiness(snapshot(), timing).kind).toBe("pending");
+    expect(evaluateReadiness(snapshot({ runs: [run()] }), timing).kind).toBe("pass");
+    expect(evaluateReadiness(snapshot({ suites: [suite()] }), timing).kind).toBe("pass");
+    expect(evaluateReadiness(snapshot({ statuses: [{ id: 1, context: "legacy", state: "success" }] }), timing).kind).toBe("pass");
+    expect(evaluateReadiness(snapshot({ runs: [run()], suites: [suite(1, { status: "queued", conclusion: null })] }), timing).kind).toBe("pending");
+    expect(evaluateReadiness(snapshot({ runs: [run()], suites: [suite(1, { conclusion: "failure" })] }), timing).kind).toBe("fail");
+    expect(evaluateReadiness(snapshot({ suites: [suite()], statuses: [{ id: 1, context: "legacy", state: "error" }] }), timing).kind).toBe("fail");
+  });
+
+  it.each(["success", "neutral", "skipped"])("accepts completed %s", (conclusion) => {
+    expect(evaluateReadiness(snapshot({ runs: [run(1, { conclusion })] }), timing).kind).toBe("pass");
+  });
+  it.each(["failure", "cancelled", "timed_out", "action_required", "startup_failure"])("fails completed %s", (conclusion) => {
+    expect(evaluateReadiness(snapshot({ runs: [run(1, { conclusion })] }), timing)).toMatchObject({ kind: "fail", failed: ["build [app 7]"] });
+  });
+  it.each([null, "stale", "unknown", "pending"])("keeps unknown conclusion %s pending", (conclusion) => {
+    expect(evaluateReadiness(snapshot({ runs: [run(1, { conclusion })] }), timing).kind).toBe("pending");
+  });
+  it("does not use a conclusion while the run is still queued", () => {
+    expect(evaluateReadiness(snapshot({ runs: [run(1, { status: "queued", conclusion: "success" })] }), timing).kind).toBe("pending");
+  });
+
+  it("chooses greatest numeric IDs, not API ordering, and a queued rerun supersedes a completion", () => {
+    const runs = [run(10, { status: "queued", conclusion: null }), run(2, { conclusion: "failure" }), run(1)];
+    const input = snapshot({ required: [{ context: "build", appId: 7 }], runs });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", failed: [], missing: [] });
+    expect(input.runs).toEqual(runs);
+    expect(evaluateReadiness(snapshot({ runs: [run(2), run(1, { conclusion: "failure" })] }), timing).kind).toBe("pass");
+    expect(evaluateReadiness(snapshot({ suites: [suite(10, { status: "queued", conclusion: null }), suite(2)] }), timing).kind).toBe("pending");
+    expect(evaluateReadiness(snapshot({ statuses: [
+      { id: 10, context: "legacy", state: "pending" }, { id: 2, context: "legacy", state: "success" },
+    ] }), timing).kind).toBe("pending");
+  });
+
+  it("does not fail prematurely while any present required check remains pending", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }, { context: "lint", appId: 7 }],
+      runs: [run(1, { conclusion: "failure" }), run(2, { name: "lint", status: "in_progress", conclusion: null })],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", failed: ["build [app 7]"], pending: ["lint [app 7]"] });
+    input.runs[1]!.status = "completed";
+    input.runs[1]!.conclusion = "success";
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", failed: ["build [app 7]"], pending: [] });
+  });
+
+  it("gates every suite without rules even when multiple workflows share an app", () => {
+    const olderPending = suite(1, { status: "queued", conclusion: null, completedAt: null });
+    const newerGreen = suite(100);
+    expect(evaluateReadiness(snapshot({ runs: [run()], suites: [olderPending, newerGreen] }), timing).kind).toBe("pending");
+    expect(evaluateReadiness(snapshot({ suites: [suite(1, { conclusion: "failure" }), newerGreen] }), timing).kind).toBe("fail");
+    expect(evaluateReadiness(snapshot({ runs: [run(1, { conclusion: "failure" })], suites: [olderPending, newerGreen] }), timing).kind).toBe("pending");
+  });
+
+  it("requires every required context, ignoring unrelated failures when rules exist", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }, { context: "lint", appId: null }],
+      runs: [run(), run(2, { name: "optional", conclusion: "failure" })],
+      statuses: [{ id: 3, context: "lint", state: "pending" }],
+    });
+    expect(evaluateReadiness(input, timing).kind).toBe("pending");
+    input.statuses[0]!.state = "success";
+    expect(evaluateReadiness(input, timing).kind).toBe("pass");
+  });
+
+  it("never lets a different app or legacy status satisfy an app-bound requirement", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }], runs: [run(99, { appId: 8 })],
+      statuses: [{ id: 100, context: "build", state: "success" }],
+    });
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"] });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["build [app 7]"], failed: [] });
+    input.runs.push(run(1, { status: "queued", conclusion: null }));
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: [] });
+  });
+
+  it("keeps latest runs separately per app, including unbound context collisions", () => {
+    const runs = [run(1, { conclusion: "failure" }), run(100, { appId: 8 })];
+    expect(evaluateReadiness(snapshot({ runs }), timing).kind).toBe("fail");
+    expect(evaluateReadiness(snapshot({ runs, required: [{ context: "build", appId: 8 }] }), timing).kind).toBe("pass");
+    expect(evaluateReadiness(snapshot({ runs, required: [{ context: "build", appId: null }] }), timing).kind).toBe("fail");
+  });
+
+  it("starts missing grace at registration only when there are no suites", () => {
+    const input = snapshot({ required: [{ context: "build", appId: null }] });
+    expect(evaluateReadiness(input, { ...timing, now: 2_999 })).toMatchObject({ kind: "pending", missingSince: 1_000, missingFailAt: 3_000 });
+    expect(evaluateReadiness(input, { ...timing, now: 3_000 }).kind).toBe("fail");
+  });
+
+  it("uses the last suite completion, not registration, for missing-check grace", () => {
+    const input = snapshot({ required: [{ context: "build", appId: null }], suites: [suite(), suite(2, { appId: 8, completedAt: 8_001 })] });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", lastSuiteCompletedAt: 8_001, missingFailAt: 10_001 });
+    expect(evaluateReadiness(input, { ...timing, now: 10_001 }).kind).toBe("fail");
+    expect(evaluateReadiness({ ...input, suites: [suite(1, { status: "queued", conclusion: null, completedAt: null })] }, timing))
+      .toMatchObject({ kind: "pending", missingSince: null, missingFailAt: null });
+  });
+
+  it("does not expire missing checks while a present required context is pending", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }, { context: "lint", appId: null }],
+      runs: [run(1, { status: "in_progress", conclusion: null })], suites: [suite()],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: ["lint"], pending: ["build [app 7]"] });
+    input.runs[0]!.status = "completed";
+    input.runs[0]!.conclusion = "success";
+    expect(evaluateReadiness(input, timing).kind).toBe("fail");
+  });
+
+  it("rejects absent or invalid timing instead of inventing a median", () => {
+    expect(() => evaluateReadiness(snapshot(), { ...timing, medianMs: 0 })).toThrow(CiGithubError);
+    expect(() => evaluateReadiness(snapshot(), { ...timing, now: NaN })).toThrow(CiGithubError);
+  });
+});
+
+describe("CiGithub REST reads", () => {
+  it("returns authoritative PR metadata, including exact head/base branches, without trusting its body", async () => {
+    const { fetch, calls } = fixtures();
+    const actual = await new CiGithub(fetch, TOKEN).pull("Acme/Widgets", 1);
+    expect(actual).toEqual({ repo: REPO, number: 1, headSha: SHA, headBranch: "task-123", headRepo: REPO,
+      baseBranch: "release/one", author: "builder", state: "open", draft: false, merged: false, mergeable: null });
+    expect(calls[0]!.url.href).toBe(`https://api.github.com/repos/${REPO}/pulls/1`);
+    expect(calls[0]!.init?.headers).toMatchObject({ Authorization: `Bearer ${TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" });
+  });
+
+  it("also accepts the installed SDK's standard Response", async () => {
+    const fetch = async () => new Response(JSON.stringify(pullData()), { status: 200 });
+    expect((await new CiGithub(fetch, TOKEN).pull(REPO, 1)).headSha).toBe(SHA);
+  });
+
+  it("reads and merges branch rules/classic checks without dropping app bindings", async () => {
+    const { fetch, calls } = fixtures((url) => {
+      if (url.pathname.includes("/rules/branches/")) return response([
+        { type: "required_status_checks", parameters: { required_status_checks: [{ context: "build", integration_id: 7 }, { context: "legacy", integration_id: null }] } },
+        { type: "pull_request", parameters: {} },
+      ]);
+      if (url.pathname.endsWith("required_status_checks")) return response({
+        contexts: ["build", "legacy", "lint"], checks: [{ context: "build", app_id: 7 }, { context: "legacy", app_id: -1 }],
+      });
+      if (url.pathname.endsWith("check-runs")) return response({ total_count: 1, check_runs: [rawRun()] });
+      if (url.pathname.endsWith("check-suites")) return response({ total_count: 1, check_suites: [rawSuite()] });
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "release/one");
+    expect(actual.required).toEqual([{ context: "build", appId: 7 }, { context: "legacy", appId: null }, { context: "lint", appId: null }]);
+    expect(actual.suites[0]).toMatchObject({ createdAt: Date.parse("2026-01-01T00:00:00Z"), completedAt: Date.parse("2026-01-01T00:01:00Z") });
+    expect(calls[0]!.url.pathname).toContain("/rules/branches/release%2Fone");
+    expect(calls[1]!.url.pathname).toContain("/branches/release%2Fone/protection/required_status_checks");
+    expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("all");
+  });
+
+  it("paginates more than 100 runs, suites, and status history without a combined-status shortcut", async () => {
+    const { fetch, calls } = fixtures((url) => {
+      const page = Number(url.searchParams.get("page"));
+      const ids = page === 1 ? Array.from({ length: 100 }, (_, i) => i + 1) : [101];
+      if (url.pathname.endsWith("check-runs")) return response({ total_count: 101, check_runs: ids.map((id) => rawRun(id, `build-${id}`)) });
+      if (url.pathname.endsWith("check-suites")) return response({ total_count: 101, check_suites: ids.map(rawSuite) });
+      if (url.pathname.endsWith("statuses")) return response(ids.map((id) => ({ id, context: `legacy-${id}`, state: id === 101 ? "failure" : "success" })));
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect([actual.runs.length, actual.suites.length, actual.statuses.length]).toEqual([101, 101, 101]);
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "fail", failed: ["legacy-101"] });
+    expect(calls.every((call) => call.url.origin === "https://api.github.com")).toBe(true);
+    expect(calls.some((call) => call.url.pathname.endsWith("/status"))).toBe(false);
+  });
+
+  it("paginates rules and treats Link only as a continuation signal, never as a fetch URL", async () => {
+    const { fetch, calls } = fixtures((url) => {
+      if (url.pathname.includes("rules/branches")) {
+        return Number(url.searchParams.get("page")) === 1
+          ? response([{ type: "pull_request" }], 200, { Link: '<https://attacker.invalid/steal>; rel="next"' })
+          : response([{ type: "required_status_checks", parameters: { required_status_checks: [{ context: "build", integration_id: 7 }] } }]);
+      }
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(actual.required).toEqual([{ context: "build", appId: 7 }]);
+    expect(calls.filter((call) => call.url.pathname.includes("rules/branches"))).toHaveLength(2);
+    expect(calls.every((call) => call.url.origin === "https://api.github.com")).toBe(true);
+  });
+
+  it.each([401, 403, 500])("fails closed on classic protection HTTP %i", async (status) => {
+    const { fetch, calls } = fixtures((url) => url.pathname.endsWith("required_status_checks") ? response({ message: "private upstream details" }, status) : undefined);
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "http", status });
+    expect(calls).toHaveLength(2);
+  });
+  it("does not treat a rules endpoint 404 as absence of rules", async () => {
+    const { fetch, calls } = fixtures(() => response({}, 404));
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "http", status: 404 });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("rejects invalid repositories, abbreviated SHAs, branches, and PR numbers before fetching", async () => {
+    const { fetch, calls } = fixtures();
+    const github = new CiGithub(fetch, TOKEN);
+    for (const repo of ["https://github.com/acme/widgets", "acme/widgets/extra", "acme/..", "acme/widgets?x=1", "../widgets", "acme/%77idgets"]) {
+      await expect(github.pull(repo, 1)).rejects.toMatchObject({ code: "input" });
+    }
+    await expect(github.snapshot(REPO, "abcd", "main")).rejects.toMatchObject({ code: "input" });
+    await expect(github.snapshot(REPO, SHA, "")).rejects.toMatchObject({ code: "input" });
+    await expect(github.pull(REPO, 0)).rejects.toMatchObject({ code: "input" });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rejects mismatched PR/base repository or check SHA and malformed JSON", async () => {
+    const wrongPull = fixtures(() => response({ ...pullData(), number: 2 }));
+    await expect(new CiGithub(wrongPull.fetch, TOKEN).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+    const wrongRepo = fixtures(() => response({ ...pullData(), base: { ref: "main", repo: { full_name: "other/widgets" } } }));
+    await expect(new CiGithub(wrongRepo.fetch, TOKEN).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+    const wrongSha = fixtures((url) => url.pathname.endsWith("check-runs")
+      ? response({ total_count: 1, check_runs: [{ ...rawRun(), head_sha: "b".repeat(40) }] }) : undefined);
+    await expect(new CiGithub(wrongSha.fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "response" });
+    await expect(new CiGithub(async () => ({ status: 200, headers: {}, body: "not JSON" }), TOKEN).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+  });
+});
+
+describe("CiGithub caching, backoff, and caps", () => {
+  it("reuses cached pages on 304, including pagination metadata, across fresh credential clients", async () => {
+    const counts = new Map<string, number>();
+    const fetch: CiFetch = async (url, init) => {
+      const count = counts.get(url) ?? 0;
+      counts.set(url, count + 1);
+      if (count) {
+        expect(init?.headers).toMatchObject({ "If-None-Match": '"version-1"', Authorization: `Bearer ${TOKEN}-new` });
+        return { status: 304, headers: {}, body: "" };
+      }
+      return response(pullData(), 200, { ETag: '"version-1"' });
+    };
+    const cache = new CiGithubCache();
+    const first = await new CiGithub(fetch, TOKEN, { cache }).pull(REPO, 1);
+    // The returned object is not the cached body, so consumers cannot corrupt it.
+    first.headSha = "b".repeat(40);
+    expect((await new CiGithub(fetch, `${TOKEN}-new`, { cache }).pull(REPO, 1)).headSha).toBe(SHA);
+    expect([...counts.values()]).toEqual([2]);
+  });
+
+  it("retries a throwing conditional read once without ETag and requires a fresh 200", async () => {
+    const headers: (HeadersInit | undefined)[] = [];
+    const fetch: CiFetch = async (_url, init) => {
+      headers.push(init?.headers);
+      if (headers.length === 1) return response(pullData(), 200, { ETag: '\"old\"' });
+      if (headers.length === 2) throw new TypeError("Response constructor rejected status 304");
+      return response({ ...pullData(), head: { ...pullData().head, sha: "b".repeat(40) } });
+    };
+    const github = new CiGithub(fetch, TOKEN, { maxRequests: 3 });
+    await github.pull(REPO, 1);
+    expect((await github.pull(REPO, 1)).headSha).toBe("b".repeat(40));
+    expect(headers[1]).toHaveProperty("If-None-Match", '\"old\"');
+    expect(headers[2]).not.toHaveProperty("If-None-Match");
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
+    expect(headers).toHaveLength(3);
+  });
+
+  it.each(["throw", "304", "500"])("fails closed when unconditional compatibility retry returns %s", async (retry) => {
+    let calls = 0;
+    const fetch: CiFetch = async () => {
+      calls++;
+      if (calls === 1) return response(pullData(), 200, { etag: '\"old\"' });
+      if (calls === 2 || retry === "throw") throw new Error(`${TOKEN} private upstream failure`);
+      return response({}, Number(retry));
+    };
+    const github = new CiGithub(fetch, TOKEN);
+    await github.pull(REPO, 1);
+    const error = await github.pull(REPO, 1).catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect(error).toMatchObject({ code: retry === "throw" ? "network" : retry === "304" ? "response" : "http" });
+    expect(String(error)).not.toContain(TOKEN);
+    expect(calls).toBe(3);
+  });
+
+  it("does not let compatibility retries escape the lifetime request budget", async () => {
+    let calls = 0;
+    const fetch: CiFetch = async () => {
+      calls++;
+      if (calls === 1) return response(pullData(), 200, { etag: '\"old\"' });
+      throw new Error("SDK response reconstruction failed");
+    };
+    const github = new CiGithub(fetch, TOKEN, { maxRequests: 2 });
+    await github.pull(REPO, 1);
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
+    expect(calls).toBe(2);
+  });
+
+  it("times out a host fetch without retrying an uncancellable conditional request", async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      const fetch: CiFetch = async () => {
+        calls++;
+        if (calls === 1) return response(pullData(), 200, { etag: '\"old\"' });
+        return new Promise<CiHttpResponse>(() => {});
+      };
+      const github = new CiGithub(fetch, TOKEN, { requestTimeoutMs: 5 });
+      await github.pull(REPO, 1);
+      const result = github.pull(REPO, 1).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(5);
+      expect(await result).toMatchObject({ code: "timeout", message: "GitHub CI timeout" });
+      expect(calls).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("times out Response.text independently of fetch and bounds timeout configuration", async () => {
+    vi.useFakeTimers();
+    try {
+      const hangingBody = new Response("", { status: 200 });
+      Object.defineProperty(hangingBody, "text", { value: () => new Promise<string>(() => {}) });
+      const github = new CiGithub(async () => hangingBody, TOKEN, { requestTimeoutMs: 5 });
+      const result = github.pull(REPO, 1).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(5);
+      expect(await result).toMatchObject({ code: "timeout" });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(() => new CiGithub(async () => hangingBody, TOKEN, { requestTimeoutMs: 30_001 })).toThrow(CiGithubError);
+      expect(() => new CiGithub(async () => hangingBody, TOKEN, { requestTimeoutMs: 0 })).toThrow(CiGithubError);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("supports a real bodyless Response 304 and charges it against the request budget", async () => {
+    let calls = 0;
+    const fetch = async () => {
+      calls++;
+      return calls === 1
+        ? new Response(JSON.stringify(pullData()), { status: 200, headers: { ETag: '\"v1\"' } })
+        : new Response(null, { status: 304 });
+    };
+    const github = new CiGithub(fetch, TOKEN, { maxRequests: 2 });
+    await github.pull(REPO, 1);
+    expect((await github.pull(REPO, 1)).headSha).toBe(SHA);
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
+    expect(calls).toBe(2);
+  });
+
+  it("preserves next-page metadata when a rules page returns 304", async () => {
+    const calls = new Map<string, number>();
+    const base = fixtures((url) => {
+      if (url.pathname.includes("rules/branches") && url.searchParams.get("page") === "1")
+        return response([{ type: "pull_request" }], 200, { ETag: '"rules"', Link: '<https://api.github.com/unused>; rel="next"' });
+    });
+    const fetch: CiFetch = async (url, init) => {
+      const n = calls.get(url) ?? 0;
+      calls.set(url, n + 1);
+      if (n && url.includes("rules/branches") && url.endsWith("page=1")) return { status: 304, headers: {}, body: "" };
+      return base.fetch(url, init);
+    };
+    const github = new CiGithub(fetch, TOKEN);
+    await github.snapshot(REPO, SHA, "main");
+    await github.snapshot(REPO, SHA, "main");
+    expect([...calls].filter(([url]) => url.includes("rules/branches") && url.endsWith("page=2"))[0]![1]).toBe(2);
+  });
+
+  it("bounds cache entries and bytes and rejects 304 without a cached page", async () => {
+    const headers: (HeadersInit | undefined)[] = [];
+    const fetch: CiFetch = async (url, init) => {
+      headers.push(init?.headers);
+      return response(pullData(Number(url.split("/").at(-1))), 200, { etag: '"v"' });
+    };
+    const github = new CiGithub(fetch, TOKEN, { maxCacheEntries: 1 });
+    await github.pull(REPO, 1); await github.pull(REPO, 2); await github.pull(REPO, 1);
+    expect(headers[2]).not.toHaveProperty("If-None-Match");
+    const tiny = new CiGithub(fetch, TOKEN, { maxCacheBytes: 1 });
+    await tiny.pull(REPO, 1); await tiny.pull(REPO, 1);
+    expect(headers.at(-1)).not.toHaveProperty("If-None-Match");
+    await expect(new CiGithub(async () => ({ status: 304, headers: {}, body: "" }), TOKEN).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+  });
+
+  const rateCases: Record<string, string>[] = [
+    { "Retry-After": "5" },
+    { "Retry-After": new Date(15_000).toUTCString() },
+    { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "15" },
+  ];
+  it.each(rateCases)("caches rate-limit backoff across operations: %j", async (rateHeaders) => {
+    let now = 10_000;
+    let calls = 0;
+    const fetch: CiFetch = async () => {
+      calls++;
+      return calls === 1 ? response({ message: TOKEN }, 429, rateHeaders) : response(pullData());
+    };
+    const cache = new CiGithubCache();
+    await expect(new CiGithub(fetch, TOKEN, { cache, now: () => now }).pull(REPO, 1)).rejects.toMatchObject({ code: "http", status: 429, retryAt: 15_000 });
+    await expect(new CiGithub(fetch, TOKEN, { cache, now: () => now }).pull(REPO, 1)).rejects.toMatchObject({ code: "backoff", retryAt: 15_000 });
+    expect(calls).toBe(1);
+    now = 15_000;
+    expect((await new CiGithub(fetch, TOKEN, { cache, now: () => now }).pull(REPO, 1)).headSha).toBe(SHA);
+  });
+
+  it("honors exhausted quota on successful responses and Retry-After on 503", async () => {
+    for (const status of [200, 503]) {
+      let calls = 0;
+      const fetch: CiFetch = async () => { calls++; return response(pullData(), status, { "retry-after": "10", "x-ratelimit-remaining": "0" }); };
+      const github = new CiGithub(fetch, TOKEN, { now: () => 1_000 });
+      if (status === 200) await github.pull(REPO, 1);
+      else await expect(github.pull(REPO, 1)).rejects.toMatchObject({ status: 503 });
+      await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "backoff", retryAt: 11_000 });
+      expect(calls).toBe(1);
+    }
+  });
+
+  it("never resets the lifetime request budget, including failed requests", async () => {
+    let calls = 0;
+    const github = new CiGithub(async () => { calls++; throw new Error(`upstream ${TOKEN}`); }, TOKEN, { maxRequests: 1 });
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "network", message: "GitHub CI network" });
+    await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
+    expect(calls).toBe(1);
+  });
+
+  it("throws page/request caps and incomplete totals instead of returning a partial snapshot", async () => {
+    const many = fixtures((url) => url.pathname.endsWith("check-runs")
+      ? response({ total_count: 101, check_runs: Array.from({ length: 100 }, (_, i) => rawRun(i + 1)) }) : undefined);
+    await expect(new CiGithub(many.fetch, TOKEN, { maxPages: 1 }).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "pages" });
+    const { fetch } = fixtures();
+    await expect(new CiGithub(fetch, TOKEN, { maxRequests: 3 }).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "budget" });
+    const incomplete = fixtures((url) => url.pathname.endsWith("check-runs") ? response({ total_count: 101, check_runs: [] }) : undefined);
+    await expect(new CiGithub(incomplete.fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "response" });
+    await expect(new CiGithub(async () => response(pullData()), TOKEN, { maxBodyBytes: 1 }).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+  });
+
+  it("does not expose upstream error bodies, network errors, or reflected credentials", async () => {
+    for (const status of [401, 403, 404, 422, 500]) {
+      const github = new CiGithub(async () => response({ message: `${TOKEN} private failure` }, status), TOKEN);
+      const error = await github.pull(REPO, 1).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(CiGithubError);
+      expect(String(error)).not.toContain(TOKEN);
+      expect(String(error)).not.toContain("private failure");
+    }
+    for (const body of [JSON.stringify({ ...pullData(), body: TOKEN }), JSON.stringify(pullData()).replace("builder", TOKEN.split("").map((c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""))]) {
+      await expect(new CiGithub(async () => ({ status: 200, headers: {}, body }), TOKEN).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+    }
+    const { fetch } = fixtures((url) => url.pathname.endsWith("check-runs") ? response({ total_count: 1, check_runs: [rawRun(1, `build ${TOKEN}`)] }) : undefined);
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "response" });
+  });
+
+  it.each(["bad\nname", "bad\u001bname", "x".repeat(1025)])("rejects unsafe upstream context names", async (name) => {
+    const { fetch } = fixtures((url) => url.pathname.endsWith("check-runs") ? response({ total_count: 1, check_runs: [rawRun(1, name)] }) : undefined);
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "response" });
+  });
+});
