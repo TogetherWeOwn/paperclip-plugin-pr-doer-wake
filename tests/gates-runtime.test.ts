@@ -53,8 +53,8 @@ function gatesConfig(overrides: Record<string, unknown> = {}): Record<string, un
 function interaction(overrides: Record<string, unknown> = {}) {
   return {
     id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", kind: "request_confirmation", status: "accepted",
-    resolvedByAgentId: RM, title: `Merge ${REPO}#17 at exact head ${SHA_A}`,
-    payload: { prompt: "Merge?", detailsMarkdown: `Head SHA ${SHA_A}.` },
+    addresseeAgentId: RM, resolvedByAgentId: RM, title: `Merge ${REPO}#17?`,
+    payload: { version: 1, prompt: `Merge ${REPO}#17?`, detailsMarkdown: `https://github.com/${REPO}/pull/17` },
     result: { outcome: "accepted", reason: `approved at exact head ${SHA_A}` }, ...overrides,
   };
 }
@@ -99,6 +99,18 @@ describe("gates status runtime", () => {
     expect(h.ledger().published[`${REPO}:${SHA_A}`]).toMatchObject({ state: "success", count: 1 });
   });
 
+  it("publishes nothing for a hold card accepted by the RM (non-merge acceptance is not merge authorization)", async () => {
+    const hold = interaction({
+      title: `Confirm we must NOT merge ${REPO}#17 at ${SHA_A}.`,
+      payload: { version: 1, prompt: `Confirm we must NOT merge ${REPO}#17 at ${SHA_A}.`, acceptLabel: "Keep blocked", detailsMarkdown: `https://github.com/${REPO}/pull/17` },
+    });
+    const h = setup({ interactions: [hold] });
+    await h.enqueue();
+    expect(github.createStatus).not.toHaveBeenCalled();
+    expect(h.ledger().audits.map((a) => a.outcome)).toContain("no_decision");
+    expect(h.ledger().published[`${REPO}:${SHA_A}`]).toBeUndefined();
+  });
+
   it("is a no-op while gatesStatusEnabled is false", async () => {
     const h = setup({ config: gatesConfig({ gatesStatusEnabled: false }) });
     await h.enqueue();
@@ -119,18 +131,18 @@ describe("gates status runtime", () => {
     await h.enqueue();
     expect(github.createStatus).not.toHaveBeenCalled();
 
-    const refused = setup({ interactions: [interaction({ title: `Merge other/project#3 at exact head ${SHA_A}`, payload: { prompt: "Merge?", detailsMarkdown: SHA_A } })] });
+    const refused = setup({ interactions: [interaction({ title: "Merge other/project#3?", payload: { version: 1, prompt: "Merge other/project#3?", detailsMarkdown: "https://github.com/other/project/pull/3" } })] });
     await refused.enqueue();
     expect(github.createStatus).not.toHaveBeenCalled();
     expect(refused.ledger().audits.map((a) => a.outcome)).toContain("repo_refused");
   });
 
   it("publishes failure for expired and pending for superseded decisions", async () => {
-    const expired = setup({ interactions: [interaction({ status: "expired", result: { outcome: "expired" } })] });
+    const expired = setup({ interactions: [interaction({ status: "expired", result: { outcome: "expired", reason: `expired at exact head ${SHA_A}` } })] });
     await expired.enqueue();
     expect(github.createStatus).toHaveBeenCalledWith(REPO, SHA_A, "failure", expect.any(String));
 
-    const superseded = setup({ interactions: [interaction({ status: "cancelled", result: { outcome: "superseded_by_comment" } })] });
+    const superseded = setup({ interactions: [interaction({ status: "cancelled", result: { outcome: "superseded_by_comment", reason: `superseded for head ${SHA_A}` } })] });
     await superseded.enqueue();
     expect(github.createStatus).toHaveBeenCalledWith(REPO, SHA_A, "pending", expect.any(String));
   });
@@ -143,7 +155,7 @@ describe("gates status runtime", () => {
     expect(h.ledger().audits.map((a) => a.outcome)).toContain("deduped");
 
     // Supersession flips the same SHA to pending: a new status is published.
-    h.setInteractions([interaction({ status: "cancelled", result: { outcome: "superseded_by_newer_request" } })]);
+    h.setInteractions([interaction({ status: "cancelled", result: { outcome: "superseded_by_newer_request", reason: `superseded for head ${SHA_A}` } })]);
     await h.enqueue();
     expect(github.createStatus).toHaveBeenCalledTimes(2);
     expect(github.createStatus).toHaveBeenLastCalledWith(REPO, SHA_A, "pending", expect.any(String));

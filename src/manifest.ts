@@ -74,7 +74,7 @@ const manifest: PaperclipPluginManifestV1 = {
       githubAppPrivateKeySecretRef: { ...secretRef, description: "App mode: existing approved RSA private-key reference. All three App fields are required. Tokens are narrowed to one allowed repository and fixed read permissions." },
       gatesStatusEnabled: { type: "boolean", default: false, description: "Publish paperclip/gates commit statuses from RM merge confirmations. Stays off until the App gains statuses: write; without it the publisher logs missing_permission and never greens a SHA." },
       gatesStatusShadow: { type: "boolean", default: true, description: "Shadow mode: compute and log decisions without POSTing any GitHub status. Set false only after shadow evidence matches RM decisions." },
-      releaseManagerAgentId: { type: "string", format: "uuid", description: "The one agent whose accepted merge confirmations publish paperclip/gates. Required when gatesStatusEnabled is true." },
+      releaseManagerAgentId: { type: "string", format: "uuid", description: "The one agent addressed by and resolving merge-authorization confirmations (title Merge <owner/repo>#<n>?, prompt identical, bare-PR-URL details) that publish paperclip/gates. Required when gatesStatusEnabled is true." },
       webhooksEnabled: { type: "boolean", default: false },
       webhookSecretRef: { ...secretRef, description: "Phase two only: webhook HMAC secret stored by the owner in Paperclip." },
       repoMedianMs: { type: "object", maxProperties: 100, additionalProperties: { type: "integer", minimum: 60000, maximum: 86400000 }, description: "Optional measured per-repo cold-start CI medians in milliseconds; absent entries start at 30 minutes. Replaced by a rolling median of settled registered heads." },

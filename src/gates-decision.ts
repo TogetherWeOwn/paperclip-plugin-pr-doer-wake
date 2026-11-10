@@ -6,15 +6,28 @@ import type { GatesStatusState } from "./ci-github.js";
  * issue-thread interaction. No network, clock or host state access.
  *
  * A decision exists only when every one of these holds:
- * - kind is `request_confirmation` (the RM merge confirmation kind)
- * - resolvedByAgentId is the configured Release Manager agent
+ * - kind is `request_confirmation`
+ * - the card is addressed to the configured Release Manager agent
+ *   (`addresseeAgentId`) and resolved by it (`resolvedByAgentId`) — who was
+ *   asked and who answered are both the RM; the accepted action presented
+ *   to the RM is the merge question itself, never an arbitrary prompt
  * - the outcome is terminal and publishable (accepted -> success;
  *   rejected/expired/cancelled/failed -> failure; superseded -> pending)
- * - combined text mentions the merge and states exactly one `owner/repo#N`
- *   PR reference and exactly one distinct 40-hex head SHA
+ * - the card carries the dedicated merge-authorization contract and nothing
+ *   else: title `Merge <owner/repo>#<n>?`, prompt identical to the title,
+ *   details the bare PR URL for the same repo/number, no summary and no
+ *   acceptance label, and no target / tool-action / secret-proposal /
+ *   connection-authorization payload block
+ * - the contract text (title, prompt, details, resolution reason) names
+ *   exactly one `owner/repo#N` PR reference and exactly one distinct
+ *   40-hex head SHA — the SHA the RM cites in the resolution reason
  *
- * Missing, ambiguous, wrong-resolver or non-merge text publishes nothing.
- * The text fields are untrusted input: only projected identifiers and the
+ * Missing, ambiguous, wrong-resolver, mis-addressed or non-contract text
+ * publishes nothing. In particular, a generic confirmation that merely
+ * mentions the word "merge" alongside one PR and one SHA — such as a hold
+ * card asking "Confirm we must NOT merge ...?" — is not merge
+ * authorization: acceptance of a non-merge prompt never greens a SHA. The
+ * text fields are untrusted input: only projected identifiers and the
  * terminal outcome affect the result.
  */
 export interface GatesDecision {
@@ -48,19 +61,20 @@ function shas(source: string): Set<string> {
   return found;
 }
 
+function recordOf(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
 /** Combined prose an RM merge confirmation may cite its PR/SHA in. */
 function combinedText(interaction: Record<string, unknown>): string {
-  const payload = interaction.payload && typeof interaction.payload === "object" && !Array.isArray(interaction.payload)
-    ? interaction.payload as Record<string, unknown> : {};
-  const result = interaction.result && typeof interaction.result === "object" && !Array.isArray(interaction.result)
-    ? interaction.result as Record<string, unknown> : {};
-  return [text(interaction.title), text(interaction.summary), text(payload.prompt), text(payload.detailsMarkdown), text(result.reason)].join("\n");
+  const payload = recordOf(interaction.payload);
+  const result = recordOf(interaction.result);
+  return [text(interaction.title), text(payload.prompt), text(payload.detailsMarkdown), text(result.reason)].join("\n");
 }
 
 /** Terminal outcome -> GitHub commit-status state, or null when it publishes nothing. */
 function stateFor(interaction: Record<string, unknown>): GatesStatusState | null {
-  const result = interaction.result && typeof interaction.result === "object" && !Array.isArray(interaction.result)
-    ? interaction.result as Record<string, unknown> : null;
+  const result = recordOf(interaction.result);
   const outcome = result && typeof result.outcome === "string" ? result.outcome : null;
   // Supersession replaces the card with a newer request: the old SHA stops
   // being green and returns to pending until the newer decision lands.
@@ -75,16 +89,55 @@ function stateFor(interaction: Record<string, unknown>): GatesStatusState | null
   }
 }
 
+/**
+ * Parses the dedicated merge-authorization title: the exact directive
+ * `Merge <owner/repo>#<n>?` a conforming merge confirmation presents to
+ * the RM. Returns the lowercased repo and PR number, or null for anything
+ * else (prose directives, negations, missing question mark, leading-zero
+ * numbers, invalid repo or out-of-range number).
+ */
+function mergeTitle(title: unknown): { repo: string; prNumber: number } | null {
+  if (typeof title !== "string") return null;
+  const match = /^Merge ([A-Za-z0-9][A-Za-z0-9.-]{0,38}\/[A-Za-z0-9_.-]{1,100})#(\d{1,10})\?$/.exec(title);
+  if (!match) return null;
+  const repo = match[1]!.toLowerCase();
+  if (!REPO.test(repo) || repo.endsWith("/.") || repo.endsWith("/..")) return null;
+  const number = Number(match[2]!);
+  if (String(number) !== match[2]!) return null;
+  if (!Number.isSafeInteger(number) || number < 1 || number > 2_147_483_647) return null;
+  return { repo, prNumber: number };
+}
+
+/**
+ * True when the interaction carries exactly the dedicated merge-authorization
+ * contract: the merge question as both title and prompt, the bare PR URL as
+ * the only details, and no summary, acceptance label, target, or other
+ * approval-enrichment block that would change what acceptance means.
+ */
+function isMergeAuthorizationContract(interaction: Record<string, unknown>): boolean {
+  const payload = recordOf(interaction.payload);
+  if (payload.target != null || payload.toolAction != null || payload.secretProposal != null || payload.connectionAuthorization != null) return false;
+  if (text(payload.acceptLabel).trim() !== "" || text(interaction.summary).trim() !== "") return false;
+  const target = mergeTitle(interaction.title);
+  if (!target) return false;
+  if (text(payload.prompt) !== text(interaction.title)) return false;
+  const expected = `https://github.com/${target.repo}/pull/${target.prNumber}`;
+  if (text(payload.detailsMarkdown).toLowerCase() !== expected) return false;
+  return true;
+}
+
 export function extractGatesDecision(raw: unknown, releaseManagerAgentId: string): GatesExtraction {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { reason: "not_an_interaction" };
   const interaction = raw as Record<string, unknown>;
   if (interaction.kind !== "request_confirmation") return { reason: "not_a_confirmation" };
   if (typeof interaction.resolvedByAgentId !== "string" || !UUID.test(interaction.resolvedByAgentId) || !UUID.test(releaseManagerAgentId)
       || interaction.resolvedByAgentId.toLowerCase() !== releaseManagerAgentId.toLowerCase()) return { reason: "wrong_resolver" };
+  if (typeof interaction.addresseeAgentId !== "string" || !UUID.test(interaction.addresseeAgentId)
+      || interaction.addresseeAgentId.toLowerCase() !== releaseManagerAgentId.toLowerCase()) return { reason: "not_addressed_to_rm" };
   const state = stateFor(interaction);
   if (state === null) return { reason: "no_publishable_outcome" };
+  if (!isMergeAuthorizationContract(interaction)) return { reason: "not_a_merge_authorization" };
   const source = combinedText(interaction);
-  if (!/\bmerge\b/i.test(source)) return { reason: "not_a_merge_confirmation" };
   const prs = prRefs(source);
   if (prs.size === 0) return { reason: "no_pr" };
   if (prs.size > 1) return { reason: "ambiguous_pr" };
