@@ -12,7 +12,7 @@ export function validatePaths(paths) {
   assert(paths.length > 0 && paths.length <= 100, "Unexpected package file count");
   assert.equal(new Set(paths).size, paths.length, "Duplicate package member");
   for (const path of paths) {
-    assert(requiredFiles.includes(path) || /^dist\/[a-z][a-z-]*(?:\.js|\.d\.ts)$/.test(path),
+    assert(requiredFiles.includes(path) || path === "custody-migrations/README.md" || /^dist\/[a-z][a-z-]*(?:\.js|\.d\.ts)$/.test(path),
       `Unexpected package member: ${path}`);
   }
   for (const path of requiredFiles) assert(paths.includes(path), `Missing ${path}`);

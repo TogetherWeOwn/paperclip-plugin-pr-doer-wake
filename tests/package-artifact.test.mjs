@@ -28,6 +28,15 @@ test("allows only the intended package payload", () => {
   assert.throws(() => validatePaths(Array(101).fill("dist/index.js")), /count/);
 });
 
+test("allows the custody migration README but refuses active SQL and other payload", () => {
+  const custodyPaths = [...paths, "custody-migrations/README.md"];
+  validatePaths(custodyPaths);
+  for (const unexpected of ["custody-migrations/001.sql", "custody-migrations/.env",
+    "custody-migrations/nested/README.md", "custody-migrations/../README.md"]) {
+    assert.throws(() => validatePaths([...custodyPaths, unexpected]), /Unexpected package member/);
+  }
+});
+
 test("loads the declared manifest and rejects an existing non-manifest module", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ci-wake-manifest-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
