@@ -4,6 +4,8 @@ import { CiGithubError, type CiTokenExchange, type CiTokenSource } from "./ci-gi
 
 /** Request the full read-only ceiling on every mint, including metadata. */
 export const APP_PERMISSIONS = Object.freeze({ pull_requests: "read", checks: "read", statuses: "read", actions: "read", administration: "read", metadata: "read" } as const);
+/** The gates publisher's whole ceiling: one commit-status write, nothing else. */
+export const GATES_PERMISSIONS = Object.freeze({ statuses: "write" } as const);
 export const AUTH_CYCLE_MS = 180_000;
 const MARGIN_MS = 60_000;
 interface AppAuthOptions {
@@ -12,6 +14,8 @@ interface AppAuthOptions {
   repo: string;
   resolvePrivateKey: () => Promise<string>;
   now?: () => number;
+  /** Fixed requested set; defaults to the read-only ceiling above. */
+  permissions?: Readonly<Record<string, string>>;
 }
 
 /** Operation-local only. Private fields prevent accidental JSON serialization of credentials. */
@@ -26,6 +30,8 @@ export class CiAppAuth implements CiTokenSource {
   constructor(options: AppAuthOptions) {
     if (![options.appId, options.installationId].every((v) => /^[1-9][0-9]{0,15}$/.test(v) && Number.isSafeInteger(Number(v)))
         || !REPO.test(options.repo) || options.repo !== options.repo.toLowerCase() || [".", ".."].includes(options.repo.split("/")[1]!)) throw new CiGithubError("input");
+    if (options.permissions !== undefined && (!options.permissions || typeof options.permissions !== "object" || Array.isArray(options.permissions)
+        || Object.keys(options.permissions).length === 0 || Object.entries(options.permissions).some(([name, level]) => !/^[a-z_]+$/.test(name) || (level !== "read" && level !== "write")))) throw new CiGithubError("input");
     this.#options = { ...options };
     this.#now = options.now ?? Date.now;
     this.#deadline = this.#now() + AUTH_CYCLE_MS;
@@ -63,7 +69,8 @@ export class CiAppAuth implements CiTokenSource {
     const unsigned = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iss: this.#options.appId, iat: Math.floor(now / 1000) - 60, exp: Math.floor(now / 1000) + 300 })}`;
     const jwt = `${unsigned}.${sign("RSA-SHA256", Buffer.from(unsigned), key).toString("base64url")}`;
     if (this.#failed || this.#now() >= this.#deadline) throw new CiGithubError("auth");
-    const raw = await exchange(this.#options.installationId, jwt, { repositories: [this.#options.repo.split("/")[1]!], permissions: APP_PERMISSIONS });
+    const expected: Readonly<Record<string, string>> = this.#options.permissions ?? APP_PERMISSIONS;
+    const raw = await exchange(this.#options.installationId, jwt, { repositories: [this.#options.repo.split("/")[1]!], permissions: expected });
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new CiGithubError("auth");
     const data = raw as Record<string, unknown>;
     const expiresAt = typeof data.expires_at === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(data.expires_at) ? Date.parse(data.expires_at) : NaN;
@@ -72,8 +79,10 @@ export class CiAppAuth implements CiTokenSource {
     const permissions = data.permissions;
     if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) throw new CiGithubError("auth");
     const granted = permissions as Record<string, unknown>;
-    if (Object.keys(APP_PERMISSIONS).some((name) => granted[name] !== "read")
-        || Object.entries(granted).some(([name, level]) => level !== "read" || !Object.hasOwn(APP_PERMISSIONS, name))) throw new CiGithubError("auth");
+    // If the App was never granted a requested permission, the granted set is short
+    // and this fails closed. The gates publisher maps this to `missing_permission`.
+    if (Object.entries(expected).some(([name, level]) => granted[name] !== level)
+        || Object.entries(granted).some(([name, level]) => level !== expected[name] || !Object.hasOwn(expected, name))) throw new CiGithubError("auth");
     const repos = data.repositories;
     if (!Array.isArray(repos) || repos.length !== 1 || !repos[0] || typeof repos[0] !== "object"
         || typeof repos[0].full_name !== "string" || repos[0].full_name.toLowerCase() !== this.#options.repo
