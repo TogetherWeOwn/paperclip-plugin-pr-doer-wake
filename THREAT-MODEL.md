@@ -1,0 +1,61 @@
+# Threat model: ci_wait_register / CI wake 0.2
+
+Status: implementation review required; this is not Security acceptance. Maintainer role: plugin toolsmith. API targets: stock plugin SDK 2026.1023.0 and GitHub REST 2022-11-28.
+
+## Assets and credential ceiling
+
+Assets are the GitHub read credential, optional webhook HMAC secret, exact card-to-head registration, host wake budget, and the non-secret wait/audit ledger. The configured GitHub credential may be broader than the plugin's repo allowlist; that residual ceiling must be recorded by the Operator and accepted by Security. Prefer a read-only installation/resource-scoped credential. No credential is created or rotated here. No billable infrastructure is created, and no builds execute in the credential-bearing worker.
+
+| Credential can potentially do | Tool exposes | Explicitly forbidden |
+| --- | --- | --- |
+| Read resources within its GitHub grant | Fixed-origin GET of PR, base rules/classic required status checks, commit checks/suites/statuses, exactly associated Actions workflow attempts/jobs for allowlisted registered heads | Arbitrary URLs, headers, paths, search, repository enumeration, writes, merges, workflow mutation/dispatch/rerun, token minting |
+| Authenticate one webhook origin | Compare SHA-256 raw-body HMAC and trigger the same bounded recheck | Payload-directed issue selection or direct wakes |
+| Paperclip SDK capabilities | Checkout-owner assertion, exact card/workspace reads, plugin state, job, one wake API | Issue create/update/comments, SQL/core tables, shell, secret output |
+
+## Principals and boundaries
+
+Tool run context (company/project/agent/run) is host-supplied, never an argument. `issueId` is an untrusted selector until `assertCheckoutOwner` succeeds. The card company/project and execution workspace repository/branch must match the current PR head. The assertion and binding are rechecked after GitHub responds. The runtime does not infer the owner from a `work/<uuid>` prefix, PR body, issue description, comment, author name or provider error.
+
+The registration binds company, issue, project, workspace, branch, repo, PR number, SHA and registering run to a plugin-derived wait ID. Checkout can legitimately end before CI completes: scheduled rechecks revalidate card/workspace/configuration and let `requestWakeup` apply current assignee, blocker, terminal and budget constraints. The plugin never changes task status, assignment, monitor or review policy.
+
+GitHub and Paperclip are separate systems. Revalidate current PR head/base and card/workspace before the wake. They cannot be atomically locked together; a change immediately after the final read remains a race. Branch/repository mutations retire or refuse the wait. Deleted fork repositories and missing bindings fail closed.
+
+## Confused deputy and injection
+
+The agent may supply a foreign issue, copied SHA, fork PR, spoofed branch, case tricks, encoded separators, oversized numbers, unknown keys or hostile natural-language content. Execution-time closed-schema parsing, checkout assertion, fixed GitHub origin, allowlist and authoritative workspace/PR reads constrain these. The runtime accepts no credential, secretRef, approval boolean, endpoint or caller identity in tool arguments.
+
+PR/API content is data, not instructions. Only projected identifiers, statuses, check names, timestamps and app IDs affect readiness. App-bound checks cannot be satisfied by legacy commit statuses or an unrelated app of the same name. Unknown/partial shapes, denied pages, pagination limits and unknown conclusions stay pending. A required check failing does not wake while another required check remains pending. An active associated suite needs positive Actions attempt/job evidence before terminal required checks can ignore optional work. Discovery is constrained by exact repo/head/suite; complete attempt-job pages bind exact check-run references, names and conclusions, followed by suite/workflow rereads. Response-provided references are validated, never fetched. Missing/contradictory evidence and newer partial attempts defer, as do legacy statuses while observed suites run. This is not a transaction or an enumeration of uncreated rerun targets; universal required-only latency is not promised. Every extra GET uses the unchanged request/page/byte/cache/time budgets and operation-local credential. Actual existing Actions-read authority remains pre-installation evidence; denial is not permission to widen a credential.
+
+## Secrets and transport
+
+Resolve configured references only after tool authorization and before the authorized read. Credentials remain operation-local and are not cached in the runtime, serialized, returned or written to logs/state. Errors are fixed code strings, not upstream/host exceptions or bodies. GitHub client rejects direct and JSON-escaped credential reflection; check labels reject control characters and are bounded before the wake reason. Tests use synthetic canaries only.
+
+Use `ctx.http.fetch` on `https://api.github.com` only. Do not follow Link URLs; build page numbers locally. Client requests `redirect: error` and rejects a returned redirect/changed URL. **Stock-host limitation:** the pinned SDK serializes only selected RequestInit fields; enforcement of redirect refusal and network abort at the actual host must be verified before installation. A response-size check in the worker does not prevent the host from buffering an oversized response first. Process separation is not an OS sandbox and does not constrain a compromised plugin with the broad credential in memory.
+
+Some pinned SDK response wrappers construct a body-bearing Response for 304, which can throw. Conditional-read compatibility must use a real successful unconditional re-read within the same budget, never interpret an exception as cached success. Record target-host behavior in acceptance evidence.
+
+## Replay, concurrency and state integrity
+
+One host-managed worker serializes registration, job and webhook work. Same-run registration retries are stable; joining runs are recorded as bounded aliases. New-run rearming after a settled wait is explicit. This does not claim that the plugin can distinguish a mistaken new registration from an intentional manual rerun.
+
+Before the wake API call, persist a `waking` intent and stable `(repo, headSha, waitId)` idempotency key. A lost reply or restart during the intent becomes `unconfirmed`, not an automatic retry. Host `queued: false` may retry on later polls because it confirms no wake queued. State/audit failure before an effect stops it; failure after a potentially delivered effect preserves the conservative intent/unconfirmed state. Retain the card backstop to cover this at-most-once-versus-delivery tradeoff.
+
+**No cross-worker CAS is provided by stock plugin state.** Run one installed worker/ledger, not overlapping independent installations. A process-local lock is not evidence of distributed fencing. Security must accept or reject this deployment envelope explicitly.
+
+Webhook verification uses timingSafeEqual, raw bytes, SHA-256 only, delivery UUID replay entries for 24 hours, repository/organization allowlists, 20-second head debounce and six hints/minute. Admission before the worker queue is limited to two outstanding hints and six candidate bodies/minute, before any ledger/configuration RPC. Six secret verifications/minute independently limit consumption of the host secret-resolution quota. Malformed/oversized payloads are rejected. Payloads without an existing exact-head registration create no wait. Dropped hints never bypass readiness; the independent four-minute poll catches them.
+
+## Caps, expiry and audit
+
+Immutable code limits bound open/retained waits, run aliases, audit ring, delivery replay records, cached HTTP responses, pages, bytes, tick duration, requests and wake attempts. Active waits expire after seven days without extension on retry. Independent scheduled compaction retires expiry and prunes 30-day tombstones and 24-hour delivery entries. TTL pertains only to plugin records; resource provisioning, spend reservations, delegated credentials and cloud teardown are not applicable because all provider operations are reads.
+
+The ledger records safe tool intent/outcome/refusal entries with server time and host run/company IDs. Wake intents/outcomes and webhook hints are also recorded. Audit writes precede new effects; arbitrary arguments, secrets, raw bodies, HTTP errors and headers are never audit fields. This is a bounded operational ring, not a tamper-evident compliance archive. Operator export/retention and host native immutable tool-event coverage remain installation evidence, not claims proved by unit tests.
+
+## Residual risks and installation hold
+
+- Compromised worker/host or an excessively broad upstream credential exceeds the narrow tool boundary. Use minimal grants and revoke bindings on compromise.
+- Host may store unauthenticated webhook headers/raw bodies **before** plugin verification, without a plugin-controlled retention policy. Phase two stays off until the owner accepts ingress/storage and supplies the secret/webhook.
+- A denied or unavailable rules/protection API cannot produce completion evidence. Repair access; never waive a check or substitute model judgment.
+- Finite caps or the ambiguous-reply policy can miss a timely wake. Backstop monitors, `unconfirmed` audit review and the 20-head canary are required operational controls.
+- Governance of `ctx.tools.register`, redirect/timeout handling, native host idempotency and safe secret trace behavior must be verified on the exact installation. This repository alone does not prove them.
+
+Security acceptance, QA, exact-head Actions and Operator installation/canary are independent gates. See [ACCEPTANCE.md](ACCEPTANCE.md) and the [runbook](README.md).

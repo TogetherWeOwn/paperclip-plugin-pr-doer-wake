@@ -1,29 +1,102 @@
-# PR doer wake
+# CI wake
 
-A Paperclip plugin that wakes the owner of an open, non-draft, trusted GitHub PR through `ctx.issues.requestWakeup`. It does not create comments. The host remains authoritative for assignee, blockers, status, agent state, and budget. Shadow mode records the decision without a wake.
+CI completion wakes for explicitly registered Paperclip cards. This is the successor to PR doer wake in the same repository and package, retaining plugin ID `togetherweown.pr-doer-wake`. Version 0.2 replaces the old ownership guessing, check-failure/conflict triggers, core-table reads and SQL ledger. It never trusts PR bodies, issue text, comments or a branch prefix to select a card.
 
-## Events and limitations
+**Status: implementation pending independent Security/QA acceptance and Operator canary. Not installed or qualified by this repository.** Stock Paperclip plugin SDK only; no core modifications, internal APIs, GitHub settings changes or LLM calls are needed for phase one.
 
-Keep the existing organization webhook id **703712015**, plugin id `togetherweown.pr-doer-wake`, and endpoint key `github`. Subscribe only to `check_run` and `pull_request`; keep the existing signed endpoint and secret. The plugin accepts completed check runs with conclusions `failure`, `timed_out` or `action_required`, and pull request `synchronize` events as candidates for conflicts. It re-reads GitHub and only wakes for a currently red check or `CONFLICTING` mergeability. `UNKNOWN` is retried. `closed` events verify current PR state and clear never-attempted ledger rows; wake-attempted tombstones are retained for deduplication. Other events and conclusions do not trigger a wake.
+## Registration
 
-A default-branch push is no longer consumed: conflicts caused only by a base branch update are not noticed until a relevant synchronize event. Checks that fail while a PR is a draft or closed are not rechecked merely because it becomes ready or reopens. Commit status events are not consumed.
+Immediately after a push, call the plugin-contributed `ci_wait_register` tool:
 
-## Card resolution
+```json
+{
+  "issueId": "aaaaaaaa-0000-4000-8000-000000000001",
+  "repo": "example/project",
+  "prNumber": 42,
+  "headSha": "0123456789abcdef0123456789abcdef01234567"
+}
+```
 
-All available ownership evidence is considered before eligibility: branch identifier, PR URL in an agent-authored comment, and PR URL in a card title or description. More than one distinct candidate is ambiguous and held. A branch identifier counts only when the named card's project has a workspace for the PR's repository; a card-named branch in an unrelated repository names no card. Once two candidates are found the description scan is skipped. Comment matching excludes comments by configured excluded agents, users, plugins, and chat-channel cards. URL matching requires the GitHub PR URL as a token, with a non-digit after the PR number. The SDK issue list has no text search, so the plugin discovers matching projects from their workspace GitHub repository URLs, lists only their open issues by status, and fetches full descriptions (the list returns previews). It reads at most 200 full issues and checks at most 200 projects; if either cap is exceeded it holds the wake as ambiguous, even when a branch or comment matches. No matching workspace means title/description evidence is unavailable; projectless and terminal cards are not scanned for this evidence. Keep workspace repository URLs current. The repository-to-projects map and full issue texts (keyed by issue `updatedAt`) are reused for 60 seconds, so a new workspace link may take up to a minute to count. The host applies pagination twice (`/app/server/src/services/plugin-host-services.ts` `applyWindow` and `/app/server/src/services/issues.ts` `list`), so the bounded scan uses no offset.
+The host supplies company, project, agent and run identity. The tool checks `ctx.issues.assertCheckoutOwner`, reads the card's execution workspace, and verifies its company, project, exact GitHub repository and exact branch against the current open PR and head SHA. Fork heads are refused. Draft PRs are allowed: explicit registration authorizes waiting for their CI, not merging them. There is **no automatic branch fallback**, so a spoofed `work/<uuid>` branch or PR-body link cannot create a wait. Other arguments, URLs, credentials and secret references are refused.
 
-**Known gap:** Work-product matching is not implemented. The pinned SDK/host exposes no plugin work-product read (`/app/server/src/services/plugin-host-services.ts:2060`, `/app/packages/shared/src/constants.ts:1442`). Follow up upstream for a supported plugin work-product read after searching existing issues, then use it as another ownership signal. Until then a card linked only by a work product is not found, and a single wrong candidate cannot be detected.
+Retries in the same run return the original wait ID without extending its seven-day expiry. Another run joins an active wait. After a settled wait, a manual rerun must be registered from a **new agent run**, producing a new wait ID for that head. A repeated call from the old run cannot rearm a settled wait. Keep a card backstop monitor; a registration refusal, exhausted cap or expired wait must not strand the card.
 
-## Delivery contract
+## Readiness and delivery
 
-The ledger deduplicates by company, PR, head SHA and state. A fenced atomic mark precedes the wake request. If a request may have reached the host but its reply is lost, it is not repeated, and the row is recorded as `wake_unconfirmed`: this provides at-most-once requests, not guaranteed delivery. Transient failures retry with backoff without limit. Unresolved owners (`no_card`) retry with backoff for 8 attempts (about 4 hours), after which only a later genuine signal for the same head and state resumes them; terminal holds and ambiguity are not polled. GitHub revalidation prevents stale heads, closed or merged PRs, drafts, forks, outsiders and recovered checks from waking. A closed event arriving after reopening is ignored after the current-state check. A concurrent close after the last GitHub read cannot be made atomic with a wake.
+The SDK job `ci-wake-poll` runs every four minutes over registered open waits. Conditional REST reads use ETag / `If-None-Match`; a 304 reuses only the corresponding successfully cached response. All pages of check runs, suites, statuses and applicable branch rules are read, with finite page, byte, time and request limits. A failed/incomplete read is pending, never green. Rate limits defer work; they do not create an LLM retry loop.
 
-## Configuration
+Required status-check contexts come from the **PR base branch's effective rules** plus classic branch protection, including required app identity. The latest run per name/app wins, so a queued rerun supersedes its earlier green result. All required contexts must finish before a normal pass/fail wake:
 
-See `src/manifest.ts`. `enabled` defaults false and `shadow` true. Enabled companies require `githubOrg`, `webhookSecretRef`, and `githubTokenSecretRef` Paperclip secret references. The GitHub token must read PRs and check runs; fine-grained personal access tokens cannot obtain Checks permission, so use a suitable classic token or another supported token. `stoppedRepos` defaults to `["togetherweown/nntune"]` when omitted; an explicit list replaces the default. `ignoreChecks` excludes check names, including the review check. There is no static required-checks map: every non-ignored check is considered, including optional checks. Existing `requiredChecks` and `postEvidenceComment` settings are ignored. Other controls include `excludeAgentIds`, `wakeStates`, `skipBlockedStatus`, `branchIdentifierPattern`, `reviewCheckName`, and `trustedAuthors`.
+- Pass: `success`, `neutral`, `skipped`.
+- Fail: `failure`, `cancelled`, `timed_out`, `action_required`, `startup_failure` (commit statuses `failure`/`error` also fail).
+- Unknown conclusions and nonterminal runs remain pending.
+- An active required run's suite is ambiguous: it may contain optional work or a required rerun that has not created its replacement check yet. Prompt required-only completion needs positive current-generation evidence. The plugin discovers an exactly associated Actions workflow, validates its attempt, reads every page of attempt jobs, binds terminal required jobs by exact check-run reference/name/app/suite, rereads the suite, then rereads the workflow. Matching observations and required job conclusions allow optional work in that same attempt to continue without delaying the wake.
+- This is a bounded consistency check, **not a cross-resource transaction or complete list of uncreated rerun targets**. Ambiguous/newer/partial attempts, unavailable Actions access, contradictory or incomplete reads, and providers without equivalent evidence defer to later normal polls, potentially until full workflow/suite settlement. Repeated reads, 304s, timestamps, numeric ordering and debounce do not prove a missing required replacement was excluded. Legacy statuses have no suite/generation binding and wait for observed suites to settle. Universal prompt required-only latency is not promised. Expiry remains expiry, never a fabricated pass/fail.
+- Without required contexts, all observed suites and latest runs/commit statuses must be terminal. An empty head remains pending; no Actions extension is applied.
+- A missing required context yields a fail wake naming `required check missing` only after twice the repository CI median has elapsed since the last suite completion (registration time if no suite exists), and no present required context remains pending.
 
-The webhook signature is checked against the raw body using the configured secret; non-actionable events are discarded before secret resolution. Both GitHub secrets use the worker-memory cache described in `src/secrets.ts`.
+The cold-start median is an operator-supplied measured `repoMedianMs` entry, or **30 minutes** when unknown. A rolling sample of up to 31 distinct settled registered heads replaces it. The plugin measures suite creation-to-final-completion, not agent registration-to-wake latency. It never treats an HTTP denial as an absence of required checks. A moved head, changed branch, closed or merged PR retires the wait without waking. Fresh PR and card/workspace/config reads precede every wake; a concurrent GitHub change after the final read cannot be made atomic with the Paperclip wake.
+
+The wake reason names pass/fail, repository, short head SHA, failed contexts and missing contexts. The host remains authoritative for assignee, blockers, terminal status, paused agents and budget. A host-deferred (`queued: false`) wait remains open. Exactly matched, known pre-queue accounting/not-sent refusals also remain open; unknown exceptions never authorize retry. A failed pre-dispatch intent write is restored to open when possible, because no wake call has occurred. Dry run logs **`would wake`**, records a terminal dry-run outcome and calls no wake API; switching to live does not replay dry-run completions.
+
+### At-most-once boundary
+
+Each `(repo, headSha, waitId)` has a durable intent before `ctx.issues.requestWakeup`, plus a stable host idempotency key. All entrypoints share a single-worker lock, including overlapping scheduled callbacks. If the host reply is lost, the wait becomes `unconfirmed` and is **not retried**; restart treats an unfinished intent the same way. This favors no duplicate requests over guaranteed delivery during an ambiguous failure. The backstop recovers missed work. Do not claim exactly-once delivery or run multiple independent plugin workers against the same ledger: stock state has no cross-worker compare-and-swap.
+
+## Configuration and limits
+
+The manifest has only these capabilities:
+
+```text
+webhooks.receive  jobs.schedule  issues.read  issues.wakeup  issues.checkout
+execution.workspaces.read  agent.tools.register  plugin.state.read
+plugin.state.write  http.outbound  secrets.read-ref
+```
+
+No issue creation/update/comments, company/project enumeration, SQL namespace, shell or GitHub writes. The tool discovers companies only from its own registered waits. Both credentials resolve **at call time**, remain operation-local and are never returned/logged/stored. Do not paste credential values into config; use Paperclip secret pickers.
+
+| Config | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Master switch; rejects registrations and stops rechecks when disabled. |
+| `dryRun` | `true` | Log/record would-wake decisions without waking. |
+| `allowedRepos` | `[]` | Explicit owner/repo allowlist; mandatory when enabled, maximum 100. |
+| `githubTokenSecretRef` | unset | Existing read-only credential reference. |
+| `repoMedianMs` | `{}` | Measured cold-start repo medians in ms, 60,000–86,400,000. |
+| `webhooksEnabled` | `false` | Phase-two opt-in only. |
+| `webhookSecretRef` | unset | Owner-held HMAC secret reference, required only in phase two. |
+
+Use a GitHub credential that can read pull requests, checks, statuses and effective branch rules/classic protection for allowlisted repos. Prompt same-attempt Actions reconciliation additionally needs existing **Actions: read** access to the fixed workflow-run/attempt-job endpoints; verify the actual plugin credential at qualification, not an agent's separate GitHub identity. Without that access, active-suite reconciliation defers and settled suites still use the normal checks path. Never widen a credential to avoid deferral without separate authorization. A GitHub App installation token must be maintained by its existing credential provider; this plugin does not mint tokens, rotate credentials, modify installations or increase scopes. For public repos a suitable token can read public resources; verify rules/protection access explicitly. A 401/403 is a retryable configuration/access problem, not a green result. No webhook secret is needed for polling.
+
+Hard runtime caps: 20 simultaneous open waits across the installation; 2,000 retained waits; seven-day active TTL; 30-day dedupe tombstones; 1,000 recent safe audit entries; 240 HTTP requests / 180 seconds / 20 wake attempts per tick. Bounded per-client page and response limits may defer large heads rather than truncate results. Expiry/compaction run on the independent scheduled job, including while disabled. No cloud resources are provisioned and no paid runner is used, so provisioning/spend reservation and cloud teardown are not applicable. Operator must export required audit evidence before the bounded ring expires.
+
+## Operator installation and canary (phase one)
+
+1. Obtain native Security acceptance and QA for the exact source/artifact/configuration envelope; retain exact-head GitHub Actions run/job links. Complete `ACCEPTANCE.md`, including native-tool governance coverage on the target stock host. A manifest declaration is not evidence that governance ran.
+2. An Operator installs/upgrades the reviewed package, preserving the plugin ID. Bind an **existing approved** read-only GitHub credential with the secret picker. Creating/rotating credentials requires the separate owner decision; this plugin does neither.
+3. Replace old configuration, do not carry its heuristic fields forward. Start `enabled: true`, `dryRun: true`, allowlisting only the canary repository. Keep `webhooksEnabled: false`; no GitHub settings change is needed.
+4. Register after each canary PR push. Compare the first **20 distinct registered heads** against GitHub's authoritative required contexts and timestamps. Retain per-head registration time, final-check time, poll/would-wake time, head-move retirement and wake count. Exit only with **0 premature wakes, 0 misses beyond one four-minute poll, 0 duplicate wakes**. Count ambiguity, caps, HTTP denials and failed reads explicitly; they are not passes. Sample enough checks to verify queued reruns, required missing and failed contexts, not merely all-green heads.
+5. Operator records the evidence and enables live wakes only through the accepted configuration envelope. Dry-run records stay terminal; register new heads (or new-run waits after a deliberate rerun) for live evidence. Record actual live host queue/run evidence.
+6. Only after canary/live acceptance, route the agent instruction change through its normal reviewer/applier: register after push and keep a long backstop `max(15 minutes, 2 × repo median)`. Do not change instructions or remove backstops merely because code merged.
+
+Old SQL migrations remain as historical schema definitions, not active manifest migrations. Existing database evidence is neither read nor deleted. The previous `github` endpoint and check_run/pull_request subscriptions are retired; no old webhook settings are reused automatically. The Operator/owner must handle obsolete settings separately under their normal authority.
+
+## Exact owner steps for optional webhook hints (phase two)
+
+After phase-one acceptance, the owner who administers GitHub and holds the new secret:
+
+1. Generate a high-entropy webhook secret privately. Do not send it to an agent, an issue, the Operator or this repository.
+2. Store it directly in a Paperclip company secret. Bind its reference as `webhookSecretRef` for the reviewed plugin, using the secret picker; never a raw string.
+3. In the canary GitHub repository **Settings → Webhooks → Add webhook** (later the organization **Settings → Webhooks → Add webhook**), set payload URL to `https://<your-public-paperclip-host>/api/plugins/<installed-plugin-id>/webhooks/github-ci`. Use the installed record's route identifier, not an assumed UUID. Content type **application/json**; **SSL verification enabled**; enter the same secret privately.
+4. Select **Let me select individual events → Check suites only**, then **Active**. Do not select all events, check runs, pull requests or workflow runs. GitHub check-suite webhooks deliver completed events; statuses are still caught by polling.
+5. Operator enables `webhooksEnabled` only after the owner confirms the webhook/secret placement. Validate one real completed check-suite delivery and its HMAC verdict, then prove the resulting read sees current GitHub state. A delivery itself is not CI completion evidence.
+6. Monitor the host's webhook-delivery table/storage growth during the canary: stock host may persist raw bodies/headers before plugin verification and may not prune them. If that risk is not accepted, leave webhooks off and use polling. Protect public ingress with existing limits if authorized; this plugin cannot enforce pre-storage retention.
+
+The plugin verifies SHA-256 HMAC over the **raw body** with `timingSafeEqual`, ignores `parsedBody`, requires delivery UUIDs, retains a 24-hour replay guard and checks repo/org against the allowlist. The event is only a hint for the same readiness recheck. Payloads are capped at 64 KiB; before any ledger/config RPC, admission is limited to two outstanding hints and six candidate bodies per minute. Verification is independently capped at six secret resolutions per minute per worker; hints are debounced 20 seconds per head and capped at six per minute. Oversized/busy hints may be dropped safely: polling remains authoritative.
+
+## Rollback and revocation
+
+Operator sets `dryRun: true` or `enabled: false`, disables the tool profile, and removes secret bindings if needed. The owner disables/deletes the optional webhook. Keep card backstops and reconcile `unconfirmed` waits against actual host run records; never blindly replay them. A rollback must not reinstall the unsafe ownership heuristic without a separate decision. Do not delete the state ledger to retry a wake. Review threats and residual host limits in [THREAT-MODEL.md](THREAT-MODEL.md).
 
 ## Development
 
-Run `npm ci && npm run check` for typecheck, Vitest and build. SQL and config contract tests use the host validators copied into `tests/fixtures/`.
+Pinned SDK fixture target: `@paperclipai/plugin-sdk@2026.1023.0` (lockfile). GitHub REST API version `2022-11-28`. Tests use synthetic fixtures and no live provider calls. GitHub Actions is the CI of record: the `check` job runs locked dependency installation, typecheck, Vitest and build on a standard hosted runner. Push a draft PR and record the exact head's run/job links. Do not run a full suite or CI mirror on a shared host. Before pushing, run the existing bounded formatter/linter, project typecheck and changed/covering unit files, recording commands, scope, elapsed time, results and justified skips separately from exact-head Actions evidence.
