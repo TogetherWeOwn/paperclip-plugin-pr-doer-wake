@@ -56,6 +56,8 @@ export interface CiSnapshot {
   runs: CiCheckRun[];
   suites: CiCheckSuite[];
   statuses: CiCommitStatus[];
+  /** Exact check-run IDs corroborated by terminal jobs in a stable Actions attempt. */
+  currentAttemptRunIds?: number[];
   fetchedAt: number;
 }
 export interface CiPull {
@@ -301,12 +303,74 @@ export class CiGithub {
       return { id: id(status.id), context: text(status.context), state: text(status.state) };
     });
     const unique = new Map(required.map((check) => [JSON.stringify([check.context, check.appId]), check]));
-    return { repo, sha, baseBranch, required: [...unique.values()], runs, suites, statuses, fetchedAt: this.now() };
+    const relevant = latest(runs, (run) => JSON.stringify([run.name, run.appId])).filter((run) =>
+      [...unique.values()].some((check) => check.context === run.name && (check.appId === null || check.appId === run.appId)));
+    const currentAttemptRunIds: number[] = [];
+    for (const suite of suites) {
+      const candidates = relevant.filter((run) => run.suiteId === suite.id && run.appId === suite.appId);
+      if (suite.status !== "completed" && candidates.length) {
+        currentAttemptRunIds.push(...await this.currentAttempt(repo, sha, suite, candidates));
+      }
+    }
+    return { repo, sha, baseBranch, required: [...unique.values()], runs, suites, statuses, currentAttemptRunIds, fetchedAt: this.now() };
   }
 
-  private async pages(path: string, field?: string): Promise<unknown[]> {
+  private async currentAttempt(repo: string, sha: string, suite: CiCheckSuite, runs: CiCheckRun[]): Promise<number[]> {
+    // A queued suite contradicts an old in-progress workflow, even if its jobs
+    // still look terminal. Wait for a coherent observation on a later poll.
+    if (suite.status !== "in_progress" || suite.conclusion !== null) return [];
+    const root = `/repos/${repo}`;
+    const workflow = (value: unknown) => {
+      const raw = object(value);
+      if (fullSha(text(raw.head_sha)) !== sha || id(raw.check_suite_id) !== suite.id
+          || repoName(text(object(raw.repository).full_name)) !== repo) return invalid();
+      return { id: id(raw.id), attempt: id(raw.run_attempt), status: text(raw.status), conclusion: nullableText(raw.conclusion) };
+    };
+    const discovered = (await this.pages(`${root}/actions/runs?head_sha=${sha}&check_suite_id=${suite.id}`, "workflow_runs", true)).map(workflow);
+    // No association (or multiple associations) supplies no current-generation proof.
+    if (discovered.length !== 1) return [];
+    const found = discovered[0]!;
+    const path = `${root}/actions/runs/${found.id}`;
+    const before = workflow((await this.request(path)).data);
+    if (before.id !== found.id || before.attempt !== found.attempt || before.status !== "in_progress" || before.conclusion !== null) return [];
+    const jobs = await this.pages(`${path}/attempts/${before.attempt}/jobs`, "jobs", true);
+    const jobIds = new Set<number>();
+    const checkIds = new Set<number>();
+    const corroborated: number[] = [];
+    for (const value of jobs) {
+      const job = object(value);
+      const jobId = id(job.id);
+      if (jobIds.has(jobId) || id(job.run_id) !== before.id || id(job.run_attempt) !== before.attempt
+          || fullSha(text(job.head_sha)) !== sha) return invalid();
+      jobIds.add(jobId);
+      // Validate identity only. Never fetch a URL supplied by a response.
+      const reference = text(job.check_run_url);
+      const prefix = `${ORIGIN}${root}/check-runs/`;
+      if (!reference.startsWith(prefix) || !/^[1-9][0-9]*$/.test(reference.slice(prefix.length))) return invalid();
+      const checkId = id(Number(reference.slice(prefix.length)));
+      if (checkIds.has(checkId)) return invalid();
+      checkIds.add(checkId);
+      const name = text(job.name);
+      const status = text(job.status);
+      const result = nullableText(job.conclusion);
+      const run = runs.find((run) => run.id === checkId && run.name === name);
+      if (run && run.status === status && run.conclusion === result && conclusion(status, result) !== "pending") corroborated.push(run.id);
+    }
+    // Observe the suite again after jobs, then the workflow. This is a bounded
+    // consistency check, not a transaction or an enumeration of uncreated targets.
+    const later = object((await this.request(`${root}/check-suites/${suite.id}`)).data);
+    if (id(later.id) !== suite.id || fullSha(text(later.head_sha)) !== sha || appId(later.app) !== suite.appId) return invalid();
+    const after = workflow((await this.request(path)).data);
+    if (text(later.status) !== suite.status || nullableText(later.conclusion) !== suite.conclusion
+        || after.id !== before.id || after.attempt !== before.attempt
+        || after.status !== before.status || after.conclusion !== before.conclusion) return [];
+    return corroborated;
+  }
+
+  private async pages(path: string, field?: string, strict = false): Promise<unknown[]> {
     const values: unknown[] = [];
     let expectedTotal = 0;
+    const complete = () => strict && values.length !== expectedTotal ? invalid() : values;
     for (let page = 1; page <= this.maxPages; page++) {
       const result = await this.request(`${path}${path.includes("?") ? "&" : "?"}per_page=${PAGE_SIZE}&page=${page}`);
       const envelope = field ? object(result.data) : null;
@@ -314,14 +378,15 @@ export class CiGithub {
       if (batch.length > PAGE_SIZE) return invalid();
       if (envelope) {
         const total = envelope.total_count;
-        if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) return invalid();
+        if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0
+            || (strict && page > 1 && total !== expectedTotal)) return invalid();
         expectedTotal = Math.max(expectedTotal, total);
       }
       values.push(...batch);
       // Never follow server-provided URLs (and never send a token to a Link host).
       const hasNext = /(?:^|,)\s*<[^>]+>\s*;\s*rel="next"/.test(result.link);
-      if (!hasNext && batch.length < PAGE_SIZE && values.length >= expectedTotal) return values;
-      if (!hasNext && envelope && values.length >= expectedTotal) return values;
+      if (!hasNext && batch.length < PAGE_SIZE && values.length >= expectedTotal) return complete();
+      if (!hasNext && envelope && values.length >= expectedTotal) return complete();
       // Empty/short pages cannot justify returning a partial snapshot when total_count says more.
       if (batch.length === 0) return invalid();
     }
@@ -487,12 +552,15 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
       const matchingStatuses = required.appId === null ? statuses.filter((status) => status.context === required.context) : [];
       if (!matchingRuns.length && !matchingStatuses.length) missing.push(label(required));
       for (const run of matchingRuns) {
-        // Runs are read before suites: an active rerun can make the old result stale.
-        // Gate only this latest run's suite, never other workflows sharing its app.
-        const rerunning = suites.some((suite) => suite.id === run.suiteId && suite.status !== "completed");
-        record(label(required), rerunning ? "pending" : conclusion(run.status, run.conclusion));
+        // An active suite can hide a required rerun not yet materialized. Only
+        // positive current-attempt job evidence permits same-suite optional work.
+        const associated = suites.find((suite) => suite.id === run.suiteId && suite.appId === run.appId);
+        const ambiguous = associated ? associated.status !== "completed" : suites.some((suite) => suite.status !== "completed");
+        const corroborated = associated && snapshot.currentAttemptRunIds?.includes(run.id);
+        record(label(required), ambiguous && !corroborated ? "pending" : conclusion(run.status, run.conclusion));
       }
-      for (const status of matchingStatuses) record(label(required), statusVerdict(status.state));
+      // Statuses do not identify their workflow/generation; defer while suites run.
+      for (const status of matchingStatuses) record(label(required), suites.some((suite) => suite.status !== "completed") ? "pending" : statusVerdict(status.state));
     }
   } else {
     for (const run of runs) record(label({ context: run.name, appId: run.appId }), conclusion(run.status, run.conclusion));

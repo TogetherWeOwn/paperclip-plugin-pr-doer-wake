@@ -546,21 +546,29 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
-  it("does not wake an old successful required run whose associated suite is rerunning", async () => {
+  it.each(["success", "failure"])("does not wake an ambiguous rerun, then wakes once for corroborated required %s despite same-suite optional work", async (result) => {
     const h = setup();
     await h.runtime.register(registration, run);
     const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
     github.readiness.mockImplementation(actual.evaluateReadiness);
-    github.snapshot.mockResolvedValue({
+    const input = {
       repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
       required: [{ context: "build", appId: 7 }],
-      runs: [{ id: 10, name: "build", appId: 7, suiteId: 100, status: "completed", conclusion: "success" }],
+      runs: [{ id: 10, name: "build", appId: 7, suiteId: 100, status: "completed", conclusion: result },
+        { id: 11, name: "coverage", appId: 7, suiteId: 100, status: "in_progress", conclusion: null }],
       suites: [{ id: 100, appId: 7, status: "in_progress", conclusion: null, createdAt: START, completedAt: null }], statuses: [],
-    });
+      currentAttemptRunIds: [] as number[],
+    };
+    github.snapshot.mockResolvedValue(input);
     await h.runtime.poll();
     expect(h.ledger().waits[0]?.status).toBe("open");
     expect(h.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger().audits.filter((entry) => entry.operation === "wake")).toEqual([]);
+    input.currentAttemptRunIds = [10];
+    await h.runtime.poll();
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
   it("resolves fresh credentials per operation and retains only a credential-scoped token-free cache", async () => {

@@ -49,6 +49,7 @@ function fixtures(overrides: (url: URL) => CiHttpResponse | undefined = () => un
     if (url.pathname.endsWith("/check-runs")) return response({ total_count: 0, check_runs: [] });
     if (url.pathname.endsWith("/check-suites")) return response({ total_count: 0, check_suites: [] });
     if (url.pathname.endsWith("/statuses")) return response([]);
+    if (url.pathname.endsWith("/actions/runs")) return response({ total_count: 0, workflow_runs: [] });
     if (url.pathname.includes("/pulls/")) return response(pullData(Number(url.pathname.split("/").at(-1))));
     throw new Error("Unexpected fixture request");
   };
@@ -122,12 +123,19 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(input, timing).kind).toBe("pass");
   });
 
-  it("does not infer a required run's suite from an app ID when association is unavailable", () => {
+  it("defers unknown suite associations and legacy statuses while any suite is active", () => {
     for (const suiteId of [null, undefined, 99]) {
       expect(evaluateReadiness(snapshot({
         required: [{ context: "build", appId: 7 }], runs: [run(1, { suiteId })],
         suites: [suite(1, { status: "queued", conclusion: null, completedAt: null })],
-      }), timing).kind).toBe("pass");
+      }), timing).kind).toBe("pending");
+    }
+    for (const state of ["success", "failure"]) {
+      const input = snapshot({ required: [{ context: "legacy", appId: null }],
+        statuses: [{ id: 1, context: "legacy", state }], suites: [suite(1, { status: "in_progress", conclusion: null, completedAt: null })] });
+      expect(evaluateReadiness(input, timing).kind).toBe("pending");
+      input.suites = [suite()];
+      expect(evaluateReadiness(input, timing).kind).toBe(state === "success" ? "pass" : "fail");
     }
   });
 
@@ -437,6 +445,153 @@ describe("CiGithub REST reads", () => {
       ? response({ total_count: 1, check_runs: [{ ...rawRun(), head_sha: "b".repeat(40) }] }) : undefined);
     await expect(new CiGithub(wrongSha.fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "response" });
     await expect(new CiGithub(async () => ({ status: 200, headers: {}, body: "not JSON" }), TOKEN).pull(REPO, 1)).rejects.toMatchObject({ code: "response" });
+  });
+});
+
+function attemptFixtures(overrides: (url: URL, count: number) => CiHttpResponse | undefined = () => undefined) {
+  const workflow = { id: 50, head_sha: SHA, check_suite_id: 1, run_attempt: 1,
+    repository: { full_name: REPO }, status: "in_progress", conclusion: null };
+  const job = { id: 90, run_id: 50, run_attempt: 1, head_sha: SHA, name: "build",
+    status: "completed", conclusion: "success", check_run_url: `https://api.github.com/repos/${REPO}/check-runs/1` };
+  const activeSuite = { ...rawSuite(), status: "in_progress", conclusion: null };
+  const counts = new Map<string, number>();
+  const base = fixtures((url) => {
+    const count = (counts.get(url.href) ?? 0) + 1;
+    counts.set(url.href, count);
+    const override = overrides(url, count);
+    if (override) return override;
+    if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "build", app_id: 7 }] });
+    if (url.pathname.endsWith("check-runs")) return response({ total_count: 1, check_runs: [rawRun()] });
+    if (url.pathname.endsWith("check-suites")) return response({ total_count: 1, check_suites: [activeSuite] });
+    if (url.pathname.endsWith("/actions/runs")) return response({ total_count: 1, workflow_runs: [workflow] });
+    if (url.pathname.endsWith("/actions/runs/50")) return response(workflow);
+    if (url.pathname.endsWith("/attempts/1/jobs")) return response({ total_count: 2, jobs: [job, {
+      ...job, id: 91, name: "optional", status: "in_progress", conclusion: null,
+      check_run_url: `https://api.github.com/repos/${REPO}/check-runs/2`,
+    }] });
+    if (url.pathname.endsWith("/check-suites/1")) return response(activeSuite);
+  });
+  return { ...base, workflow, job, activeSuite };
+}
+
+describe("Actions current-attempt evidence", () => {
+  it.each(["success", "neutral", "skipped", "failure", "cancelled", "timed_out", "action_required", "startup_failure"])(
+    "uses required %s without waiting for optional jobs in the same attempt/suite", async (result) => {
+      const f = attemptFixtures((url) => {
+        if (url.pathname.endsWith("check-runs")) return response({ total_count: 1, check_runs: [{ ...rawRun(), conclusion: result }] });
+        if (url.pathname.endsWith("/attempts/1/jobs")) return response({ total_count: 2, jobs: [{ ...f.job, conclusion: result }, {
+          ...f.job, id: 91, name: "coverage", status: "in_progress", conclusion: null,
+          check_run_url: `https://api.github.com/repos/${REPO}/check-runs/2`,
+        }] });
+      });
+      const actual = await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main");
+      expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: ["success", "neutral", "skipped"].includes(result) ? "pass" : "fail", pending: [] });
+      const actions = f.calls.filter(({ url }) => url.pathname.includes("/actions/") || url.pathname.endsWith("/check-suites/1"));
+      expect(actions.map(({ url }) => url.pathname.split(`/repos/${REPO}/`)[1])).toEqual([
+        "actions/runs", "actions/runs/50", "actions/runs/50/attempts/1/jobs", "check-suites/1", "actions/runs/50",
+      ]);
+      expect(actions[0]!.url.searchParams.get("head_sha")).toBe(SHA);
+      expect(actions[0]!.url.searchParams.get("check_suite_id")).toBe("1");
+      expect(actions.every(({ init }) => init?.redirect === "error")).toBe(true);
+    });
+
+  it.each(["absent", "queued", "in_progress", "unknown", "changed-attempt", "changed-suite"])(
+    "keeps old required success pending for %s evidence", async (mode) => {
+      const f = attemptFixtures((url, count) => {
+        if (mode === "changed-attempt" && url.pathname.endsWith("/actions/runs/50") && count === 2)
+          return response({ ...f.workflow, run_attempt: 2 });
+        if (mode === "changed-suite" && url.pathname.endsWith("/check-suites/1"))
+          return response({ ...f.activeSuite, status: "queued" });
+        if (url.pathname.endsWith("/attempts/1/jobs") && !mode.startsWith("changed")) {
+          const jobs = mode === "absent" ? [] : [{ ...f.job, status: mode === "unknown" ? "completed" : mode, conclusion: null }];
+          return response({ total_count: jobs.length, jobs });
+        }
+      });
+      const actual = await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main");
+      expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pending", failed: [] });
+    });
+
+  it("keeps a queued suite pending even when stale workflow/job reads still show the old in-progress attempt", async () => {
+    const f = attemptFixtures((url) => {
+      if (url.pathname.endsWith("check-suites")) return response({ total_count: 1, check_suites: [{ ...f.activeSuite, status: "queued" }] });
+      if (url.pathname.endsWith("/check-suites/1")) return response({ ...f.activeSuite, status: "queued" });
+    });
+    expect(evaluateReadiness(await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main"), timing).kind).toBe("pending");
+  });
+
+  it("does not infer that an old required success was excluded from an optional-only newer attempt", async () => {
+    const f = attemptFixtures((url) => {
+      if (url.pathname.endsWith("/actions/runs")) return response({ total_count: 1, workflow_runs: [{ ...f.workflow, run_attempt: 2 }] });
+      if (url.pathname.endsWith("/actions/runs/50")) return response({ ...f.workflow, run_attempt: 2 });
+      if (url.pathname.endsWith("/attempts/2/jobs")) return response({ total_count: 1, jobs: [{ ...f.job,
+        id: 91, name: "optional", run_attempt: 2, status: "in_progress", conclusion: null,
+        check_run_url: `https://api.github.com/repos/${REPO}/check-runs/2`,
+      }] });
+    });
+    expect(evaluateReadiness(await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main"), timing).kind).toBe("pending");
+  });
+
+  it.each(["wrong-sha", "wrong-repo", "wrong-suite", "missing-attempt", "ambiguous", "missing", "bad-job-attempt", "bad-job-run", "bad-job-sha", "bad-reference", "wrong-job-name", "duplicate-job", "incomplete", "inconsistent-total", "403", "404"])(
+    "fails closed on %s reconciliation without credential or budget changes", async (mode) => {
+      const f = attemptFixtures((url) => {
+        if (url.pathname.endsWith("/actions/runs")) {
+          if (mode === "missing") return response({ total_count: 0, workflow_runs: [] });
+          if (mode === "ambiguous") return response({ total_count: 2, workflow_runs: [f.workflow, { ...f.workflow, id: 51 }] });
+          if (mode === "403" || mode === "404") return response({ message: TOKEN }, Number(mode));
+        }
+        if (url.pathname.endsWith("/actions/runs/50")) {
+          const changes: Record<string, object> = {
+            "wrong-sha": { head_sha: "b".repeat(40) }, "wrong-repo": { repository: { full_name: "other/widgets" } },
+            "wrong-suite": { check_suite_id: 2 }, "missing-attempt": { run_attempt: undefined },
+          };
+          if (changes[mode]) return response({ ...f.workflow, ...changes[mode] });
+        }
+        if (url.pathname.endsWith("/attempts/1/jobs")) {
+          const changes: Record<string, object> = {
+            "bad-job-attempt": { run_attempt: 2 }, "bad-job-run": { run_id: 51 }, "bad-job-sha": { head_sha: "b".repeat(40) },
+            "bad-reference": { check_run_url: `https://attacker.invalid/repos/${REPO}/check-runs/1` },
+            "wrong-job-name": { name: "not-build" },
+          };
+          if (changes[mode]) return response({ total_count: 1, jobs: [{ ...f.job, ...changes[mode] }] });
+          if (mode === "duplicate-job") return response({ total_count: 2, jobs: [f.job, f.job] });
+          if (mode === "incomplete") return response({ total_count: 2, jobs: [] });
+          if (mode === "inconsistent-total") return response({ total_count: 0, jobs: [f.job] });
+        }
+      });
+      const result = await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main").then((s) => evaluateReadiness(s, timing).kind, (e: unknown) => {
+        expect(e).toBeInstanceOf(CiGithubError); expect(String(e)).not.toContain(TOKEN); return "pending";
+      });
+      expect(result).toBe("pending");
+      expect(f.calls.every(({ url }) => url.origin === "https://api.github.com")).toBe(true);
+    });
+
+  it("paginates attempt jobs, counts every read, and never extends the request/page caps", async () => {
+    const f = attemptFixtures((url) => {
+      if (url.pathname.endsWith("/attempts/1/jobs")) {
+        const jobs = url.searchParams.get("page") === "1"
+          ? Array.from({ length: 100 }, (_, i) => ({ ...f.job, id: i + 100, name: `optional-${i}`, check_run_url: `https://api.github.com/repos/${REPO}/check-runs/${i + 100}` }))
+          : [f.job];
+        return response({ total_count: 101, jobs });
+      }
+    });
+    expect(evaluateReadiness(await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main"), timing).kind).toBe("pass");
+    expect(f.calls.filter(({ url }) => url.pathname.endsWith("/attempts/1/jobs"))).toHaveLength(2);
+    await expect(new CiGithub(f.fetch, TOKEN, { maxPages: 1 }).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "pages" });
+    await expect(new CiGithub(f.fetch, TOKEN, { maxRequests: 8 }).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "budget" });
+  });
+
+  it("does not use 304 as a cross-resource generation fence", async () => {
+    const f = attemptFixtures((url, count) => {
+      if (url.pathname.endsWith("/actions/runs/50")) return count === 1 ? response(f.workflow, 200, { ETag: '"run"' }) : { status: 304, headers: {}, body: "" };
+      if (url.pathname.endsWith("/attempts/1/jobs")) return response({ total_count: 0, jobs: [] });
+    });
+    expect(evaluateReadiness(await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main"), timing).kind).toBe("pending");
+  });
+
+  it("never applies the extension to the all-suites fallback", async () => {
+    const f = attemptFixtures((url) => url.pathname.endsWith("required_status_checks") ? response({}, 404) : undefined);
+    expect(evaluateReadiness(await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main"), timing).kind).toBe("pending");
+    expect(f.calls.some(({ url }) => url.pathname.includes("/actions/"))).toBe(false);
   });
 });
 

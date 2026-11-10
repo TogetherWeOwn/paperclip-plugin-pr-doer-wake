@@ -8,7 +8,7 @@ Assets are the GitHub read credential, optional webhook HMAC secret, exact card-
 
 | Credential can potentially do | Tool exposes | Explicitly forbidden |
 | --- | --- | --- |
-| Read resources within its GitHub grant | Fixed-origin GET of PR, base rules/classic required status checks, commit checks/suites/statuses for allowlisted registered heads | Arbitrary URLs, headers, paths, search, repository enumeration, writes, merges, workflows, token minting |
+| Read resources within its GitHub grant | Fixed-origin GET of PR, base rules/classic required status checks, commit checks/suites/statuses, exactly associated Actions workflow attempts/jobs for allowlisted registered heads | Arbitrary URLs, headers, paths, search, repository enumeration, writes, merges, workflow mutation/dispatch/rerun, token minting |
 | Authenticate one webhook origin | Compare SHA-256 raw-body HMAC and trigger the same bounded recheck | Payload-directed issue selection or direct wakes |
 | Paperclip SDK capabilities | Checkout-owner assertion, exact card/workspace reads, plugin state, job, one wake API | Issue create/update/comments, SQL/core tables, shell, secret output |
 
@@ -24,7 +24,7 @@ GitHub and Paperclip are separate systems. Revalidate current PR head/base and c
 
 The agent may supply a foreign issue, copied SHA, fork PR, spoofed branch, case tricks, encoded separators, oversized numbers, unknown keys or hostile natural-language content. Execution-time closed-schema parsing, checkout assertion, fixed GitHub origin, allowlist and authoritative workspace/PR reads constrain these. The runtime accepts no credential, secretRef, approval boolean, endpoint or caller identity in tool arguments.
 
-PR/API content is data, not instructions. Only projected identifiers, statuses, check names, timestamps and app IDs affect readiness. App-bound checks cannot be satisfied by legacy commit statuses or an unrelated app of the same name. Unknown/partial shapes, denied pages, pagination limits and unknown conclusions stay pending. A required check failing does not wake while another required check remains pending.
+PR/API content is data, not instructions. Only projected identifiers, statuses, check names, timestamps and app IDs affect readiness. App-bound checks cannot be satisfied by legacy commit statuses or an unrelated app of the same name. Unknown/partial shapes, denied pages, pagination limits and unknown conclusions stay pending. A required check failing does not wake while another required check remains pending. An active associated suite needs positive Actions attempt/job evidence before terminal required checks can ignore optional work. Discovery is constrained by exact repo/head/suite; complete attempt-job pages bind exact check-run references, names and conclusions, followed by suite/workflow rereads. Response-provided references are validated, never fetched. Missing/contradictory evidence and newer partial attempts defer, as do legacy statuses while observed suites run. This is not a transaction or an enumeration of uncreated rerun targets; universal required-only latency is not promised. Every extra GET uses the unchanged request/page/byte/cache/time budgets and operation-local credential. Actual existing Actions-read authority remains pre-installation evidence; denial is not permission to widen a credential.
 
 ## Secrets and transport
 
