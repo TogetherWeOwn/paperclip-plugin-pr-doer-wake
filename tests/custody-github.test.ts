@@ -36,8 +36,8 @@ function connection(nodes: unknown[], totalCount = nodes.length, hasNextPage = f
 function commit(oid = SHA) {
   return { commit: { oid, committedDate: CREATED } };
 }
-function review(id = "review-1", submittedAt: string | null = UPDATED) {
-  return { id, state: "APPROVED", submittedAt };
+function review(id = "review-1", submittedAt: string | null = UPDATED, oid = SHA) {
+  return { id, state: "APPROVED", submittedAt, commit: { oid } };
 }
 function suite(id = "suite-1", updatedAt = RECENT) {
   return { id, status: "IN_PROGRESS", createdAt: CREATED, updatedAt };
@@ -444,6 +444,69 @@ describe("CustodyGithub exact activity", () => {
       });
       await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
     }
+  });
+});
+
+describe("CustodyGithub head seeding", () => {
+  it("seeds from the latest head check-suite updated_at", async () => {
+    const { client } = fixtures((_url, init) => String(init?.body).includes("checkSuites(")
+      ? response(graphql("checkSuites", connection([suite("s", RECENT)]))) : undefined);
+    expect(await client.seedHead(pr())).toBe(Date.parse(RECENT));
+  });
+
+  it("seeds from the latest submitted review on the head commit", async () => {
+    const { client } = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([review("r1", UPDATED), review("r2", RECENT)]))) : undefined);
+    expect(await client.seedHead(pr())).toBe(Date.parse(RECENT));
+  });
+
+  it("does not date a fresh head from reviews of earlier commits", async () => {
+    // A review submitted Oct 1 on a previous head cannot prove the current
+    // head SHA was present then; with no head-bound evidence the seed is
+    // null so the caller applies the conservative warmup instead of waking
+    // a freshly pushed PR.
+    const { client } = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([review("r1", "2026-01-01T00:00:00Z", "b".repeat(40))]))) : undefined);
+    expect(await client.seedHead(pr())).toBeNull();
+  });
+
+  it("takes the maximum across head-bound sources and floors at PR creation", async () => {
+    const { client } = fixtures((_url, init) => String(init?.body).includes("checkSuites(")
+      ? response(graphql("checkSuites", connection([suite("s", RECENT)]))) : undefined);
+    expect(await client.seedHead(pr())).toBe(Date.parse(RECENT));
+    const stale = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([review("r1", "2025-01-01T00:00:00Z")]))) : undefined);
+    expect(await stale.client.seedHead(pr())).toBe(Date.parse(CREATED));
+  });
+
+  it("returns null with no head-bound evidence so the caller applies the now() warmup", async () => {
+    const { client } = fixtures();
+    expect(await client.seedHead(pr())).toBeNull();
+    const pendingOnly = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([{ id: "r1", state: "PENDING", submittedAt: null, commit: { oid: SHA } }]))) : undefined);
+    expect(await pendingOnly.client.seedHead(pr())).toBeNull();
+  });
+
+  it("ignores a pending review with no commit instead of rejecting the seed", async () => {
+    // GitHub returns commit: null for PENDING reviews. That must not fail
+    // the whole reviews connection (and with it the seed, leaving the head
+    // unstaged/UNKNOWN forever); a pending review is simply not evidence.
+    const mixed = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([
+        { id: "p1", state: "PENDING", submittedAt: null, commit: null },
+        review("r1", RECENT),
+      ]))) : undefined);
+    expect(await mixed.client.seedHead(pr())).toBe(Date.parse(RECENT));
+    const pendingOnly = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([{ id: "p1", state: "PENDING", submittedAt: null, commit: null }]))) : undefined);
+    expect(await pendingOnly.client.seedHead(pr())).toBeNull();
+  });
+
+  it("requires the head commit and refuses closed PRs", async () => {
+    const wrongHead = fixtures((_url, init) => String(init?.body).includes("checkSuites(")
+      ? response(graphql("checkSuites", connection([suite()]), {}, 2)) : undefined);
+    await expect(wrongHead.client.seedHead(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(wrongHead.client.seedHead(pr({ state: "closed", closedAt: Date.parse(UPDATED) }))).rejects.toMatchObject({ code: "input" });
   });
 });
 

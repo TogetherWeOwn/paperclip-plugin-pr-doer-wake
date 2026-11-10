@@ -60,10 +60,11 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
     return { ...pr, baseBranch: "main", draft: false, mergeable: true };
   });
   const activity = vi.spyOn(CustodyGithub.prototype, "activity").mockResolvedValue(NOW - 8 * DAY);
+  const seedHead = vi.spyOn(CustodyGithub.prototype, "seedHead").mockImplementation(async () => now);
   vi.spyOn(CustodyGithub.prototype, "closureTexts").mockResolvedValue([]);
   const runtime = new CustodyRuntime(ctx as unknown as PluginContext, () => now);
   const ledger = () => [...state.entries()].find(([key]) => key.includes("pr-custody-v1"))?.[1];
-  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, advance: (ms: number) => { now += ms; }, restart: () => new CustodyRuntime(ctx as unknown as PluginContext, () => now) };
+  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => new CustodyRuntime(ctx as unknown as PluginContext, () => now) };
 }
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); });
 
@@ -851,5 +852,48 @@ describe("coverage, summary and cursor controls", () => {
     const h = fixture();
     await Promise.all([h.runtime.poll(), h.runtime.poll()]);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("seeds first-observed heads so already-idle PRs trigger without a fresh seven-day warmup", async () => {
+    const h = fixture();
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.seedHead).toHaveBeenCalledWith(expect.objectContaining({ number: 42 }));
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW - 8 * DAY);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
+  });
+
+  it("falls back to a fresh warmup when no head-bound seeding evidence exists", async () => {
+    const h = fixture();
+    h.seedHead.mockResolvedValue(null);
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    // No evidence ever wakes immediately, but the head is staged so the
+    // inventory completes and the PR gets its conservative seven-day warmup
+    // instead of staying UNKNOWN forever (e.g. a repo with no CI).
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().report.unknown).not.toContain("example/project#42");
+    expect(h.ledger().report.complete).toBe(true);
+  });
+
+  it("does not seed a changed SHA from stale evidence (a revert to an older head gets a fresh warmup)", async () => {
+    const pr = pull();
+    const h = fixture({ open: [pr] });
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    // A force-push back to an earlier SHA must not inherit that SHA's old
+    // evidence as its idle epoch; the head became current now.
+    h.seedHead.mockClear();
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    pr.headSha = "b".repeat(40);
+    h.advance(3 * DAY);
+    await h.runtime.poll();
+    expect(h.seedHead).not.toHaveBeenCalled();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "b".repeat(40), at: NOW + 3 * DAY });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
 });

@@ -143,12 +143,57 @@ export class CustodyGithub extends CiGithub {
   }
 
   /**
+   * Seed a newly observed head from the latest head-bound evidence instead of
+   * wall-clock arrival: head check-suite updated_at (scoped to the head
+   * commit) and submitted reviews on the head commit itself. PR created_at
+   * is only a floor. PR-wide evidence such as reviews of earlier commits or
+   * the card disposition line cannot prove this SHA was present at their
+   * time, so they never date a head; disposition still feeds the trigger
+   * epoch in custodyTriggers. With no head-bound evidence this returns null
+   * so the caller falls back to a conservative now() warmup rather than
+   * staying UNKNOWN forever. Seeded epochs never claim push time; they only
+   * keep already-idle PRs from waiting out a fresh seven-day warmup.
+   */
+  async seedHead(pr: CustodyPull): Promise<number | null> {
+    const { headSha } = identity(pr);
+    if (pr.state !== "open") throw new CiGithubError("input");
+    const commits = await this.connection(pr, "commits", (value) => {
+      const oid = sha(object(object(value).commit).oid);
+      return { key: oid, value: oid };
+    });
+    if (!commits.length || commits.at(-1) !== headSha) return invalid();
+    const reviews = await this.connection(pr, "reviews", (value) => {
+      const review = object(value);
+      if (!["PENDING", "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(text(review.state))) return invalid();
+      const at = review.state === "PENDING" ? nullableTimestamp(review.submittedAt) : timestamp(review.submittedAt);
+      if (review.state === "PENDING" && at !== null) return invalid();
+      // PENDING reviews carry commit: null; that is not seed evidence, not
+      // a malformed response. A null oid never matches headSha below.
+      const oid = review.commit === null || review.commit === undefined ? null : sha(object(review.commit).oid);
+      return { key: text(review.id), value: { at, oid } };
+    });
+    const suites = await this.connection(pr, "checkSuites", (value) => {
+      const suite = object(value);
+      if (!["QUEUED", "IN_PROGRESS", "COMPLETED", "REQUESTED", "WAITING", "PENDING"].includes(text(suite.status))) return invalid();
+      const createdAt = timestamp(suite.createdAt);
+      const updatedAt = timestamp(suite.updatedAt);
+      if (updatedAt < createdAt) return invalid();
+      return { key: text(suite.id), value: updatedAt };
+    }, commits.length);
+    // Only reviews on this exact commit establish it was present then.
+    const evidence = [...reviews.filter((value) => value.at !== null && value.oid === headSha).map((value) => value.at!), ...suites];
+    if (!evidence.length) return null;
+    return Math.max(pr.createdAt, ...evidence);
+  }
+
+  /**
    * Commit/push, submitted review, and head suite activity (even running).
    * REST commit dates alone do not establish push time; PR updated_at also
    * changes for metadata, which could postpone custody forever.
    * GitHub retired pushedDate. Activity is UNKNOWN unless the caller supplies a
-   * persisted first-observed timestamp for this exact head SHA. That upper bound
-   * starts a conservative idle warmup on discovery/head changes, never metadata.
+   * persisted first-observed timestamp for this exact head SHA (seeded by
+   * seedHead). That upper bound starts a conservative idle warmup on
+   * discovery/head changes, never metadata.
    */
   async activity(pr: CustodyPull, observedHeadAt?: number): Promise<number> {
     const { headSha } = identity(pr);
@@ -191,7 +236,7 @@ export class CustodyGithub extends CiGithub {
     const { repo, number, headSha } = identity(pr);
     const [owner, name] = repo.split("/");
     const selection = kind === "commits" ? "commits(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid committedDate}}}"
-      : kind === "reviews" ? "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id state submittedAt}}"
+      : kind === "reviews" ? "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id state submittedAt commit{oid}}}"
         : "commits(last:1){totalCount nodes{commit{oid checkSuites(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id status createdAt updatedAt}}}}}";
     const query = `query CustodyActivity($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){nameWithOwner pullRequest(number:$number){number state headRefOid createdAt repository{nameWithOwner} ${selection}}}}`;
     const values: T[] = [];
