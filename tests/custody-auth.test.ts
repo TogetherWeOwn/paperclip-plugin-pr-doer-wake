@@ -90,6 +90,26 @@ describe("Custody installation authentication", () => {
     await expect(auth.token("/repos/acme/widgets/pulls", exchange as CiTokenExchange)).rejects.toMatchObject({ code: "timeout" });
   });
 
+  it("covers the full custody tick when given a tick-sized cycle", async () => {
+    let now = START;
+    const auth = new CustodyAppAuth({ appId: "123", installationId: "456", org: "acme", resolvePrivateKey: async () => KEY, now: () => now, cycleMs: 240_000 });
+    const exchange = vi.fn(async () => tokenResponse());
+    await expect(auth.token("/repos/acme/widgets/pulls", exchange as CiTokenExchange)).resolves.toBe(TOKEN);
+    // Inventory admits requests until tickMs - 30s (210s) and dispatch
+    // rereads after that; past the 180s default cycle the token must live on.
+    now += 200_000;
+    await expect(auth.token("/graphql", exchange as CiTokenExchange)).resolves.toBe(TOKEN);
+    expect(exchange).toHaveBeenCalledTimes(1);
+    now += 41_000;
+    await expect(auth.token("/graphql", exchange as CiTokenExchange)).rejects.toMatchObject({ code: "timeout" });
+  });
+
+  it("refuses an invalid cycle override at construction", () => {
+    for (const cycleMs of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => new CustodyAppAuth({ appId: "123", installationId: "456", org: "acme", resolvePrivateKey: async () => KEY, cycleMs })).toThrowError("GitHub CI input");
+    }
+  });
+
   it("refuses invalid keys and sanitizes resolver failures", async () => {
     const bad = fixture({ key: "not a pem" });
     await expect(bad.auth.token("/repos/acme/widgets/pulls", bad.exchange as CiTokenExchange)).rejects.toMatchObject({ code: "auth" });

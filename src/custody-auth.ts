@@ -10,6 +10,8 @@ interface CustodyAppAuthOptions {
   org: string;
   resolvePrivateKey: () => Promise<string>;
   now?: () => number;
+  /** Operation-local deadline; custody passes the tick budget so a long inventory cannot outlive the 180s CI-wake cycle. */
+  cycleMs?: number;
 }
 
 /**
@@ -32,10 +34,11 @@ export class CustodyAppAuth implements CiTokenSource {
 
   constructor(options: CustodyAppAuthOptions) {
     if (![options.appId, options.installationId].every((v) => /^[1-9][0-9]{0,15}$/.test(v) && Number.isSafeInteger(Number(v)))
-        || !ORG.test(options.org) || options.org !== options.org.toLowerCase()) throw new CiGithubError("input");
+        || !ORG.test(options.org) || options.org !== options.org.toLowerCase()
+        || (options.cycleMs !== undefined && (!Number.isSafeInteger(options.cycleMs) || options.cycleMs <= 0))) throw new CiGithubError("input");
     this.#options = { ...options };
     this.#now = options.now ?? Date.now;
-    this.#deadline = this.#now() + AUTH_CYCLE_MS;
+    this.#deadline = this.#now() + (options.cycleMs ?? AUTH_CYCLE_MS);
   }
 
   invalidate(): void { this.#token = null; this.#failed = true; }

@@ -146,7 +146,7 @@ export class CustodyRuntime {
       // App mode mints a short-lived read-only installation token per operation
       // and refuses any non-read permission; the key is resolved only at call time.
       const credential: string | CustodyAppAuth = app
-        ? new CustodyAppAuth({ appId: app.appId, installationId: app.installationId, org: config.org, now: this.now,
+        ? new CustodyAppAuth({ appId: app.appId, installationId: app.installationId, org: config.org, now: this.now, cycleMs: CUSTODY_LIMITS.tickMs,
             resolvePrivateKey: () => this.ctx.secrets.resolve(app.privateKeySecretRef, { companyId: config.companyId, configPath: "githubAppPrivateKeySecretRef" }) })
         : await this.ctx.secrets.resolve(config.tokenRef!, { companyId: config.companyId, configPath: "githubTokenSecretRef" });
       // Reserve discovery capacity inside the client's admission gate, before its sole counter advances.
