@@ -475,6 +475,52 @@ function attemptFixtures(overrides: (url: URL, count: number) => CiHttpResponse 
 }
 
 describe("Actions current-attempt evidence", () => {
+  it.each(["Acme/Widgets", "ACME/WIDGETS"])("accepts canonical %s job identities without fetching response URLs", async (repo) => {
+    const f = attemptFixtures((url) => url.pathname.endsWith("/attempts/1/jobs")
+      ? response({ total_count: 1, jobs: [{ ...f.job, check_run_url: `https://api.github.com/repos/${repo}/check-runs/1` }] }) : undefined);
+    const actual = await new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(actual, timing).kind).toBe("pass");
+    expect(f.calls.every(({ url }) => url.href.startsWith(`https://api.github.com/repos/${REPO}/`))).toBe(true);
+  });
+
+  it.each([
+    "https://attacker.invalid/repos/acme/widgets/check-runs/1", "http://api.github.com/repos/acme/widgets/check-runs/1",
+    "https://api.github.com@attacker.invalid/repos/acme/widgets/check-runs/1", "https://api.github.com/repos/other/widgets/check-runs/1",
+    "https://api.github.com/repos/acme/other/check-runs/1", "https://api.github.com/repos/acme/widgets/check-runs/1?x=1",
+    "https://api.github.com/repos/acme/widgets/check-runs/1#x", "https://api.github.com/repos/acme/widgets/check-runs/1/extra",
+    "https://api.github.com/repos/acme/widgets/check-runs/01", "https://api.github.com/repos/acme/widgets/check-runs/0",
+    "https://api.github.com/repos/acme/widgets/check-runs/9007199254740992", "https://api.github.com/repos/%61cme/widgets/check-runs/1",
+  ])("refuses a non-exact job reference %s", async (check_run_url) => {
+    const f = attemptFixtures((url) => url.pathname.endsWith("/attempts/1/jobs")
+      ? response({ total_count: 1, jobs: [{ ...f.job, check_run_url }] }) : undefined);
+    await expect(new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toBeInstanceOf(CiGithubError);
+    expect(f.calls.every(({ url }) => url.origin === "https://api.github.com")).toBe(true);
+  });
+
+  it.each([403, 404])("defers unavailable attempt evidence HTTP %i without delaying a settled wait on the shared credential", async (status) => {
+    for (const endpoint of ["/actions/runs", "/actions/runs/50", "/attempts/1/jobs", "/check-suites/1"]) {
+      let settled = false;
+      const f = attemptFixtures((url) => {
+        if (settled && url.pathname.endsWith("check-suites")) return response({ total_count: 1, check_suites: [rawSuite()] });
+        if (url.pathname.endsWith(endpoint)) return response({ message: "Resource not accessible by integration" }, status,
+          { "x-ratelimit-remaining": "4999", "x-ratelimit-reset": "1000" });
+      });
+      const cache = new CiGithubCache();
+      const pending = await new CiGithub(f.fetch, TOKEN, { cache, now: () => 10_000 }).snapshot(REPO, SHA, "main");
+      expect(pending.currentAttemptRunIds).toEqual([]);
+      expect(evaluateReadiness(pending, timing).kind).toBe("pending");
+      expect(cache.backoffUntil).toBe(0);
+      settled = true;
+      const next = await new CiGithub(f.fetch, TOKEN, { cache, now: () => 10_000 }).snapshot(REPO, SHA, "main");
+      expect(evaluateReadiness(next, timing).kind).toBe("pass");
+    }
+  });
+
+  it.each([401, 500])("propagates attempt HTTP %i without treating it as absent evidence", async (status) => {
+    const f = attemptFixtures((url) => url.pathname.endsWith("/actions/runs") ? response({}, status) : undefined);
+    await expect(new CiGithub(f.fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "http", status });
+  });
+
   it.each(["success", "neutral", "skipped", "failure", "cancelled", "timed_out", "action_required", "startup_failure"])(
     "uses required %s without waiting for optional jobs in the same attempt/suite", async (result) => {
       const f = attemptFixtures((url) => {
@@ -762,6 +808,18 @@ describe("CiGithub caching, backoff, and caps", () => {
     expect(calls).toBe(1);
     now = 15_000;
     expect((await new CiGithub(fetch, TOKEN, { cache, now: () => now }).pull(REPO, 1)).headSha).toBe(SHA);
+  });
+
+  it.each([
+    [429, {}, 70_000], [403, { "retry-after": "5" }, 15_000],
+    [403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "15" }, 15_000],
+    [403, { "x-ratelimit-remaining": "0" }, 70_000],
+  ] as const)("retains shared throttle backoff for HTTP %i with %j", async (status, headers, retryAt) => {
+    const cache = new CiGithubCache();
+    const fetch = vi.fn(async () => response({}, status, { ...headers }));
+    await expect(new CiGithub(fetch, TOKEN, { cache, now: () => 10_000 }).pull(REPO, 1)).rejects.toMatchObject({ code: "http", status, retryAt });
+    await expect(new CiGithub(fetch, TOKEN, { cache, now: () => 10_000 }).pull(REPO, 1)).rejects.toMatchObject({ code: "backoff", retryAt });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("honors exhausted quota on successful responses and Retry-After on 503", async () => {

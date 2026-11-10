@@ -309,7 +309,13 @@ export class CiGithub {
     for (const suite of suites) {
       const candidates = relevant.filter((run) => run.suiteId === suite.id && run.appId === suite.appId);
       if (suite.status !== "completed" && candidates.length) {
-        currentAttemptRunIds.push(...await this.currentAttempt(repo, sha, suite, candidates));
+        try {
+          currentAttemptRunIds.push(...await this.currentAttempt(repo, sha, suite, candidates));
+        } catch (error) {
+          // Unavailable optional corroboration supplies no generation proof.
+          // Rule/check reads above remain mandatory; real throttles still back off.
+          if (!(error instanceof CiGithubError && error.code === "http" && (error.status === 403 || error.status === 404))) throw error;
+        }
       }
     }
     return { repo, sha, baseBranch, required: [...unique.values()], runs, suites, statuses, currentAttemptRunIds, fetchedAt: this.now() };
@@ -345,9 +351,9 @@ export class CiGithub {
       jobIds.add(jobId);
       // Validate identity only. Never fetch a URL supplied by a response.
       const reference = text(job.check_run_url);
-      const prefix = `${ORIGIN}${root}/check-runs/`;
-      if (!reference.startsWith(prefix) || !/^[1-9][0-9]*$/.test(reference.slice(prefix.length))) return invalid();
-      const checkId = id(Number(reference.slice(prefix.length)));
+      const match = /^https:\/\/api\.github\.com\/repos\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/check-runs\/([1-9][0-9]*)$/.exec(reference);
+      if (!match || repoName(match[1]!) !== repo) return invalid();
+      const checkId = id(Number(match[2]!));
       if (checkIds.has(checkId)) return invalid();
       checkIds.add(checkId);
       const name = text(job.name);
@@ -404,11 +410,11 @@ export class CiGithub {
       const parsed = retry.trim() && Number.isFinite(seconds) && seconds >= 0 ? now + seconds * 1000 : Date.parse(retry);
       if (Number.isFinite(parsed)) until = Math.max(until, parsed);
     }
-    if ((remaining === "0" || status === 429 || status === 403) && reset !== undefined && reset.trim()) {
+    if ((remaining === "0" || status === 429) && reset !== undefined && reset.trim()) {
       const parsed = Number(reset) * 1000;
       if (Number.isFinite(parsed)) until = Math.max(until, parsed);
     }
-    if ((status === 429 || status === 403) && until <= now) until = now + 60_000;
+    if ((status === 429 || (status === 403 && retry !== undefined)) && until <= now) until = now + 60_000;
     if (remaining === "0" && until <= now) until = now + 60_000;
     this.cache.backoffUntil = Math.max(this.cache.backoffUntil, until);
   }
