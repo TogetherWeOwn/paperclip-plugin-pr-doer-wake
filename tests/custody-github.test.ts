@@ -93,6 +93,27 @@ describe("CustodyGithub REST enumeration", () => {
     expect(calls[0]!.url.searchParams.get("state")).toBe("open");
   });
 
+  it.each(["open", "closed"] as const)("accepts format characters in bounded %s PR titles without losing the listing", async (state) => {
+    const title = "Fix developer 👩‍💻 workflow​";
+    const { client } = fixtures(() => response([state === "open" ? rawPull(1, { title }) : { ...closed(), title }]));
+    const values = await client.pulls(REPO, state, Date.parse(CREATED));
+    expect(values).toHaveLength(1);
+    expect(values[0]!.title).toBe(title);
+  });
+
+  it.each([undefined, null, 3, "", " ", "x".repeat(1025), "bad\nline", "bad\u0000title"])("rejects malformed or unbounded PR titles: %j", async (title) => {
+    const { client } = fixtures(() => response([rawPull(1, { title })]));
+    await expect(client.pulls(REPO, "open")).rejects.toMatchObject({ code: "response" });
+  });
+
+  it.each([
+    { head: { sha: SHA, ref: "work‍flow", repo: { full_name: REPO } } },
+    { user: { login: "build‍er", type: "User" } },
+  ])("still refuses format characters in ownership identifiers: %j", async (patch) => {
+    const { client } = fixtures(() => response([rawPull(1, patch)]));
+    await expect(client.pulls(REPO, "open")).rejects.toMatchObject({ code: "response" });
+  });
+
   it("checks a terminal full array with one additional numbered page", async () => {
     const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
       ? Array.from({ length: 100 }, (_, index) => rawPull(index + 1)) : []));

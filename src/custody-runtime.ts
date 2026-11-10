@@ -247,20 +247,26 @@ export class CustodyRuntime {
           if (!delivered(receipt)) { unknown("summary_deferred_or_unconfirmed"); holdSummaryClosures(); }
         } catch { unknown("summary_unknown"); holdSummaryClosures(); }
       };
-      // Least recently effect-admitted first, then oldest. Summaries share the same fair queue.
-      const queue: Array<{ item?: typeof pending[number]; key: string; at: number; turn: number }> = pending.map((item) => ({ item, key: item.trigger.key, at: item.trigger.at, turn: ledger.receipts[item.trigger.key]?.turn ?? 0 }));
-      if (summaries.size) queue.push({ key: dailyKey, at: summaryReceipt?.at ?? this.now(), turn: summaryReceipt?.turn ?? 0 });
+      // New work joins at this tick's watermark, not ahead of every retry. Persist its
+      // place even when the effect cap refuses admission; summaries share the same queue.
+      const arrivalTurn = ledger.dispatchSequence;
+      const queue: Array<{ item?: typeof pending[number]; key: string; at: number; turn: number }> = pending.map((item) => ({ item, key: item.trigger.key, at: item.trigger.at, turn: ledger.receipts[item.trigger.key]?.turn ?? arrivalTurn }));
+      if (summaries.size) queue.push({ key: dailyKey, at: summaryReceipt?.at ?? this.now(), turn: summaryReceipt?.turn ?? arrivalTurn });
       for (const entry of queue.sort((a, b) => a.turn - b.turn || a.at - b.at || a.key.localeCompare(b.key))) {
-        if (!entry.item) { await dispatchSummary(); continue; }
+        if (!entry.item) {
+          if (summaryReceipt) summaryReceipt.turn ??= entry.turn;
+          await dispatchSummary(); continue;
+        }
         const { pr, card, trigger, repo } = entry.item;
         let receipt = ledger.receipts[trigger.key];
         if (!receipt) {
           try { if (await archived("receipt", trigger.key)) continue; }
           catch { unknown(trigger.key); holdClosure(repo, trigger); continue; }
           if (Object.keys(ledger.receipts).length >= CUSTODY_LIMITS.receipts) { unknown("receipt_capacity"); holdClosure(repo, trigger); continue; }
-          receipt = ledger.receipts[trigger.key] = { at: this.now(), status: "pending", issueId: card.id };
+          receipt = ledger.receipts[trigger.key] = { at: this.now(), turn: entry.turn, status: "pending", issueId: card.id };
           await save();
         }
+        receipt.turn ??= entry.turn;
         const spend = effectSlot(receipt);
         // A fresh disposition acknowledges a terminal trigger; closed rationale remains mandatory on both sides.
         if (trigger.kind === "terminal" && (latestDisposition(card, pr)?.at ?? 0) > receipt.at) receipt.status = "cleared";

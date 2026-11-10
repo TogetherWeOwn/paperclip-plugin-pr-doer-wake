@@ -458,6 +458,33 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.create).toHaveBeenCalledTimes(1);
     expect(receipts.filter(([key, value]) => key.startsWith("example/project#") && (value as any).status === "pending")).toHaveLength(15);
   });
+  it.each(["deferred", "refused", "ambiguous"])("services existing %s receipts and fresh triggers under continuous arrivals", async (outcome) => {
+    const prs = Array.from({ length: 15 }, (_, i) => pull({ number: i + 1 }));
+    prs.push(pull({ number: 1000, authorIsBot: true }));
+    const h = fixture({ open: prs });
+    h.ctx.issues.requestWakeup.mockImplementation(async () => {
+      if (outcome === "refused") throw new Error("Company cannot start work while completed runs await accounting.");
+      if (outcome === "ambiguous") throw new Error("wake reply lost");
+      return { queued: false, runId: ISSUE };
+    });
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(15);
+    h.ctx.issues.requestWakeup.mockResolvedValue({ queued: true, runId: ISSUE });
+    for (let tick = 0; tick < 4; tick++) {
+      prs.push(...Array.from({ length: 15 }, (_, i) => pull({ number: 16 + tick * 15 + i })));
+      h.advance(60 * 60 * 1000);
+      await h.restart().poll();
+      expect(h.ledger().report.effects).toBeLessThanOrEqual(15);
+    }
+    for (let number = 1; number <= 15; number++) {
+      const key = `example/project#${number}|idle|${NOW - 8 * DAY}`;
+      expect(h.ledger().receipts[key].status).toBe(outcome === "ambiguous" ? "unconfirmed" : "woken");
+      expect(h.ctx.issues.requestWakeup.mock.calls.filter((args) => (args as any)[2].idempotencyKey === key)).toHaveLength(outcome === "ambiguous" ? 1 : 2);
+    }
+    expect(h.ledger().receipts["pr-custody-summary|2026-10-20"].status).toBe("woken");
+    expect(h.ctx.issues.create).toHaveBeenCalledTimes(1);
+    expect(Object.entries(h.ledger().receipts).some(([key, receipt]) => key.startsWith("example/project#16|") && (receipt as any).status === "woken")).toBe(true);
+  });
   it("keeps mapped delivery independent of an unavailable summary archive", async () => {
     const h = fixture({ open: [pull(), pull({ number: 100, authorIsBot: true })] });
     const get = h.ctx.state.get.getMockImplementation()!;

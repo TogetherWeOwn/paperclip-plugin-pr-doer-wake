@@ -37,6 +37,11 @@ function text(value: unknown): string {
   if (typeof value !== "string" || !value.trim() || value.length > 1024 || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value)) return invalid();
   return value;
 }
+function title(value: unknown): string {
+  // Display text may contain format characters (for example emoji joiners), unlike identifiers.
+  if (typeof value !== "string" || !value.trim() || value.length > 1024 || /[\p{Cc}\p{Zl}\p{Zp}]/u.test(value)) return invalid();
+  return value;
+}
 function body(value: unknown): string {
   if (value === null) return "";
   if (typeof value !== "string") return invalid();
@@ -87,7 +92,7 @@ function pull(value: unknown, repo: string, state?: "open" | "closed"): CustodyP
     repo, number: id(raw.number), headSha: sha(head.sha), headBranch,
     headRepo: head.repo === null ? null : repository(object(head.repo).full_name), author,
     authorIsBot: user.type === "Bot" || author.toLowerCase().endsWith("[bot]"),
-    title: text(raw.title), body: body(raw.body), state: raw.state, merged: mergedAt !== null,
+    title: title(raw.title), body: body(raw.body), state: raw.state, merged: mergedAt !== null,
     createdAt, updatedAt, closedAt, mergedAt,
   };
 }
