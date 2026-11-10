@@ -90,10 +90,10 @@ describe("loadCustodyCards", () => {
       status: "todo", statusVersion: 7, assigneeAgentId: AGENT, assigneeUserId: null,
       updatedAt: MS, completedAt: null, cancelledAt: null,
       texts: [
-        { body: "Fix https://github.com/acme/widgets/pull/7", at: MS, ownership: true },
-        { body: "Implementation owner", at: MS, ownership: true },
-        { body: "https://github.com/acme/widgets/pull/8", at: MS + 3_600_000, ownership: true },
-        { body: "https://github.com/acme/widgets/pull/9", at: MS + 7_200_000, ownership: true },
+        { id: "title", body: "Fix https://github.com/acme/widgets/pull/7", at: MS, ownership: true },
+        { id: "description", body: "Implementation owner", at: MS, ownership: true },
+        { id: `comment:${uuid(1)}`, body: "https://github.com/acme/widgets/pull/8", at: MS + 3_600_000, ownership: true },
+        { id: `document:${uuid(100_001)}`, body: "https://github.com/acme/widgets/pull/9", at: MS + 7_200_000, ownership: true },
       ],
     }]);
     expect(h.query).toHaveBeenCalledTimes(3);

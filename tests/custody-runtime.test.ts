@@ -40,11 +40,11 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
       listWorkspaces: vi.fn(async (projectId: string) => [{ projectId, repoUrl: "https://github.com/example/project" }]),
     },
     issues: {
-      get: vi.fn(async (id: string) => cards.find((c) => c.id === id) ?? null),
+      get: vi.fn(async (id: string) => cards.find((c) => c.id === id) ?? created.find((c) => c.id === id) ?? null),
       list: vi.fn(async ({ originId }: any) => created.filter((c) => c.originId === originId)),
       create: vi.fn(async (input: any) => { const c = { ...input, id: CHILD }; created.push(c); return c; }),
       requestWakeup: vi.fn(async () => ({ queued: true, runId: ISSUE })),
-      relations: { get: vi.fn(async () => ({ blockedBy: [], blocks: [] })) },
+      relations: { get: vi.fn(async (_id: string) => ({ blockedBy: [], blocks: [] })) },
       documents: {
         get: vi.fn(async (id: string) => docs.get(id) ?? null),
         upsert: vi.fn(async (input: any) => { docs.set(input.issueId, input); return input; }),
@@ -93,7 +93,7 @@ describe("custody native effects", () => {
   });
   it("routes unresolved blockers through one child, never source mutation", async () => {
     const h = fixture();
-    h.ctx.issues.relations.get.mockResolvedValue({ blockedBy: [{ status: "in_progress" }], blocks: [] } as any);
+    h.ctx.issues.relations.get.mockImplementation(async (id) => ({ blockedBy: id === ISSUE ? [{ status: "in_progress" }] : [], blocks: [] } as any));
     await h.runtime.poll();
     expect(h.created[0].parentId).toBe(ISSUE);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(CHILD, COMPANY, expect.any(Object));
@@ -146,7 +146,7 @@ describe("custody native effects", () => {
   it("reuses an existing origin child rather than duplicating it", async () => {
     const h = fixture({ cards: [card({ status: "done" })] });
     h.activity.mockResolvedValue(NOW);
-    h.created.push({ id: CHILD, companyId: COMPANY, originKind: CUSTODY_ORIGIN, originId: `example/project#42|terminal|${ISSUE}:done:2` });
+    h.created.push({ id: CHILD, companyId: COMPANY, status: "todo", assigneeAgentId: ISSUE, originKind: CUSTODY_ORIGIN, originId: `example/project#42|terminal|${ISSUE}:done:2` });
     await h.runtime.poll();
     expect(h.ctx.issues.create).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
@@ -251,6 +251,84 @@ describe("coverage, summary and cursor controls", () => {
     await h.runtime.poll();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger().report.complete).toBe(false);
+  });
+  it("retains same-second overlap for closures observed after a scan begins", async () => {
+    const closed: CustodyPull[] = [];
+    const h = fixture({ open: [], closed });
+    h.advance(500);
+    await h.runtime.poll();
+    expect(h.ledger().cursors["example/project"]).toBe(NOW);
+    closed.push(pull({ state: "closed", closedAt: NOW, updatedAt: NOW }));
+    h.advance(500);
+    await h.runtime.poll();
+    expect(h.listing).toHaveBeenLastCalledWith("example/project", "closed", NOW);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it("reserves HTTP capacity for dispatch when activity inventory exhausts its share", async () => {
+    const prs = Array.from({ length: 410 }, (_, i) => pull({ number: i + 1 }));
+    const h = fixture({ open: prs });
+    h.activity.mockImplementation(async function (this: any) {
+      for (let i = 0; i < 3; i++) await this.fetch("https://api.github.com/graphql", { method: "POST" });
+      return NOW - 8 * DAY;
+    });
+    vi.mocked(CustodyGithub.prototype.pull).mockImplementation(async function (this: any, _repo, number) {
+      await this.fetch(`https://api.github.com/repos/example/project/pulls/${number}`);
+      return { ...prs.find((p) => p.number === number)!, baseBranch: "main", draft: false, mergeable: true };
+    });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(15);
+    expect(h.ctx.http.fetch.mock.calls.length).toBeLessThanOrEqual(1_200);
+    expect(h.ledger().report.complete).toBe(false);
+  });
+  it("does not refresh an unchanged description disposition after an unrelated card edit", async () => {
+    const owner = card({ status: "done", texts: [{ body: "PR disposition: example/project#42 finish; next actor contributor; revisit event", at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    h.activity.mockResolvedValue(NOW);
+    h.ctx.issues.requestWakeup.mockResolvedValue({ queued: false, runId: null } as any);
+    await h.runtime.poll();
+    h.advance(DAY);
+    owner.title = "An unrelated rename";
+    owner.updatedAt = NOW + DAY;
+    owner.texts[0]!.at = NOW + DAY;
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "pending" })]);
+  });
+  it("acknowledges a terminal trigger when the same disposition is genuinely posted in a new comment", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ status: "done", texts: [{ id: "description", body, at: NOW - DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    h.activity.mockResolvedValue(NOW);
+    h.ctx.issues.requestWakeup.mockResolvedValue({ queued: false, runId: null } as any);
+    await h.runtime.poll();
+    h.advance(DAY);
+    owner.texts.push({ id: `comment:${PROJECT}`, body, at: NOW + DAY, ownership: true });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "cleared" })]);
+  });
+  it("refuses an existing child after its source is reassigned to another agent", async () => {
+    const owner = card({ status: "done" });
+    const h = fixture({ cards: [owner] });
+    h.activity.mockResolvedValue(NOW);
+    h.ctx.issues.requestWakeup.mockResolvedValueOnce({ queued: false, runId: null } as any);
+    await h.runtime.poll();
+    owner.assigneeAgentId = PROJECT;
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ctx.issues.create).toHaveBeenCalledTimes(1);
+    expect(h.ledger().report.complete).toBe(false);
+  });
+  it.each([false, true])("keeps ambiguous closure %s coverage UNKNOWN without advancing the cursor", async (unmapped) => {
+    const h = fixture({ cards: unmapped ? [] : [card()], open: [], closed: [pull({ state: "closed", closedAt: NOW - DAY })] });
+    h.ctx.issues.requestWakeup.mockRejectedValue(new Error("reply lost"));
+    await h.runtime.poll();
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().cursors).toEqual({});
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().cursors).toEqual({});
   });
   it("coalesces overlapping scheduled callbacks", async () => {
     const h = fixture();

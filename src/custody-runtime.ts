@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { CiGithubCache } from "./ci-github.js";
 import { workspaceRepo, UUID } from "./ci-config.js";
@@ -8,6 +9,7 @@ import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard
 
 export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000 } as const;
 type Receipt = { at: number; status: "pending" | "attempting" | "woken" | "unconfirmed" | "cleared"; phase?: "create" | "wake"; issueId?: string; childId?: string };
+function delivered(receipt: Receipt): boolean { return receipt.status === "woken"; }
 interface InventoryRow { pr: string; state: string; cardId: string | null; mapping: string; triggers: string[]; unknown?: boolean }
 interface Audit { at: number; operation: string; outcome: string; key?: string }
 interface Ledger {
@@ -16,10 +18,11 @@ interface Ledger {
   cursors: Record<string, number>;
   attempted: Record<string, number>;
   heads: Record<string, { sha: string; at: number }>;
+  dispositions: Record<string, number>;
   audits: Audit[];
   report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number };
 }
-const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {}, attempted: {}, heads: {}, audits: [], report: { at: now, complete: false, rows: [], unknown: [], effects: 0 } });
+const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {}, attempted: {}, heads: {}, dispositions: {}, audits: [], report: { at: now, complete: false, rows: [], unknown: [], effects: 0 } });
 
 /** One host-managed worker; coalesce overlapping hourly/manual runs. No registration or LLM tool surface. */
 export class CustodyRuntime {
@@ -40,13 +43,16 @@ export class CustodyRuntime {
     if (!config) return;
     const key = { scopeKind: "company" as const, scopeId: config.companyId, namespace: "pr-custody-v1", stateKey: `${config.org}:${config.dryRun ? "dry" : "live"}` };
     const stored = await this.ctx.state.get(key) as Ledger | null;
-    if (stored && (stored.version !== 1 || !stored.receipts || !stored.cursors || !stored.attempted || !stored.heads || !Array.isArray(stored.audits))) throw new Error("invalid_custody_ledger");
+    if (stored && (stored.version !== 1 || !stored.receipts || !stored.cursors || !stored.attempted || !stored.heads || !stored.dispositions || !Array.isArray(stored.audits))) throw new Error("invalid_custody_ledger");
     const ledger = stored ?? empty(this.now());
     for (const receipt of Object.values(ledger.receipts)) if (receipt.status === "attempting") receipt.status = "unconfirmed";
     ledger.report = { at: this.now(), complete: false, rows: [], unknown: [], effects: 0 };
     const started = this.now();
     let requests = 0;
     let reads = 0;
+    let dispatching = false;
+    // Discovery may be incomplete, but it must leave capacity to deliver proven triggers.
+    const inventoryAvailable = () => requests < CUSTODY_LIMITS.requests - 100 && this.now() - started < CUSTODY_LIMITS.tickMs - 30_000;
     const guard = () => { if (++reads > CUSTODY_LIMITS.hostReads || this.now() - started >= CUSTODY_LIMITS.tickMs) throw new Error("custody_tick_budget"); };
     const audit = (operation: string, outcome: string, effectKey?: string) => {
       ledger.audits.push({ at: this.now(), operation, outcome, ...(effectKey ? { key: effectKey } : {}) });
@@ -90,7 +96,8 @@ export class CustodyRuntime {
       const token = await this.ctx.secrets.resolve(config.tokenRef, { companyId: config.companyId, configPath: "githubTokenSecretRef" });
       const github = new CustodyGithub(async (url, init) => {
         guard();
-        if (++requests > CUSTODY_LIMITS.requests) throw new Error("custody_request_budget");
+        if (requests >= CUSTODY_LIMITS.requests || (!dispatching && !inventoryAvailable())) throw new Error("custody_request_budget");
+        requests++;
         return this.ctx.http.fetch(url, init);
       }, token, { now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100 });
       const repos = await github.repositories(config.org);
@@ -100,7 +107,9 @@ export class CustodyRuntime {
       for (const repo of repos.sort((a, b) => (ledger.attempted[a] ?? 0) - (ledger.attempted[b] ?? 0))) {
         ledger.attempted[repo] = this.now();
         try {
-          const until = this.now();
+          if (!inventoryAvailable()) throw new Error("inventory_budget");
+          // GitHub REST timestamps have second precision; retain inclusive same-second overlap.
+          const until = Math.floor(this.now() / 1000) * 1000;
           const open = await github.pulls(repo, "open");
           const closed = await github.pulls(repo, "closed", ledger.cursors[repo] ?? config.closedSince);
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
@@ -114,9 +123,13 @@ export class CustodyRuntime {
               summaries.add(`${prReference(pr)} ${pr.state} ${pr.authorIsBot ? "bot" : mapping.candidates.length > 1 ? "ambiguous" : "unmapped"}`);
               continue;
             }
+            let owner: CustodyCard;
+            try { owner = this.dispositionClock(mapping.card, pr, ledger); }
+            catch { complete = false; row.unknown = true; unknown(prReference(pr)); continue; }
             let activity: number | null = null;
             let closure: string[] | null = null;
             try {
+              if (!inventoryAvailable()) throw new Error("inventory_budget");
               if (pr.state === "open") {
                 const ref = prReference(pr);
                 let head = ledger.heads[ref];
@@ -129,13 +142,14 @@ export class CustodyRuntime {
               } else if (!pr.merged) closure = await github.closureTexts(pr);
             } catch { complete = false; row.unknown = true; unknown(prReference(pr)); }
             // Missing activity cannot erase an independently established terminal-card trigger.
-            const triggers = custodyTriggers(pr, mapping.card, activity, closure, this.now());
+            const triggers = custodyTriggers(pr, owner, activity, closure, this.now());
             row.triggers = triggers.map((t) => t.key);
-            for (const trigger of triggers) pending.push({ pr, card: mapping.card, trigger, repo });
+            for (const trigger of triggers) pending.push({ pr, card: owner, trigger, repo });
           }
           if (complete) scanned.set(repo, until);
         } catch { unknown(repo); }
       }
+      dispatching = true;
       // Oldest first, across repositories. No cursor advances past an undispatched closure.
       for (const item of pending.sort((a, b) => a.trigger.at - b.trigger.at || a.trigger.key.localeCompare(b.trigger.key))) {
         const { pr, card, trigger, repo } = item;
@@ -183,8 +197,8 @@ export class CustodyRuntime {
           if (evidence.length > 250_000) throw new Error("evidence_capacity");
           guard();
           await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "PR custody evidence", format: "markdown", body: evidence });
-          await this.wake(config, target, trigger.key, receipt, ledger, guard, audit, save);
-          if (receipt.status === "pending") { scanned.delete(repo); unknown(prReference(pr)); }
+          await this.wake(config, target, card.assigneeAgentId ?? config.summaryAgentId, trigger.key, receipt, guard, audit, save);
+          if (!delivered(receipt)) { scanned.delete(repo); unknown(prReference(pr)); }
         } catch { scanned.delete(repo); unknown(prReference(pr)); audit("dispatch", "unknown", trigger.key); }
       }
       if (summaries.size) {
@@ -208,8 +222,8 @@ export class CustodyRuntime {
           const target = await this.child(config, dailyKey, "PR custody: daily unmapped and bot inventory", body, null, guard, audit, save, receipt);
           guard();
           await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "Daily PR custody inventory", format: "markdown", body });
-          if (receipt.status === "pending") await this.wake(config, target, dailyKey, receipt, ledger, guard, audit, save);
-          if (receipt.status === "pending") { unknown("summary_deferred"); scanned.clear(); }
+          if (receipt.status === "pending") await this.wake(config, target, config.summaryAgentId, dailyKey, receipt, guard, audit, save);
+          if (!delivered(receipt)) { unknown("summary_deferred_or_unconfirmed"); scanned.clear(); }
         } catch { unknown("summary_unknown"); scanned.clear(); }
       }
       for (const [repo, until] of scanned) ledger.cursors[repo] = until;
@@ -222,6 +236,24 @@ export class CustodyRuntime {
       await save();
     }
     this.ctx.logger.info("pr-custody: inventory", { complete: ledger.report.complete, prs: ledger.report.rows.length, unknown: ledger.report.unknown.length, effects: ledger.report.effects, dryRun: config.dryRun });
+  }
+
+  private dispositionClock(card: CustodyCard, pr: CustodyPull, ledger: Ledger): CustodyCard {
+    const texts: CustodyCard["texts"] = [];
+    for (const text of card.texts) for (const line of text.body.split(/\r?\n/)) {
+      const entry = { ...text, body: line };
+      if (latestDisposition({ ...card, texts: [entry] }, pr)) {
+        const key = createHash("sha256").update(JSON.stringify([card.id, text.id ?? "legacy", line])).digest("hex");
+        if (ledger.dispositions[key] === undefined) {
+          if (Object.keys(ledger.dispositions).length >= CUSTODY_LIMITS.receipts) throw new Error("disposition_capacity");
+          ledger.dispositions[key] = Math.min(text.at, this.now());
+        }
+        // Generic card/document timestamps cannot refresh an unchanged directive.
+        entry.at = ledger.dispositions[key]!;
+      }
+      texts.push(entry);
+    }
+    return { ...card, texts };
   }
 
   private async confirmConfig(expected: CustodyConfig, guard: () => void): Promise<void> {
@@ -261,8 +293,14 @@ export class CustodyRuntime {
     return created.id;
   }
 
-  private async wake(config: CustodyConfig, target: string, effectKey: string, receipt: Receipt, ledger: Ledger, guard: () => void, audit: (operation: string, outcome: string, key?: string) => void, save: () => Promise<void>): Promise<void> {
+  private async wake(config: CustodyConfig, target: string, expectedAgent: string, effectKey: string, receipt: Receipt, guard: () => void, audit: (operation: string, outcome: string, key?: string) => void, save: () => Promise<void>): Promise<void> {
     await this.confirmConfig(config, guard);
+    guard();
+    const current = await this.ctx.issues.get(target, config.companyId);
+    if (!current || current.id !== target || current.companyId !== config.companyId || current.assigneeAgentId !== expectedAgent || current.assigneeUserId || !["todo", "in_progress", "in_review"].includes(current.status)) throw new Error("wake_target_changed");
+    guard();
+    const relations = await this.ctx.issues.relations.get(target, config.companyId);
+    if (relations.blockedBy.some((b) => b.status !== "done")) throw new Error("wake_target_blocked");
     receipt.phase = "wake";
     receipt.status = "attempting";
     audit("wake", "intent", effectKey);

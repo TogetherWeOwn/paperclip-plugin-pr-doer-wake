@@ -14,7 +14,7 @@ export interface CustodyCard {
   updatedAt: number;
   completedAt: number | null;
   cancelledAt: number | null;
-  texts: Array<{ body: string; at: number; ownership: boolean }>;
+  texts: Array<{ id?: string; body: string; at: number; ownership: boolean }>;
 }
 
 // These are fail-closed budgets, never truncation limits. An incomplete company
@@ -144,10 +144,10 @@ export async function loadCustodyCards(
       texts: [],
     };
     budget(card.title);
-    card.texts.push({ body: card.title, at: card.updatedAt, ownership: true });
+    card.texts.push({ id: "title", body: card.title, at: card.updatedAt, ownership: true });
     if (card.description !== null) {
       budget(card.description);
-      card.texts.push({ body: card.description, at: card.updatedAt, ownership: true });
+      card.texts.push({ id: "description", body: card.description, at: card.updatedAt, ownership: true });
     }
     cards.set(card.id, card);
   });
@@ -169,7 +169,7 @@ export async function loadCustodyCards(
     if (authorType !== null && !["agent", "user", "system"].includes(authorType)) unknown("invalid comment author_type");
     const body = text(row.body, "comment body");
     budget(body);
-    card.texts.push({ body, at: time(row.updated_at), ownership: agent !== null && user === null && (authorType === null || authorType === "agent") });
+    card.texts.push({ id: `comment:${id(row.id)}`, body, at: time(row.updated_at), ownership: agent !== null && user === null && (authorType === null || authorType === "agent") });
   }, issueIds);
 
   // Never join public.documents: only metadata is an allowed core table. Scan
@@ -198,7 +198,7 @@ export async function loadCustodyCards(
     }
     const body = text(document.body, "document body");
     budget(body);
-    card.texts.push({ body, at: time(document.updatedAt), ownership: true });
+    card.texts.push({ id: `document:${documentId}`, body, at: time(document.updatedAt), ownership: true });
   }
   return [...cards.values()];
 }
