@@ -51,6 +51,8 @@ export class CiAppAuth implements CiTokenSource {
   private async mint(exchange: CiTokenExchange): Promise<string> {
     // Do not retain key material, KeyObjects or JWTs on the source or the runtime.
     const pem = await this.#options.resolvePrivateKey();
+    // A client deadline can invalidate us while the secret RPC is still running.
+    if (this.#failed) throw new CiGithubError("auth");
     if (typeof pem !== "string" || pem.length > 32_768 || !/^-----BEGIN (?:RSA )?PRIVATE KEY-----/.test(pem)) throw new CiGithubError("auth");
     const key = createPrivateKey(pem);
     const bits = key.asymmetricKeyDetails?.modulusLength ?? 0;
@@ -60,6 +62,7 @@ export class CiAppAuth implements CiTokenSource {
     const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
     const unsigned = `${encode({ alg: "RS256", typ: "JWT" })}.${encode({ iss: this.#options.appId, iat: Math.floor(now / 1000) - 60, exp: Math.floor(now / 1000) + 300 })}`;
     const jwt = `${unsigned}.${sign("RSA-SHA256", Buffer.from(unsigned), key).toString("base64url")}`;
+    if (this.#failed || this.#now() >= this.#deadline) throw new CiGithubError("auth");
     const raw = await exchange(this.#options.installationId, jwt, { repositories: [this.#options.repo.split("/")[1]!], permissions: APP_PERMISSIONS });
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new CiGithubError("auth");
     const data = raw as Record<string, unknown>;

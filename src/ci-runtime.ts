@@ -69,6 +69,7 @@ export class CiWakeRuntime {
   private pendingWebhooks = 0;
   private webhookAdmissions = { since: 0, used: 0 };
   private readonly caches = new Map<string, CiGithubCache>();
+  private readonly githubBackoffs = new Map<string, { until: number }>();
   private webhookBudget = { since: 0, used: 0 };
 
   constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now) {}
@@ -118,9 +119,19 @@ export class CiWakeRuntime {
 
   private async client(companyId: string, config: CiConfig, repo: string, fetch: PluginContext["http"]["fetch"] = this.ctx.http.fetch.bind(this.ctx.http), cycle = new Map<string, CiAppAuth>()): Promise<CiGithub> {
     const app = config.githubApp;
-    // App throttles span repos and private-key rotation within an installation.
+    // Response bodies/ETags stay company scoped; App installation quota does not.
     const key = app ? `${companyId}:app:${app.appId}:${app.installationId}`
       : `${companyId}:${config.githubTokenSecretRef!.secretId}:${config.githubTokenSecretRef!.version ?? "latest"}`;
+    const quota = app ? `app:${app.appId}:${app.installationId}` : `bearer:${key}`;
+    for (const [id, entry] of this.githubBackoffs) if (entry.until <= this.now()) this.githubBackoffs.delete(id);
+    let backoff = this.githubBackoffs.get(quota);
+    if (!backoff) {
+      // Never evict a live Retry-After to admit another identity or response cache.
+      if (this.githubBackoffs.size >= LIMITS.retained) throw new Error("github_backoff_capacity");
+      backoff = { until: 0 };
+      this.githubBackoffs.set(quota, backoff);
+    }
+    if (this.now() < backoff.until) throw new Error("github_backoff");
     if (!this.caches.has(key)) {
       if (this.caches.size >= 8) this.caches.delete(this.caches.keys().next().value!);
       this.caches.set(key, new CiGithubCache());
@@ -136,7 +147,7 @@ export class CiWakeRuntime {
       }));
       credential = cycle.get(scope)!;
     } else credential = await this.ctx.secrets.resolve(config.githubTokenSecretRef!, { companyId, configPath: "githubTokenSecretRef" });
-    return new CiGithub(fetch, credential, { now: this.now, cache });
+    return new CiGithub(fetch, credential, { now: this.now, cache, backoff });
   }
 
   private async binding(wait: Registration, companyId: string, projectId?: string): Promise<{ workspaceId: string; projectId: string; branch: string }> {

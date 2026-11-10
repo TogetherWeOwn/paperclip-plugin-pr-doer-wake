@@ -28,6 +28,33 @@ function fixture(options: { tokenPatch?: Record<string, unknown>; status?: numbe
 }
 
 describe("App installation authentication", () => {
+  it("does not start an exchange when key resolution completes after the auth deadline", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    try {
+      let resolve!: (key: string) => void;
+      const auth = new CiAppAuth({ appId: "123", installationId: "456", repo: "example/project", resolvePrivateKey: () => new Promise<string>((done) => { resolve = done; }) });
+      const fetch = vi.fn(async () => response({}, 201));
+      const client = new CiGithub(fetch, auth, { requestTimeoutMs: 10 });
+      const outcome = client.pull("example/project", 1).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(11);
+      expect(await outcome).toMatchObject({ code: "timeout" });
+      resolve(KEY);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetch).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("refuses reflected previous-cycle GitHub credentials, escaped=%s", async (escaped) => {
+    const previous = "ghs_previous_valid_installation_fixture_token";
+    let body = JSON.stringify({ ...pr, user: { login: previous } });
+    if (escaped) body = body.replace(previous, `\\u0067${previous.slice(1)}`);
+    const fetch: CiFetch = async () => ({ status: 200, headers: { etag: '"fixture"' }, body });
+    const client = new CiGithub(fetch, TOKEN);
+    await expect(client.pull("example/project", 1)).rejects.toMatchObject({ code: "response" });
+    expect(JSON.stringify(client)).not.toContain(previous);
+  });
+
   it("signs a short RS256 JWT and explicitly narrows one repository and fixed permissions", async () => {
     const h = fixture();
     await h.github.pull("example/project", 1);

@@ -52,6 +52,7 @@ function setup(app = false) {
   let durable: Ledger | null = null;
   let now = 1_800_000_000_000;
   let terminal = false;
+  let throttled = false;
   let ownerRun = RUN;
   let stateOffline = false;
   let reply: "queued" | "ambiguous" | "crash-after-dispatch" = "queued";
@@ -67,8 +68,10 @@ function setup(app = false) {
   });
   const fetch = vi.fn(async (input: string, init?: RequestInit) => {
     const path = new URL(input).pathname;
-    if (path === "/app/installations/456/access_tokens") {
+    if (throttled && !app) return { status: 429, headers: { "retry-after": "600" }, body: "{}" };
+    if (/^\/app\/installations\/[0-9]+\/access_tokens$/.test(path)) {
       expect(init?.method).toBe("POST");
+      if (throttled && path === "/app/installations/456/access_tokens") return { status: 429, headers: { "retry-after": "600" }, body: "{}" };
       expect(JSON.parse(init?.body as string)).toEqual({ repositories: ["widget"], permissions: APP_PERMISSIONS });
       return { status: 201, headers: {}, body: JSON.stringify({ token: APP_TOKEN, expires_at: new Date(now + 3_600_000).toISOString(), repositories: [{ full_name: REPO }], permissions: APP_PERMISSIONS }) };
     }
@@ -101,13 +104,13 @@ function setup(app = false) {
       },
     },
     issues: {
-      get: async () => ({ id: ISSUE, companyId: COMPANY, projectId: PROJECT, executionWorkspaceId: WORKSPACE }),
+      get: async (_issueId: string, companyId: string) => ({ id: ISSUE, companyId, projectId: PROJECT, executionWorkspaceId: WORKSPACE }),
       assertCheckoutOwner: async (input: { actorRunId: string }) => {
         if (input.actorRunId !== ownerRun) throw new Error("synthetic checkout refused");
       },
       requestWakeup,
     },
-    executionWorkspaces: { get: async () => ({ id: WORKSPACE, companyId: COMPANY, projectId: PROJECT, repoUrl: `https://github.com/${REPO}.git`, branchName: BRANCH }) },
+    executionWorkspaces: { get: async (_id: string, companyId: string) => ({ id: WORKSPACE, companyId, projectId: PROJECT, repoUrl: `https://github.com/${REPO}.git`, branchName: BRANCH }) },
     secrets: { resolve: resolveSecret },
     http: { fetch }, logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
   } as unknown as PluginContext;
@@ -118,10 +121,39 @@ function setup(app = false) {
     reply: (value: typeof reply) => { reply = value; },
     recoverState: () => { stateOffline = false; },
     nextRun: () => { ownerRun = NEXT_RUN; },
+    throttle: (value = true) => { throttled = value; },
+    installation: (id: string) => { if (app) auth.githubInstallationId = id; },
   };
 }
 
 describe("plugin ledger without host idempotency", () => {
+  it("shares installation backoff across companies before resolving another key", async () => {
+    const h = setup(true);
+    const runtime = h.runtime();
+    h.throttle();
+    expect(await runtime.register(registration, run)).toHaveProperty("error");
+    expect(h.fetch).toHaveBeenCalledTimes(1);
+    expect(await runtime.register(registration, { ...run, companyId: "77777777-7777-4777-8777-777777777777" })).toHaveProperty("error");
+    expect(h.fetch).toHaveBeenCalledTimes(1);
+    expect(h.resolveSecret).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])("does not evict live backoff with response-cache entries, App mode=%s", async (app) => {
+    const h = setup(app);
+    const runtime = h.runtime();
+    h.throttle();
+    expect(await runtime.register(registration, run)).toHaveProperty("error");
+    h.throttle(false);
+    for (let n = 0; n < 9; n++) {
+      h.installation(String(457 + n));
+      expect(await runtime.register(registration, { ...run, companyId: `77777777-7777-4777-8777-${String(n).padStart(12, "0")}` })).toMatchObject({ data: { status: "open" } });
+    }
+    h.installation("456");
+    const count = h.fetch.mock.calls.length;
+    expect(await runtime.register(registration, run)).toHaveProperty("error");
+    expect(h.fetch).toHaveBeenCalledTimes(count);
+  });
+
   it("uses App auth consistently for registration, scheduled polls and enabled signed-hint rechecks", async () => {
     const h = setup(true);
     const runtime = h.runtime();

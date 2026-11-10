@@ -24,6 +24,8 @@ export interface CiGithubOptions {
   now?: () => number;
   /** Token-free state, scoped by the caller to one company/credential identity. */
   cache?: CiGithubCache;
+  /** Installation quota only; may span companies, never contains response data. */
+  backoff?: { until: number };
 }
 export interface CiRequiredContext {
   context: string;
@@ -107,6 +109,8 @@ export class CiGithubError extends Error {
 
 const ORIGIN = "https://api.github.com";
 const PAGE_SIZE = 100;
+// Recognize provider credential shapes without retaining expired/previous tokens.
+const SECRET_SHAPE = /(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{16,}|eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{16,}|-----BEGIN (?:RSA )?PRIVATE KEY-----/;
 type JsonObject = Record<string, unknown>;
 function invalid(): never { throw new CiGithubError("response"); }
 function object(value: unknown): JsonObject {
@@ -217,6 +221,7 @@ export class CiGithub {
   private readonly now: () => number;
   private requests = 0;
   private readonly cache: CiGithubCache;
+  private readonly backoff: { until: number };
   #credential: string | CiTokenSource;
 
   constructor(
@@ -231,6 +236,7 @@ export class CiGithub {
     this.maxBodyBytes = bounded(options.maxBodyBytes, 2 * 1024 * 1024, 8 * 1024 * 1024);
     this.requestTimeoutMs = bounded(options.requestTimeoutMs, 15_000, 30_000);
     this.cache = options.cache ?? new CiGithubCache(options);
+    this.backoff = options.backoff ?? { until: 0 };
     this.now = options.now ?? Date.now;
   }
 
@@ -436,6 +442,7 @@ export class CiGithub {
     if ((status === 429 || (status === 403 && (!permissionDenied || retry !== undefined))) && until <= now) until = now + 60_000;
     if (remaining === "0" && until <= now) until = now + 60_000;
     this.cache.backoffUntil = Math.max(this.cache.backoffUntil, until);
+    this.backoff.until = Math.max(this.backoff.until, until);
   }
 
   private async deadline<T>(operation: () => Promise<T>): Promise<T> {
@@ -453,7 +460,7 @@ export class CiGithub {
   }
 
   private async attempt(url: string, headers: Record<string, string>, body?: string): Promise<CiHttpResponse | Response> {
-    if (this.now() < this.cache.backoffUntil) throw new CiGithubError("backoff", undefined, this.cache.backoffUntil);
+    if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     this.requests++;
     try { return await this.deadline(() => this.fetch(url, { method: body === undefined ? "GET" : "POST", headers, redirect: "error", ...(body === undefined ? {} : { body }) })); }
@@ -465,7 +472,7 @@ export class CiGithub {
 
   private async request(path: string, exchange?: { jwt: string; body: string }): Promise<Page> {
     // Backoff/budget apply before secret resolution as well as to every fetch.
-    if (this.now() < this.cache.backoffUntil) throw new CiGithubError("backoff", undefined, this.cache.backoffUntil);
+    if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     const token = exchange ? exchange.jwt : typeof this.#credential === "string" ? this.#credential
       : await this.deadline(() => (this.#credential as CiTokenSource).token(path, async (installationId, jwt, body) => {
@@ -517,23 +524,24 @@ export class CiGithub {
       throw new CiGithubError("response");
     }
     if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > (exchange ? Math.min(this.maxBodyBytes, 16_384) : this.maxBodyBytes)) return invalid();
-    const data = this.parse(body, token);
+    const data = this.parse(body, token, exchange !== undefined);
     // Installation-token responses must never enter the ETag cache.
     if (exchange) return { data, link: "" };
     const link = header(response.headers, "link") ?? "";
     const etag = header(response.headers, "etag");
-    if (link.includes(token) || etag?.includes(token)) return invalid();
+    if (link.includes(token) || etag?.includes(token) || SECRET_SHAPE.test(link) || etag && SECRET_SHAPE.test(etag)) return invalid();
     if (etag) this.cache.remember(url, { body, etag, link, bytes: Buffer.byteLength(body + etag + link + url, "utf8") });
     else if (cached) this.cache.delete(url);
     return { data, link };
   }
 
-  private parse(body: string, token?: string): unknown {
+  private parse(body: string, token?: string, exchange = false): unknown {
     try {
       if (token && body.includes(token)) return invalid();
       // A reviver also catches reflection hidden by JSON escapes, including property names.
       return JSON.parse(body, (key: string, value: unknown) => {
         if (token && (key.includes(token) || (typeof value === "string" && value.includes(token)))) return invalid();
+        if (SECRET_SHAPE.test(key) || typeof value === "string" && !(exchange && key === "token") && SECRET_SHAPE.test(value)) return invalid();
         return value;
       }) as unknown;
     } catch { throw new CiGithubError("response"); }
