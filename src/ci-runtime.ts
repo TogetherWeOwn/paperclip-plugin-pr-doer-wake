@@ -2,6 +2,11 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
 import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, type CiConfig, type Registration } from "./ci-config.js";
 import { CiGithub, CiGithubCache, evaluateReadiness } from "./ci-github.js";
+import { CiAppAuth } from "./ci-auth.js";
+
+function authIdentity(config: CiConfig): string {
+  return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
+}
 
 export const LIMITS = { active: 20, retained: 2_000, audit: 1_000, deliveries: 2_000, requestsPerTick: 240, wakePerTick: 20, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 180_000 } as const;
 const KEY = { scopeKind: "instance" as const, namespace: "ci-wake-v1", stateKey: "ledger" };
@@ -111,14 +116,27 @@ export class CiWakeRuntime {
     return config;
   }
 
-  private async client(companyId: string, config: CiConfig, fetch: PluginContext["http"]["fetch"] = this.ctx.http.fetch.bind(this.ctx.http)): Promise<CiGithub> {
-    const token = await this.ctx.secrets.resolve(config.githubTokenSecretRef!, { companyId, configPath: "githubTokenSecretRef" });
-    const key = `${companyId}:${config.githubTokenSecretRef!.secretId}:${config.githubTokenSecretRef!.version ?? "latest"}`;
+  private async client(companyId: string, config: CiConfig, repo: string, fetch: PluginContext["http"]["fetch"] = this.ctx.http.fetch.bind(this.ctx.http), cycle = new Map<string, CiAppAuth>()): Promise<CiGithub> {
+    const app = config.githubApp;
+    // App throttles span repos and private-key rotation within an installation.
+    const key = app ? `${companyId}:app:${app.appId}:${app.installationId}`
+      : `${companyId}:${config.githubTokenSecretRef!.secretId}:${config.githubTokenSecretRef!.version ?? "latest"}`;
     if (!this.caches.has(key)) {
       if (this.caches.size >= 8) this.caches.delete(this.caches.keys().next().value!);
       this.caches.set(key, new CiGithubCache());
     }
-    return new CiGithub(fetch, token, { now: this.now, cache: this.caches.get(key)! });
+    const cache = this.caches.get(key)!;
+    if (this.now() < cache.backoffUntil) throw new Error("github_backoff");
+    let credential: string | CiAppAuth;
+    if (app) {
+      const scope = `${companyId}:${authIdentity(config)}:${repo}`;
+      if (!cycle.has(scope)) cycle.set(scope, new CiAppAuth({
+        appId: app.appId, installationId: app.installationId, repo, now: this.now,
+        resolvePrivateKey: () => this.ctx.secrets.resolve(app.privateKeySecretRef, { companyId, configPath: "githubAppPrivateKeySecretRef" }),
+      }));
+      credential = cycle.get(scope)!;
+    } else credential = await this.ctx.secrets.resolve(config.githubTokenSecretRef!, { companyId, configPath: "githubTokenSecretRef" });
+    return new CiGithub(fetch, credential, { now: this.now, cache });
   }
 
   private async binding(wait: Registration, companyId: string, projectId?: string): Promise<{ workspaceId: string; projectId: string; branch: string }> {
@@ -177,7 +195,7 @@ export class CiWakeRuntime {
         // Audit intent before resolving the credential or making any outbound request.
         this.audit(ledger, "register", "intent", run, waitId);
         await this.save(ledger);
-        const github = await this.client(run.companyId, config);
+        const github = await this.client(run.companyId, config, registration.repo);
         const pr = await github.pull(registration.repo, registration.prNumber);
         if (pr.state !== "open" || pr.merged || pr.headSha !== registration.headSha || pr.headRepo?.toLowerCase() !== registration.repo || pr.headBranch !== binding.branch) throw new Error("pr_binding_refused");
         // Checkout ownership may have changed while GitHub answered.
@@ -227,6 +245,8 @@ export class CiWakeRuntime {
     const started = this.now();
     let requests = 0;
     let wakes = 0;
+    // Tokens are reusable only within this bounded poll, never a runtime field/state.
+    const cycle = new Map<string, CiAppAuth>();
     const fetch: PluginContext["http"]["fetch"] = async (url, init) => {
       if (++requests > LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
       return this.ctx.http.fetch(url, init);
@@ -242,7 +262,9 @@ export class CiWakeRuntime {
         if (!config.enabled) continue;
         if (!config.allowedRepos.includes(wait.repo)) { wait.status = "retired"; wait.reason = "repo_revoked"; wait.finishedAt = this.now(); await this.save(ledger); continue; }
         await this.checkBinding(wait);
-        const github = await this.client(wait.companyId, config, fetch);
+        this.audit(ledger, "poll", "intent", undefined, wait.waitId);
+        await this.save(ledger);
+        const github = await this.client(wait.companyId, config, wait.repo, fetch, cycle);
         const pr = await github.pull(wait.repo, wait.prNumber);
         if (pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo || pr.headBranch !== wait.branch) {
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
@@ -255,7 +277,7 @@ export class CiWakeRuntime {
         if (verdict.kind === "pending") continue;
         await this.checkBinding(wait);
         const freshConfig = await this.config(wait.companyId);
-        if (!freshConfig.allowedRepos.includes(wait.repo) || freshConfig.dryRun !== config.dryRun) throw new Error("configuration_changed");
+        if (!freshConfig.allowedRepos.includes(wait.repo) || freshConfig.dryRun !== config.dryRun || authIdentity(freshConfig) !== authIdentity(config)) throw new Error("configuration_changed");
         const current = await github.pull(wait.repo, wait.prNumber);
         if (current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo || current.headBranch !== wait.branch) {
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;

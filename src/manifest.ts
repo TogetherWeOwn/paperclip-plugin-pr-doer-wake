@@ -47,11 +47,18 @@ const manifest: PaperclipPluginManifestV1 = {
   webhooks: [{ endpointKey: "github-ci", displayName: "GitHub CI hint", description: "Optional phase two: signed check_suite completed events only. Disabled until explicitly configured; payloads never authorize a wake." }],
   instanceConfigSchema: {
     type: "object", additionalProperties: false,
+    allOf: [
+      { if: { anyOf: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"].map((key) => ({ required: [key] })) }, then: { required: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"], not: { required: ["githubTokenSecretRef"] } } },
+      { if: { required: ["enabled"], properties: { enabled: { const: true } } }, then: { anyOf: [{ required: ["githubTokenSecretRef"] }, { required: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"] }] } },
+    ],
     properties: {
       enabled: { type: "boolean", default: false },
       dryRun: { type: "boolean", default: true },
       allowedRepos: { type: "array", minItems: 0, maxItems: 100, uniqueItems: true, items: { type: "string", maxLength: 140, pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$" }, default: [] },
-      githubTokenSecretRef: { ...secretRef, description: "Existing read-only GitHub credential: pull requests, checks, commit statuses and branch rules/protection. Resolved only at call time." },
+      githubTokenSecretRef: { ...secretRef, description: "Bearer mode only: existing read-only GitHub token. Mutually exclusive with the three App settings; resolved at call time." },
+      githubAppId: { type: "string", pattern: "^[1-9][0-9]{0,15}$", description: "App mode: numeric App ID as a decimal string, not a client secret." },
+      githubInstallationId: { type: "string", pattern: "^[1-9][0-9]{0,15}$", description: "App mode: existing approved installation ID as a decimal string." },
+      githubAppPrivateKeySecretRef: { ...secretRef, description: "App mode: existing approved RSA private-key reference. All three App fields are required. Tokens are narrowed to one allowed repository and fixed read permissions." },
       webhooksEnabled: { type: "boolean", default: false },
       webhookSecretRef: { ...secretRef, description: "Phase two only: webhook HMAC secret stored by the owner in Paperclip." },
       repoMedianMs: { type: "object", maxProperties: 100, additionalProperties: { type: "integer", minimum: 60000, maximum: 86400000 }, description: "Optional measured per-repo cold-start CI medians in milliseconds; absent entries start at 30 minutes. Replaced by a rolling median of settled registered heads." },

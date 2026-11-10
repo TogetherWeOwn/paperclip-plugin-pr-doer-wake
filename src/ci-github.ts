@@ -7,6 +7,11 @@ export interface CiHttpResponse {
   body: string;
 }
 export type CiFetch = (url: string, init?: RequestInit) => Promise<CiHttpResponse | Response>;
+export type CiTokenExchange = (installationId: string, jwt: string, body: { repositories: string[]; permissions: Record<string, string> }) => Promise<unknown>;
+export interface CiTokenSource {
+  token(path: string, exchange: CiTokenExchange): Promise<string>;
+  invalidate(): void;
+}
 export interface CiGithubOptions {
   /** Counts every attempted fetch, including 304s and failed requests, for this instance. */
   maxRequests?: number;
@@ -87,7 +92,7 @@ export interface CiReadiness {
   missingSince: number | null;
   missingFailAt: number | null;
 }
-export type CiGithubErrorCode = "input" | "http" | "network" | "response" | "budget" | "pages" | "backoff" | "timeout";
+export type CiGithubErrorCode = "input" | "auth" | "http" | "network" | "response" | "budget" | "pages" | "backoff" | "timeout";
 /** Deliberately contains neither response bodies, request headers, tokens, nor upstream errors. */
 export class CiGithubError extends Error {
   constructor(
@@ -212,13 +217,15 @@ export class CiGithub {
   private readonly now: () => number;
   private requests = 0;
   private readonly cache: CiGithubCache;
+  #credential: string | CiTokenSource;
 
   constructor(
     private readonly fetch: PluginContext["http"]["fetch"] | CiFetch,
-    private readonly token: string,
+    credential: string | CiTokenSource,
     options: CiGithubOptions = {},
   ) {
-    if (typeof token !== "string" || !token.trim() || /[\r\n]/.test(token)) throw new CiGithubError("input");
+    if (typeof credential === "string" ? !credential.trim() || /[\r\n]/.test(credential) : !credential || typeof credential.token !== "function") throw new CiGithubError("input");
+    this.#credential = credential;
     this.maxRequests = bounded(options.maxRequests, 100, 10_000);
     this.maxPages = bounded(options.maxPages, 20, 100);
     this.maxBodyBytes = bounded(options.maxBodyBytes, 2 * 1024 * 1024, 8 * 1024 * 1024);
@@ -445,28 +452,41 @@ export class CiGithub {
     }
   }
 
-  private async attempt(url: string, headers: Record<string, string>): Promise<CiHttpResponse | Response> {
+  private async attempt(url: string, headers: Record<string, string>, body?: string): Promise<CiHttpResponse | Response> {
     if (this.now() < this.cache.backoffUntil) throw new CiGithubError("backoff", undefined, this.cache.backoffUntil);
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     this.requests++;
-    try { return await this.deadline(() => this.fetch(url, { method: "GET", headers, redirect: "error" })); }
+    try { return await this.deadline(() => this.fetch(url, { method: body === undefined ? "GET" : "POST", headers, redirect: "error", ...(body === undefined ? {} : { body }) })); }
     catch (error) {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
       throw new CiGithubError("network");
     }
   }
 
-  private async request(path: string): Promise<Page> {
+  private async request(path: string, exchange?: { jwt: string; body: string }): Promise<Page> {
+    // Backoff/budget apply before secret resolution as well as to every fetch.
+    if (this.now() < this.cache.backoffUntil) throw new CiGithubError("backoff", undefined, this.cache.backoffUntil);
+    if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
+    const token = exchange ? exchange.jwt : typeof this.#credential === "string" ? this.#credential
+      : await this.deadline(() => (this.#credential as CiTokenSource).token(path, async (installationId, jwt, body) => {
+        if (!/^[1-9][0-9]{0,15}$/.test(installationId)) throw new CiGithubError("input");
+        return (await this.request(`/app/installations/${installationId}/access_tokens`, { jwt, body: JSON.stringify(body) })).data;
+      })).catch((error: unknown) => {
+        (this.#credential as CiTokenSource).invalidate();
+        if (error instanceof CiGithubError) throw error;
+        throw new CiGithubError("auth");
+      });
     const url = `${ORIGIN}${path}`;
-    const cached = this.cache.get(url);
+    const cached = exchange ? undefined : this.cache.get(url);
     const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json", Authorization: `Bearer ${this.token}`,
+      Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
       "X-GitHub-Api-Version": "2022-11-28",
+      ...(exchange ? { "Content-Type": "application/json" } : {}),
     };
     if (cached) headers["If-None-Match"] = cached.etag;
     let response: CiHttpResponse | Response;
     let unconditionalRetry = false;
-    try { response = await this.attempt(url, headers); }
+    try { response = await this.attempt(url, headers, exchange?.body); }
     catch (error) {
       if (!cached || !(error instanceof CiGithubError) || error.code !== "network") throw error;
       // Some stock SDKs construct Response("", {status:304}) and throw. Never assume
@@ -484,9 +504,10 @@ export class CiGithub {
     this.rateLimit(response.status, response.headers, await this.permissionDenied(response));
     if (response.status === 304) {
       if (!cached || unconditionalRetry) return invalid();
-      return { data: this.parse(cached.body), link: cached.link };
+      return { data: this.parse(cached.body, token), link: cached.link };
     }
-    if (response.status !== 200) {
+    if (response.status !== (exchange ? 201 : 200)) {
+      if (!exchange && response.status === 401 && typeof this.#credential !== "string") this.#credential.invalidate();
       throw new CiGithubError("http", response.status, this.cache.backoffUntil > this.now() ? this.cache.backoffUntil : undefined);
     }
     let body: string;
@@ -495,22 +516,24 @@ export class CiGithub {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
       throw new CiGithubError("response");
     }
-    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > this.maxBodyBytes) return invalid();
-    const data = this.parse(body);
+    if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > (exchange ? Math.min(this.maxBodyBytes, 16_384) : this.maxBodyBytes)) return invalid();
+    const data = this.parse(body, token);
+    // Installation-token responses must never enter the ETag cache.
+    if (exchange) return { data, link: "" };
     const link = header(response.headers, "link") ?? "";
     const etag = header(response.headers, "etag");
-    if (link.includes(this.token) || etag?.includes(this.token)) return invalid();
+    if (link.includes(token) || etag?.includes(token)) return invalid();
     if (etag) this.cache.remember(url, { body, etag, link, bytes: Buffer.byteLength(body + etag + link + url, "utf8") });
     else if (cached) this.cache.delete(url);
     return { data, link };
   }
 
-  private parse(body: string): unknown {
+  private parse(body: string, token?: string): unknown {
     try {
-      if (body.includes(this.token)) return invalid();
+      if (token && body.includes(token)) return invalid();
       // A reviver also catches reflection hidden by JSON escapes, including property names.
       return JSON.parse(body, (key: string, value: unknown) => {
-        if (key.includes(this.token) || (typeof value === "string" && value.includes(this.token))) return invalid();
+        if (token && (key.includes(token) || (typeof value === "string" && value.includes(token)))) return invalid();
         return value;
       }) as unknown;
     } catch { throw new CiGithubError("response"); }

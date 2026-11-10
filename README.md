@@ -41,7 +41,7 @@ The wake reason names pass/fail, repository, short head SHA, failed contexts and
 
 ### At-most-once boundary
 
-Each `(repo, headSha, waitId)` has a durable intent before `ctx.issues.requestWakeup`, plus a stable host idempotency key. All entrypoints share a single-worker lock, including overlapping scheduled callbacks. If the host reply is lost, the wait becomes `unconfirmed` and is **not retried**; restart treats an unfinished intent the same way. This favors no duplicate requests over guaranteed delivery during an ambiguous failure. The backstop recovers missed work. Do not claim exactly-once delivery or run multiple independent plugin workers against the same ledger: stock state has no cross-worker compare-and-swap.
+Each `(repo, headSha, waitId)` has a durable intent before `ctx.issues.requestWakeup`, plus a stable correlation/idempotency key. The reported target host does **not** deduplicate that key: the plugin ledger, not host deduplication, prevents repeat dispatch. All entrypoints share a single-worker lock, including overlapping scheduled callbacks. If the host reply is lost, the wait becomes `unconfirmed` and is **not retried**; restart treats an unfinished intent the same way. This favors no duplicate requests over guaranteed delivery during an ambiguous failure. The backstop recovers missed work. Do not claim exactly-once delivery or run multiple independent plugin workers against the same ledger: stock state has no cross-worker compare-and-swap.
 
 ## Configuration and limits
 
@@ -53,26 +53,50 @@ execution.workspaces.read  agent.tools.register  plugin.state.read
 plugin.state.write  http.outbound  secrets.read-ref
 ```
 
-No issue creation/update/comments, company/project enumeration, SQL namespace, shell or GitHub writes. The tool discovers companies only from its own registered waits. Both credentials resolve **at call time**, remain operation-local and are never returned/logged/stored. Do not paste credential values into config; use Paperclip secret pickers.
+No issue creation/update/comments, company/project enumeration, SQL namespace, shell or GitHub resource writes. App mode adds only the fixed installation-token exchange below. The tool discovers companies only from its own registered waits. Secret references resolve **at call time**; key material, JWTs and tokens are never returned/logged/stored in plugin state. Do not paste credential values into config; use Paperclip secret pickers.
 
 | Config | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Master switch; rejects registrations and stops rechecks when disabled. |
 | `dryRun` | `true` | Log/record would-wake decisions without waking. |
 | `allowedRepos` | `[]` | Explicit owner/repo allowlist; mandatory when enabled, maximum 100. |
-| `githubTokenSecretRef` | unset | Existing read-only credential reference. |
+| `githubTokenSecretRef` | unset | Bearer mode: existing read-only token reference. Do not configure any App field with this. |
+| `githubAppId` | unset | App mode: numeric App ID, as a positive decimal string. |
+| `githubInstallationId` | unset | App mode: existing authorized installation ID, as a positive decimal string. |
+| `githubAppPrivateKeySecretRef` | unset | App mode: existing approved RSA private-key reference; requires both IDs and excludes bearer mode. |
 | `repoMedianMs` | `{}` | Measured cold-start repo medians in ms, 60,000–86,400,000. |
 | `webhooksEnabled` | `false` | Phase-two opt-in only. |
 | `webhookSecretRef` | unset | Owner-held HMAC secret reference, required only in phase two. |
 
-Use a GitHub credential that can read pull requests, checks, statuses and effective branch rules/classic protection for allowlisted repos. Prompt same-attempt Actions reconciliation additionally needs existing **Actions: read** access to the fixed workflow-run/attempt-job endpoints; verify the actual plugin credential at qualification, not an agent's separate GitHub identity. Without that access, active-suite reconciliation defers and settled suites still use the normal checks path. Never widen a credential to avoid deferral without separate authorization. A GitHub App installation token must be maintained by its existing credential provider; this plugin does not mint tokens, rotate credentials, modify installations or increase scopes. For public repos a suitable token can read public resources; verify rules/protection access explicitly. A 401/403 is a retryable configuration/access problem, not a green result. No webhook secret is needed for polling.
+Configure **exactly one** complete mode. Partial App configuration, mixing App and bearer fields, raw keys/tokens and unknown fields fail closed, including while disabled. Existing bearer configurations remain compatible. No webhook secret is needed for polling.
+
+### GitHub App exchange
+
+App mode signs an RS256 JWT with the configured App ID, `iat = now − 60s`, `exp = now + 300s`, using an RSA private key of 2048–8192 bits resolved through `ctx.secrets.resolve`. It sends only `POST https://api.github.com/app/installations/{installationId}/access_tokens` through the stock SDK HTTP client, with explicit `repositories: [repositoryName]` and these fixed permissions:
+
+| GitHub permission key | Used for |
+| --- | --- |
+| `pull_requests: read` | Current PR/head/base/branch identity |
+| `checks: read` | Check runs and suites |
+| `statuses: read` | Commit status history (`commit_statuses` is not a valid App permission key) |
+| `actions: read` | Workflow runs and attempt-specific jobs |
+| `administration: read` | Classic branch protection required-status-check settings |
+| `metadata: read` | Implicit GitHub metadata permission; effective branch rules |
+
+The [GitHub permission reference](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps) and [installation-token API](https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app) define these scopes. These are requested permissions, **not evidence the App has them**. Public repositories do not prove protection/Actions access. An installation not covering the repository, missing grants, expired/revoked credentials or an unexpected envelope blocks the read. There is no bearer, anonymous, broader-permission or all-repository fallback. The response must identify exactly the requested owner/repository, only requested read permissions (plus implicit metadata), and expiry 60s–61min ahead. Denied exchanges never become readiness evidence.
+
+Only the installation token is reused, in private memory for one bounded poll cycle (at most 180s); concurrent requests share one exchange. Registration and signed-hint rechecks use the same auth code with fresh cycles. Tokens renew if within 60s of expiry; a failed renewal or 401 ends their use in that cycle. App IDs, installation and key references remain operator configuration, never agent arguments. Each exchange consumes the same request/deadline/backoff budgets as reads; installation backoff spans repositories and private-key reference rotation. Token responses are never ETag-cached. The exchange response acceptance cap is 16 KiB, **not a host streaming cap**.
+
+GitHub-issued tokens expire upstream after about one hour; this plugin discards them after the cycle but does **not** revoke them or shorten GitHub's TTL. Crashes/ambiguous mint replies can therefore leave an unused token valid until expiry. Local references/garbage collection are not cryptographic memory erasure. A compromised worker with the App private key can exceed these requested scopes: Security must independently disposition that ceiling, host buffering/cancellation/trace behavior and the token-lifecycle residuals before installation. Creating/rotating credentials, changing App permissions/repositories, placing secrets or installing/enabling the plugin remain separately authorized actions.
+
+Bearer mode uses an existing approved read-only token. Prompt same-attempt reconciliation needs **Actions: read**; without it, active-suite evidence defers conservatively until settlement. App mode intentionally requests the fixed complete read envelope above and never retries with fewer or broader scopes. Verify the actual plugin credential rather than an agent's separate GitHub identity.
 
 Hard runtime caps: 20 simultaneous open waits across the installation; 2,000 retained waits; seven-day active TTL; 30-day dedupe tombstones; 1,000 recent safe audit entries; 240 HTTP requests / 180 seconds / 20 wake attempts per tick. Bounded per-client page and response limits may defer large heads rather than truncate results. Expiry/compaction run on the independent scheduled job, including while disabled. No cloud resources are provisioned and no paid runner is used, so provisioning/spend reservation and cloud teardown are not applicable. Operator must export required audit evidence before the bounded ring expires.
 
 ## Operator installation and canary (phase one)
 
 1. Obtain native Security acceptance and QA for the exact source/artifact/configuration envelope; retain exact-head GitHub Actions run/job links. Complete `ACCEPTANCE.md`, including native-tool governance coverage on the target stock host. A manifest declaration is not evidence that governance ran.
-2. An Operator installs/upgrades the reviewed package, preserving the plugin ID. Bind an **existing approved** read-only GitHub credential with the secret picker. Creating/rotating credentials requires the separate owner decision; this plugin does neither.
+2. An Operator installs/upgrades the reviewed package, preserving the plugin ID. Configure either an **existing approved** read-only bearer reference or an existing approved App ID/installation/private-key reference with the secret picker. The App installation must already cover the canary repository and requested read permissions. Creating/rotating keys, adding repositories or increasing App grants requires separate owner authorization and authorized administrative work; source merge grants none of it.
 3. Replace old configuration, do not carry its heuristic fields forward. Start `enabled: true`, `dryRun: true`, allowlisting only the canary repository. Keep `webhooksEnabled: false`; no GitHub settings change is needed.
 4. Register after each canary PR push. Compare the first **20 distinct registered heads** against GitHub's authoritative required contexts and timestamps. Retain per-head registration time, final-check time, poll/would-wake time, head-move retirement and wake count. Exit only with **0 premature wakes, 0 misses beyond one four-minute poll, 0 duplicate wakes**. Count ambiguity, caps, HTTP denials and failed reads explicitly; they are not passes. Sample enough checks to verify queued reruns, required missing and failed contexts, not merely all-green heads.
 5. Operator records the evidence and enables live wakes only through the accepted configuration envelope. Dry-run records stay terminal; register new heads (or new-run waits after a deliberate rerun) for live evidence. Record actual live host queue/run evidence.
@@ -99,4 +123,4 @@ Operator sets `dryRun: true` or `enabled: false`, disables the tool profile, and
 
 ## Development
 
-Pinned SDK fixture target: `@paperclipai/plugin-sdk@2026.1023.0` (lockfile). GitHub REST API version `2022-11-28`. Tests use synthetic fixtures and no live provider calls. GitHub Actions is the CI of record: the `check` job runs locked dependency installation, typecheck, Vitest and build on a standard hosted runner. Push a draft PR and record the exact head's run/job links. Do not run a full suite or CI mirror on a shared host. Before pushing, run the existing bounded formatter/linter, project typecheck and changed/covering unit files, recording commands, scope, elapsed time, results and justified skips separately from exact-head Actions evidence.
+SDK fixture targets: locked `@paperclipai/plugin-sdk@2026.1023.0` and an isolated exact `2026.1106.0` Actions compatibility job (SDK plus shared package version asserted). `tests/ci-sdk.test.ts` runs through the installed SDK's actual RPC Response wrapper, including App POST and conditional 304 recovery; it does not prove actual host transport, governance, buffering, cancellation or trace hygiene. GitHub REST API version `2022-11-28`. Tests use synthetic fixtures and no live provider calls. GitHub Actions is the CI of record: the `check` job runs locked dependency installation, typecheck, Vitest and build on a standard hosted runner. Push a draft PR and record the exact head's run/job links. Do not run a full suite or CI mirror on a shared host. Before pushing, run the existing bounded formatter/linter, project typecheck and changed/covering unit files, recording commands, scope, elapsed time, results and justified skips separately from exact-head Actions evidence.
