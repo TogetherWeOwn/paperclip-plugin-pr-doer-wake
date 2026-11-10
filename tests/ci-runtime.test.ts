@@ -1280,6 +1280,27 @@ describe("CI runtime bounded retention and work quotas", () => {
     expect(h.ledger().audits).toEqual(ledger.audits);
   });
 
+  it("preserves wake evidence under repeated poll intent audits and still saves each intent before credential access", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const ledger = h.ledger();
+    const evidence = { at: START, operation: "wake", outcome: "unconfirmed", waitId: "earlier-wake" };
+    ledger.audits = [evidence, ...Array.from({ length: LIMITS.audit - 1 }, () => ({ at: START, operation: "poll", outcome: "intent" }))];
+    h.seed(ledger);
+    github.readiness.mockReturnValue(verdict("pending"));
+    h.resolveSecret.mockImplementation(async () => {
+      expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "poll", outcome: "intent", waitId: ledger.waits[0]!.waitId });
+      return TOKEN;
+    });
+    for (let tick = 0; tick < 3; tick += 1) {
+      await h.runtime.poll();
+      h.advance(4 * 60_000);
+    }
+    expect(h.ledger().audits).toHaveLength(LIMITS.audit);
+    expect(h.ledger().audits).toContainEqual(evidence);
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
   it("bounds the audit log while preserving the latest refusal", async () => {
     const h = setup();
     await h.runtime.register(registration, run);

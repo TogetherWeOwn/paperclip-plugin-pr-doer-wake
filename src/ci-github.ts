@@ -530,7 +530,8 @@ export class CiGithub {
     const link = header(response.headers, "link") ?? "";
     const etag = header(response.headers, "etag");
     if (link.includes(token) || etag?.includes(token) || SECRET_SHAPE.test(link) || etag && SECRET_SHAPE.test(etag)) return invalid();
-    if (etag) this.cache.remember(url, { body, etag, link, bytes: Buffer.byteLength(body + etag + link + url, "utf8") });
+    const safeBody = JSON.stringify(data);
+    if (etag) this.cache.remember(url, { body: safeBody, etag, link, bytes: Buffer.byteLength(safeBody + etag + link + url, "utf8") });
     else if (cached) this.cache.delete(url);
     return { data, link };
   }
@@ -541,7 +542,12 @@ export class CiGithub {
       // A reviver also catches reflection hidden by JSON escapes, including property names.
       return JSON.parse(body, (key: string, value: unknown) => {
         if (token && (key.includes(token) || (typeof value === "string" && value.includes(token)))) return invalid();
-        if (SECRET_SHAPE.test(key) || typeof value === "string" && !(exchange && key === "token") && SECRET_SHAPE.test(value)) return invalid();
+        if (SECRET_SHAPE.test(key) || typeof value === "string" && !(exchange && key === "token") && SECRET_SHAPE.test(value)) {
+          if (exchange) return invalid();
+          // Drop token-like free text before caching. A consumed field removed
+          // here still fails its strict projection; unused PR/CI prose does not.
+          return undefined;
+        }
         return value;
       }) as unknown;
     } catch { throw new CiGithubError("response"); }

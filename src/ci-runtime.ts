@@ -93,7 +93,12 @@ export class CiWakeRuntime {
 
   private audit(ledger: Ledger, operation: string, outcome: string, run?: ToolRunContext, waitId?: string): void {
     ledger.audits.push({ at: this.now(), operation, outcome, ...(run && UUID.test(run.runId) && UUID.test(run.companyId) ? { runId: run.runId, companyId: run.companyId } : {}), ...(waitId ? { waitId } : {}) });
-    ledger.audits = ledger.audits.slice(-LIMITS.audit);
+    while (ledger.audits.length > LIMITS.audit) {
+      // Keep the current call's durable intent, but evict older routine intents
+      // before wake/refusal evidence. This remains a bounded log, not an archive.
+      const routine = ledger.audits.findIndex((entry, index) => index < ledger.audits.length - 1 && entry.operation === "poll" && entry.outcome === "intent");
+      ledger.audits.splice(routine < 0 ? 0 : routine, 1);
+    }
   }
 
   private compact(ledger: Ledger): void {
