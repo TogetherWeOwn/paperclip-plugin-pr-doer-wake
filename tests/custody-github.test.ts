@@ -33,8 +33,8 @@ function closed(number = 1, updated = UPDATED) {
 function connection(nodes: unknown[], totalCount = nodes.length, hasNextPage = false, endCursor: string | null = null) {
   return { nodes, totalCount, pageInfo: { hasNextPage, endCursor } };
 }
-function commit(oid = SHA, pushedDate: string | null = UPDATED) {
-  return { commit: { oid, pushedDate, committedDate: CREATED } };
+function commit(oid = SHA) {
+  return { commit: { oid, committedDate: CREATED } };
 }
 function review(id = "review-1", submittedAt: string | null = UPDATED) {
   return { id, state: "APPROVED", submittedAt };
@@ -214,20 +214,28 @@ describe("CustodyGithub REST enumeration", () => {
 });
 
 describe("CustodyGithub exact activity", () => {
-  it("uses push time instead of PR metadata updatedAt", async () => {
+  it("does not select retired pushedDate when the head observation supplies the push floor", async () => {
+    const { client, calls } = fixtures((_url, init) => {
+      if (String(init?.body).includes("pushedDate")) return response({ errors: [{ message: "field removed" }] });
+      return undefined;
+    });
+    expect(await client.activity(pr(), Date.parse(UPDATED))).toBe(Date.parse(UPDATED));
+    expect(calls.every((call) => !String(call.init?.body).includes("pushedDate"))).toBe(true);
+  });
+  it("uses the head observation instead of PR metadata updatedAt", async () => {
     const { client } = fixtures();
-    expect(await client.activity(pr({ updatedAt: Date.parse(RECENT) }))).toBe(Date.parse(UPDATED));
+    expect(await client.activity(pr({ updatedAt: Date.parse(RECENT) }), Date.parse(UPDATED))).toBe(Date.parse(UPDATED));
   });
 
-  it("requires push evidence when no persisted head observation is supplied", async () => {
-    const { client } = fixtures((url, init) => url.pathname === "/graphql" && String(init?.body).includes("commits(first:")
-      ? response(graphql("commits", connection([commit(SHA, null)]))) : undefined);
+  it("requires a persisted head observation before requests", async () => {
+    const { client, calls } = fixtures();
     await expect(client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    expect(calls).toHaveLength(0);
   });
 
   it("starts idle warmup at first observation when push history is unavailable", async () => {
     const { client } = fixtures((url, init) => url.pathname === "/graphql" && String(init?.body).includes("commits(first:")
-      ? response(graphql("commits", connection([commit(SHA, null)]))) : undefined);
+      ? response(graphql("commits", connection([commit()]))) : undefined);
     const observedAt = Date.parse(RECENT);
     const lastActivity = await client.activity(pr({ updatedAt: Date.parse("2026-02-01T00:00:00Z") }), observedAt);
     expect(lastActivity).toBe(observedAt);
@@ -236,7 +244,7 @@ describe("CustodyGithub exact activity", () => {
     expect(observedAt + sevenDays - lastActivity).toBe(sevenDays);
   });
 
-  it("includes the persisted observation floor even when pushedDate is present", async () => {
+  it("includes the persisted observation floor above commit dates", async () => {
     const { client } = fixtures();
     expect(await client.activity(pr(), Date.parse(RECENT))).toBe(Date.parse(RECENT));
   });
@@ -244,7 +252,7 @@ describe("CustodyGithub exact activity", () => {
   it("keeps later submitted reviews and running-suite updates above the observation floor", async () => {
     const { client } = fixtures((url, init) => {
       if (url.pathname !== "/graphql") return undefined;
-      if (String(init?.body).includes("commits(first:")) return response(graphql("commits", connection([commit(SHA, null)])));
+      if (String(init?.body).includes("commits(first:")) return response(graphql("commits", connection([commit()])));
       if (String(init?.body).includes("reviews(")) return response(graphql("reviews", connection([review("later", RECENT)])));
       return response(graphql("checkSuites", connection([suite("running", "2026-01-04T00:00:00Z")])));
     });
@@ -257,18 +265,18 @@ describe("CustodyGithub exact activity", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("accepts a zero observation floor but still rejects missing pushedDate fields", async () => {
+  it("accepts a zero observation floor but still rejects missing commit dates", async () => {
     const { client } = fixtures((url, init) => url.pathname === "/graphql" && String(init?.body).includes("commits(first:")
-      ? response(graphql("commits", connection([commit(SHA, null)]))) : undefined);
+      ? response(graphql("commits", connection([commit()]))) : undefined);
     expect(await client.activity(pr(), 0)).toBe(Date.parse(CREATED));
-    const malformed = fixtures(() => response(graphql("commits", connection([{ commit: { oid: SHA, committedDate: CREATED } }]))));
+    const malformed = fixtures(() => response(graphql("commits", connection([{ commit: { oid: SHA } }]))));
     await expect(malformed.client.activity(pr(), Date.parse(RECENT))).rejects.toMatchObject({ code: "response" });
   });
 
   it("includes running suite updatedAt", async () => {
     const { client } = fixtures((url, init) => url.pathname === "/graphql" && String(init?.body).includes("checkSuites(")
       ? response(graphql("checkSuites", connection([suite()]))) : undefined);
-    expect(await client.activity(pr())).toBe(Date.parse(RECENT));
+    expect(await client.activity(pr(), Date.parse(UPDATED))).toBe(Date.parse(RECENT));
   });
 
   it("fully paginates more than 100 submitted reviews", async () => {
@@ -279,7 +287,7 @@ describe("CustodyGithub exact activity", () => {
         ? connection(Array.from({ length: 100 }, (_, index) => review(`r-${index}`)), 101, true, "next-reviews")
         : connection([review("r-100", RECENT)], 101, false, "last-review")));
     });
-    expect(await client.activity(pr())).toBe(Date.parse(RECENT));
+    expect(await client.activity(pr(), Date.parse(UPDATED))).toBe(Date.parse(RECENT));
     expect(calls.filter((call) => String(call.init?.body).includes("reviews("))).toHaveLength(2);
   });
 
@@ -294,14 +302,14 @@ describe("CustodyGithub exact activity", () => {
       return response(graphql(kind, variables.cursor === null ? connection(nodes, 101, true, "next")
         : connection(kind === "commits" ? [commit()] : [suite("latest")], 101, false, "last"), {}, 101));
     });
-    expect(await client.activity(pr())).toBe(Date.parse(RECENT));
+    expect(await client.activity(pr(), Date.parse(UPDATED))).toBe(Date.parse(RECENT));
   });
 
   it.each([
     { errors: [{ message: "Upstream private diagnostics" }] },
     { data: null },
     graphql("commits", connection([null])),
-    graphql("commits", connection([commit(SHA, null)])),
+    graphql("commits", connection([{ commit: { oid: SHA, committedDate: null } }])),
     graphql("commits", connection([commit("b".repeat(40))])),
     graphql("commits", connection([commit()]), { headRefOid: "b".repeat(40) }),
     graphql("commits", connection([commit()]), { repository: { nameWithOwner: "other/widgets" } }),
@@ -311,12 +319,12 @@ describe("CustodyGithub exact activity", () => {
     graphql("commits", connection([commit()], 2, true, "cursor")),
   ])("fails UNKNOWN on malformed, partial or mismatched GraphQL data: %j", async (data) => {
     const { client } = fixtures(() => response(data));
-    await expect(client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
   });
 
   it("rejects GraphQL partial errors even alongside apparently complete data", async () => {
     const { client } = fixtures(() => response({ ...graphql("commits", connection([commit()])), errors: [{ message: "partial" }] }));
-    await expect(client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
   });
 
   it.each([
@@ -326,7 +334,7 @@ describe("CustodyGithub exact activity", () => {
   ])("rejects invalid reviews: %j", async (data) => {
     const { client } = fixtures((url, init) => url.pathname === "/graphql" && String(init?.body).includes("reviews(")
       ? response(graphql("reviews", data)) : undefined);
-    await expect(client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
   });
 
   it.each([
@@ -338,22 +346,22 @@ describe("CustodyGithub exact activity", () => {
   ])("rejects malformed or incomplete head suite activity: %j", async (data) => {
     const { client } = fixtures((url, init) => url.pathname === "/graphql" && String(init?.body).includes("checkSuites(")
       ? response(graphql("checkSuites", data)) : undefined);
-    await expect(client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
   });
 
   it("applies the configured page budget to GraphQL without silently truncating", async () => {
     const { client } = fixtures(() => response(graphql("commits", connection(
       Array.from({ length: 100 }, (_, index) => commit((index + 1).toString(16).padStart(40, "0"))), 101, true, "next",
     ))), { maxPages: 1 });
-    await expect(client.activity(pr())).rejects.toMatchObject({ code: "pages" });
+    await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "pages" });
   });
 
   it("accepts empty review/suite connections and ignores unsubmitted reviews, but not empty commits", async () => {
     const { client } = fixtures((url, init) => url.pathname === "/graphql" && String(init?.body).includes("reviews(")
       ? response(graphql("reviews", connection([{ id: "pending", state: "PENDING", submittedAt: null }]))) : undefined);
-    expect(await client.activity(pr())).toBe(Date.parse(UPDATED));
+    expect(await client.activity(pr(), Date.parse(UPDATED))).toBe(Date.parse(UPDATED));
     const empty = fixtures(() => response(graphql("commits", connection([]))));
-    await expect(empty.client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(empty.client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
   });
 
   it("rejects repeated cursors/duplicate nodes and total changes across pages", async () => {
@@ -365,7 +373,7 @@ describe("CustodyGithub exact activity", () => {
         return response(graphql("commits", connection(Array.from({ length: 100 }, (_, index) => commit((offset + index + 1).toString(16).padStart(40, "0"))),
           !first && mode === "total" ? 301 : 300, true, "same-cursor")));
       });
-      await expect(client.activity(pr())).rejects.toMatchObject({ code: "response" });
+      await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
     }
   });
 });
@@ -380,7 +388,7 @@ describe("CustodyGithub inherited security transport", () => {
     }, { cache });
     await client.pulls(REPO, "open");
     await client.pulls(REPO, "open");
-    await client.activity(pr());
+    await client.activity(pr(), Date.parse(UPDATED));
     expect((calls[1]!.init?.headers as Record<string, string>)["If-None-Match"]).toBe('"rest"');
     for (const call of calls.slice(2)) {
       expect(call.init?.method).toBe("POST");
@@ -397,18 +405,18 @@ describe("CustodyGithub inherited security transport", () => {
       const kind = query.includes("checkSuites(") ? "checkSuites" : query.includes("reviews(") ? "reviews" : "commits";
       return response(graphql(kind, connection(kind === "commits" ? [commit()] : [])), 200, { etag: '"post"' });
     });
-    await client.activity(pr());
-    await client.activity(pr());
+    await client.activity(pr(), Date.parse(UPDATED));
+    await client.activity(pr(), Date.parse(UPDATED));
     expect(calls.every((call) => !(call.init?.headers as Record<string, string>)["If-None-Match"])).toBe(true);
     const conditional = fixtures(() => ({ status: 304, body: "", headers: {} }));
-    await expect(conditional.client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(conditional.client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
   });
 
   it("redacts reflected credentials in REST and GraphQL bodies, including escaped JSON", async () => {
     for (const action of ["pulls", "activity"] as const) {
       const escaped = TOKEN.split("").map((char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`).join("");
       const { client } = fixtures(() => ({ status: 200, headers: {}, body: `{"secret":"${escaped}"}` }));
-      const error = await (action === "pulls" ? client.pulls(REPO, "open") : client.activity(pr())).catch((error: unknown) => error);
+      const error = await (action === "pulls" ? client.pulls(REPO, "open") : client.activity(pr(), Date.parse(UPDATED))).catch((error: unknown) => error);
       expect(error).toMatchObject({ code: "response" });
       expect(String(error)).not.toContain(TOKEN);
     }
@@ -418,7 +426,7 @@ describe("CustodyGithub inherited security transport", () => {
     const redirect = new Response("private body", { status: 200 });
     Object.defineProperty(redirect, "redirected", { value: true });
     const { client } = fixtures(() => redirect);
-    await expect(client.activity(pr())).rejects.toMatchObject({ code: "response" });
+    await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "response" });
     const rejected = fixtures(() => response({ message: TOKEN }, 302, { location: "https://evil.test" }));
     await expect(rejected.client.pulls(REPO, "open")).rejects.toMatchObject({ code: "http", status: 302 });
   });
@@ -426,7 +434,7 @@ describe("CustodyGithub inherited security transport", () => {
   it("shares the request budget across REST and GraphQL and bounds bodies/pages", async () => {
     const { client } = fixtures(undefined, { maxRequests: 1 });
     await client.pulls(REPO, "open");
-    await expect(client.activity(pr())).rejects.toMatchObject({ code: "budget" });
+    await expect(client.activity(pr(), Date.parse(UPDATED))).rejects.toMatchObject({ code: "budget" });
     const bounded = fixtures(() => response([rawPull()]), { maxBodyBytes: 10 });
     await expect(bounded.client.pulls(REPO, "open")).rejects.toMatchObject({ code: "response" });
     expect(() => fixtures(undefined, { maxPages: 101 })).toThrow();

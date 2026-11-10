@@ -141,7 +141,7 @@ export class CustodyGithub extends CiGithub {
    * Commit/push, submitted review, and head suite activity (even running).
    * REST commit dates alone do not establish push time; PR updated_at also
    * changes for metadata, which could postpone custody forever.
-   * GitHub retired pushedDate. Null is UNKNOWN unless the caller supplies a
+   * GitHub retired pushedDate. Activity is UNKNOWN unless the caller supplies a
    * persisted first-observed timestamp for this exact head SHA. That upper bound
    * starts a conservative idle warmup on discovery/head changes, never metadata.
    */
@@ -149,9 +149,10 @@ export class CustodyGithub extends CiGithub {
     const { headSha } = identity(pr);
     if (pr.state !== "open" || (observedHeadAt !== undefined
         && (!Number.isFinite(observedHeadAt) || observedHeadAt < 0 || observedHeadAt > 8_640_000_000_000_000))) throw new CiGithubError("input");
+    if (observedHeadAt === undefined) return invalid();
     const commits = await this.connection(pr, "commits", (value) => {
       const commit = object(object(value).commit);
-      const pushedAt = commit.pushedDate === null && observedHeadAt !== undefined ? observedHeadAt : timestamp(commit.pushedDate);
+      const pushedAt = observedHeadAt;
       const committedAt = timestamp(commit.committedDate);
       const oid = sha(commit.oid);
       return { key: oid, value: { oid, at: Math.max(pushedAt, committedAt) } };
@@ -184,7 +185,7 @@ export class CustodyGithub extends CiGithub {
   ): Promise<T[]> {
     const { repo, number, headSha } = identity(pr);
     const [owner, name] = repo.split("/");
-    const selection = kind === "commits" ? "commits(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid pushedDate committedDate}}}"
+    const selection = kind === "commits" ? "commits(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{commit{oid committedDate}}}"
       : kind === "reviews" ? "reviews(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id state submittedAt}}"
         : "commits(last:1){totalCount nodes{commit{oid checkSuites(first:100,after:$cursor){totalCount pageInfo{hasNextPage endCursor} nodes{id status createdAt updatedAt}}}}}";
     const query = `query CustodyActivity($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){nameWithOwner pullRequest(number:$number){number state headRefOid createdAt repository{nameWithOwner} ${selection}}}}`;

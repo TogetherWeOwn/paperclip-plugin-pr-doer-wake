@@ -108,6 +108,22 @@ describe("custody native effects", () => {
     await h.runtime.poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
+  it.each([false, true])("settles dry-run receipts once across restart and compaction (summary: %s)", async (summary) => {
+    const h = fixture({ dryRun: true, ...(summary ? { cards: [] } : {}) });
+    await h.runtime.poll();
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "cleared" })]);
+    const outcome = summary ? "would_create" : "would_wake";
+    expect(h.ledger().audits.filter((a: any) => a.outcome === outcome)).toHaveLength(1);
+    await h.restart().poll();
+    expect(h.ledger().audits.filter((a: any) => a.outcome === outcome)).toHaveLength(1);
+    for (let i = 0; i < 19_999; i++) h.ledger().receipts[`history-${i}`] = { at: NOW, status: "cleared" };
+    await h.restart().poll();
+    expect(h.ledger().audits.filter((a: any) => a.outcome === outcome)).toHaveLength(1);
+    expect(Object.keys(h.ledger().receipts).length).toBeLessThan(20_000);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
   it("never repeats an ambiguous wake and exposes the unconfirmed receipt", async () => {
     const h = fixture();
     h.ctx.issues.requestWakeup.mockRejectedValue(new Error("synthetic-provider-token must never be logged"));
@@ -228,6 +244,49 @@ describe("coverage, summary and cursor controls", () => {
     await h.runtime.poll();
     expect(h.ctx.issues.create).toHaveBeenCalledTimes(15);
     expect(h.ledger().cursors["example/project"]).toBe(NOW);
+  });
+  it("does not spend effect slots on evidence-capacity refusals before a later valid trigger", async () => {
+    const other = card({ id: PROJECT });
+    const h = fixture({ cards: [card(), other], open: [], closed: Array.from({ length: 16 }, (_, i) => pull({ number: i + 1, state: "closed", closedAt: NOW - (20 - i) * 1000, ...(i === 15 ? { headBranch: `work/${PROJECT}` } : {}) })) });
+    h.docs.set(ISSUE, { body: "x".repeat(250_000) });
+    for (let i = 0; i < 2; i++) {
+      await h.restart().poll();
+      expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().report.effects).toBe(i === 0 ? 1 : 0);
+      expect(h.ledger().cursors).toEqual({});
+    }
+    expect(h.ctx.issues.documents.upsert).toHaveBeenCalledTimes(1);
+  });
+  it("counts ambiguous document writes against the effect cap", async () => {
+    const h = fixture({ open: Array.from({ length: 20 }, (_, i) => pull({ number: i + 1 })) });
+    h.ctx.issues.documents.upsert.mockRejectedValue(new Error("lost write reply"));
+    await h.runtime.poll();
+    expect(h.ctx.issues.documents.upsert).toHaveBeenCalledTimes(15);
+    expect(h.ledger().report.effects).toBe(15);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+  it("counts updates of an already-woken daily summary against the effect cap", async () => {
+    const prs = [pull({ number: 100, authorIsBot: true })];
+    const h = fixture({ open: prs });
+    await h.runtime.poll();
+    prs.push(...Array.from({ length: 16 }, (_, i) => pull({ number: i + 1 })));
+    h.ctx.issues.documents.upsert.mockClear();
+    await h.restart().poll();
+    expect(h.ledger().report.effects).toBe(15);
+    expect(h.ctx.issues.documents.upsert).toHaveBeenCalledTimes(15);
+    expect(h.ctx.issues.documents.upsert.mock.calls.some(([input]) => input.issueId === CHILD)).toBe(false);
+  });
+  it("batches head persistence before activity-derived effects", async () => {
+    const h = fixture({ open: Array.from({ length: 20 }, (_, i) => pull({ number: i + 1 })) });
+    h.activity.mockImplementation(async () => {
+      expect(h.ctx.state.set).toHaveBeenCalledTimes(2);
+      return NOW;
+    });
+    await h.runtime.poll();
+    expect(h.activity).toHaveBeenCalledTimes(20);
+    expect(Object.keys(h.ledger().heads)).toHaveLength(20);
+    expect(h.ctx.state.set.mock.calls.length).toBeLessThanOrEqual(4);
+    expect(h.ledger().report.complete).toBe(true);
   });
   it("persists a conservative head observation floor across restart, resetting it only for a new head", async () => {
     const pr = pull();

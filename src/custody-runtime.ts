@@ -59,6 +59,16 @@ export class CustodyRuntime {
       ledger.audits = ledger.audits.filter((a) => this.now() - a.at < 30 * DAY).slice(-CUSTODY_LIMITS.audits);
     };
     const save = () => this.ctx.state.set(key, ledger);
+    // Each trigger spends one slot at its first native mutation, including ambiguous attempts.
+    const effectSlot = () => {
+      let spent = false;
+      return () => {
+        if (spent) return;
+        if (ledger.report.effects >= CUSTODY_LIMITS.effects) throw new Error("effect_budget");
+        ledger.report.effects++;
+        spent = true;
+      };
+    };
     const archiveKey = (kind: "receipt" | "disposition", id: string) => ({ ...key, stateKey: `${key.stateKey}:${kind}:${createHash("sha256").update(id).digest("hex")}` });
     const archived = async (kind: "receipt" | "disposition", id: string): Promise<Receipt | number | null> => {
       guard();
@@ -172,7 +182,6 @@ export class CustodyRuntime {
                 if (!head || head.sha !== pr.headSha) {
                   if (!head && Object.keys(ledger.heads).length >= CUSTODY_LIMITS.prs) throw new Error("head_capacity");
                   head = ledger.heads[ref] = { sha: pr.headSha, at: this.now() };
-                  await save();
                 }
                 activity = await github.activity(pr, head.at);
               } else if (!pr.merged) closure = await github.closureTexts(pr);
@@ -185,10 +194,13 @@ export class CustodyRuntime {
           if (complete) scanned.set(repo, until);
         } catch { unknown(repo); }
       }
+      // Persist discovery clocks/removals as one batch before any effect can depend on them.
+      await save();
       dispatching = true;
       // Oldest first, across repositories. No cursor advances past an undispatched closure.
       for (const item of pending.sort((a, b) => a.trigger.at - b.trigger.at || a.trigger.key.localeCompare(b.trigger.key))) {
         const { pr, card, trigger, repo } = item;
+        const spend = effectSlot();
         let receipt = ledger.receipts[trigger.key];
         if (!receipt) {
           try { if (await archived("receipt", trigger.key)) continue; }
@@ -201,7 +213,7 @@ export class CustodyRuntime {
         if (trigger.kind === "terminal" && (latestDisposition(card, pr)?.at ?? 0) > receipt.at) receipt.status = "cleared";
         if (receipt.status === "unconfirmed" && receipt.phase === "create") {
           // Reconcile a possibly created child by origin without ever repeating creation.
-          try { await this.child(config, trigger.key, "", "", card, guard, audit, save, receipt); }
+          try { await this.child(config, trigger.key, "", "", card, guard, audit, save, receipt, spend); }
           catch { /* Ambiguous creation remains a backstop responsibility. */ }
         }
         if (receipt.status === "unconfirmed") { unknown(trigger.key); holdClosure(repo, trigger); continue; }
@@ -209,11 +221,11 @@ export class CustodyRuntime {
         if (config.dryRun) {
           audit("wake", "would_wake", trigger.key);
           this.ctx.logger.info("pr-custody: would wake", { key: trigger.key, issueId: card.id });
+          receipt.status = "cleared";
+          await save();
           continue;
         }
         if (ledger.report.effects >= CUSTODY_LIMITS.effects) { holdClosure(repo, trigger); unknown("effect_budget"); continue; }
-        // A creation that fails ambiguously still spends its run's effect slot.
-        ledger.report.effects++;
         try {
           await this.confirmConfig(config, guard);
           const currentPr = await github.pull(pr.repo, pr.number);
@@ -226,7 +238,7 @@ export class CustodyRuntime {
           const eligible = ["todo", "in_progress", "in_review"].includes(fresh.status) && fresh.assigneeAgentId && !fresh.assigneeUserId && !relations.blockedBy.some((b) => b.status !== "done");
           let target = card.id;
           if (!eligible) {
-            const child = await this.child(config, trigger.key, `PR disposition: ${prReference(pr)} (${trigger.kind})`, this.evidence(pr, trigger), card, guard, audit, save, receipt);
+            const child = await this.child(config, trigger.key, `PR disposition: ${prReference(pr)} (${trigger.kind})`, this.evidence(pr, trigger), card, guard, audit, save, receipt, spend);
             target = child;
           }
           guard();
@@ -234,6 +246,7 @@ export class CustodyRuntime {
           const evidence = previous?.body.includes(`Key: ${trigger.key}\n`) ? previous.body : `${previous?.body ?? ""}\n${this.evidence(pr, trigger)}`;
           if (evidence.length > 250_000) throw new Error("evidence_capacity");
           guard();
+          spend();
           await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "PR custody evidence", format: "markdown", body: evidence });
           await this.wake(config, target, card.assigneeAgentId ?? config.summaryAgentId, trigger.key, receipt, guard, audit, save);
           if (!delivered(receipt)) { holdClosure(repo, trigger); unknown(prReference(pr)); }
@@ -244,10 +257,16 @@ export class CustodyRuntime {
         let receipt = ledger.receipts[dailyKey] ?? await archived("receipt", dailyKey) as Receipt | null;
         if (!receipt && Object.keys(ledger.receipts).length < CUSTODY_LIMITS.receipts) receipt = ledger.receipts[dailyKey] = { at: this.now(), status: "pending" };
         if (!receipt) { unknown("receipt_capacity"); holdSummaryClosures(); }
-        else if (config.dryRun) audit("summary", "would_create", dailyKey);
-        else if (ledger.report.effects >= CUSTODY_LIMITS.effects && receipt.status === "pending") { unknown("effect_budget"); holdSummaryClosures(); }
+        else if (config.dryRun) {
+          if (receipt.status === "pending") {
+            audit("summary", "would_create", dailyKey);
+            receipt.status = "cleared";
+            await save();
+          }
+        }
+        else if (ledger.report.effects >= CUSTODY_LIMITS.effects) { unknown("effect_budget"); holdSummaryClosures(); }
         else try {
-          if (receipt.status === "pending") ledger.report.effects++;
+          const spend = effectSlot();
           await this.confirmConfig(config, guard);
           const lines = new Set([...summaries].map((s) => `- ${s}`));
           if (receipt.childId) {
@@ -257,8 +276,9 @@ export class CustodyRuntime {
           }
           const body = `# PR custody: unmapped and bot inventory\n\nNo ownership inferred; no automatic close or reopen.\n\n${[...lines].sort().join("\n")}\n`;
           if (body.length > 250_000) throw new Error("summary_capacity");
-          const target = await this.child(config, dailyKey, "PR custody: daily unmapped and bot inventory", body, null, guard, audit, save, receipt);
+          const target = await this.child(config, dailyKey, "PR custody: daily unmapped and bot inventory", body, null, guard, audit, save, receipt, spend);
           guard();
+          spend();
           await this.ctx.issues.documents.upsert({ issueId: target, companyId: config.companyId, key: "pr-custody", title: "Daily PR custody inventory", format: "markdown", body });
           if (receipt.status === "pending") await this.wake(config, target, config.summaryAgentId, dailyKey, receipt, guard, audit, save);
           if (!delivered(receipt)) { unknown("summary_deferred_or_unconfirmed"); holdSummaryClosures(); }
@@ -305,7 +325,7 @@ export class CustodyRuntime {
     return `# PR disposition due\n\nPR: ${prUrl(pr)}\nHead: ${pr.headSha}\nTrigger: ${trigger.kind}\nEpoch: ${trigger.epoch}\nKey: ${trigger.key}\n\nChoose finish, rework, defer or close using current evidence and existing review/release gates. Idle age is a trigger, never a verdict. Preserve valid supersession and unique work. Record a PR-specific disposition on the source card; closure rationale belongs on both the card and PR. This job never closes, reopens or merges PRs.\n`;
   }
 
-  private async child(config: CustodyConfig, originId: string, title: string, body: string, card: CustodyCard | null, guard: () => void, audit: (operation: string, outcome: string, key?: string) => void, save: () => Promise<void>, receipt: Receipt): Promise<string> {
+  private async child(config: CustodyConfig, originId: string, title: string, body: string, card: CustodyCard | null, guard: () => void, audit: (operation: string, outcome: string, key?: string) => void, save: () => Promise<void>, receipt: Receipt, spend: () => void): Promise<string> {
     if (receipt.childId) return receipt.childId;
     guard();
     const existing = await this.ctx.issues.list({ companyId: config.companyId, originKind: CUSTODY_ORIGIN, originId, includePluginOperations: true, limit: 2 });
@@ -318,6 +338,7 @@ export class CustodyRuntime {
     }
     if (receipt.phase === "create" && receipt.status !== "pending") throw new Error("creation_unconfirmed");
     // Create can have an ambiguous result too. Persist intent and never repeat an unconfirmed creation.
+    spend();
     audit("create", "intent", originId);
     receipt.phase = "create";
     receipt.status = "attempting";
