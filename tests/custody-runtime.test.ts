@@ -877,4 +877,23 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().report.unknown).not.toContain("example/project#42");
     expect(h.ledger().report.complete).toBe(true);
   });
+
+  it("does not seed a changed SHA from stale evidence (a revert to an older head gets a fresh warmup)", async () => {
+    const pr = pull();
+    const h = fixture({ open: [pr] });
+    h.activity.mockImplementation(async (_pr, observedAt) => observedAt ?? 0);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"].at).toBe(NOW);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    // A force-push back to an earlier SHA must not inherit that SHA's old
+    // evidence as its idle epoch; the head became current now.
+    h.seedHead.mockClear();
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    pr.headSha = "b".repeat(40);
+    h.advance(3 * DAY);
+    await h.runtime.poll();
+    expect(h.seedHead).not.toHaveBeenCalled();
+    expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "b".repeat(40), at: NOW + 3 * DAY });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
 });

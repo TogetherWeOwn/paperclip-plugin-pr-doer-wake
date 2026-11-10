@@ -185,7 +185,9 @@ export class CustodyRuntime {
           const open = await github.pulls(repo, "open");
           const closed = await github.pulls(repo, "closed", ledger.cursors[repo] ?? config.closedSince);
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
-          // A complete open snapshot proves absence. Reopened PRs start a fresh safe warmup.
+          // A complete open snapshot proves absence. A reopened PR is
+          // re-observed as a first observation and seeded from head-bound
+          // evidence, so an already-idle reopened PR can trigger on discovery.
           const active = new Set(open.map(prReference));
           for (const ref of Object.keys(ledger.heads)) if (ref.startsWith(`${repo}#`) && !active.has(ref)) delete ledger.heads[ref];
           let complete = true;
@@ -216,10 +218,13 @@ export class CustodyRuntime {
                 let head = ledger.heads[ref];
                 if (!head || head.sha !== pr.headSha) {
                   if (!head && Object.keys(ledger.heads).length >= CUSTODY_LIMITS.prs) throw new Error("head_capacity");
-                  // Seed first observation from head-bound evidence (head
-                  // suite, review on the head commit). No evidence falls back
-                  // to arrival time, keeping liveness for CI-less repos.
-                  const at = (await github.seedHead(pr)) ?? this.now();
+                  // Seed only a first observation from head-bound evidence
+                  // (head suite, review on the head commit). No evidence
+                  // falls back to arrival time, keeping liveness for CI-less
+                  // repos. A changed SHA (e.g. a force-push revert to an
+                  // older head) became current now and must not inherit
+                  // stale evidence as its idle epoch.
+                  const at = head ? this.now() : (await github.seedHead(pr)) ?? this.now();
                   head = ledger.heads[ref] = { sha: pr.headSha, at };
                 }
                 activity = await github.activity(pr, head.at);
