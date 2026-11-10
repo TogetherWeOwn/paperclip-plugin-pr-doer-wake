@@ -29,6 +29,8 @@ export interface CiCheckRun {
   id: number;
   name: string;
   appId: number | null;
+  /** Exact suite identity, when supplied; app IDs cannot distinguish workflows. */
+  suiteId?: number | null;
   status: string;
   conclusion: string | null;
 }
@@ -277,7 +279,11 @@ export class CiGithub {
     const runs = (await this.pages(`${root}/commits/${sha}/check-runs?filter=all`, "check_runs")).map((value): CiCheckRun => {
       const run = object(value);
       if (fullSha(text(run.head_sha)) !== sha) return invalid();
-      return { id: id(run.id), name: text(run.name), appId: appId(run.app), status: text(run.status), conclusion: nullableText(run.conclusion) };
+      return {
+        id: id(run.id), name: text(run.name), appId: appId(run.app),
+        suiteId: run.check_suite === undefined || run.check_suite === null ? null : id(object(run.check_suite).id),
+        status: text(run.status), conclusion: nullableText(run.conclusion),
+      };
     });
     const suites = (await this.pages(`${root}/commits/${sha}/check-suites`, "check_suites")).map((value): CiCheckSuite => {
       const suite = object(value);
@@ -480,7 +486,12 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
       // Legacy statuses have no authenticated app ID: never infer one from creator.id.
       const matchingStatuses = required.appId === null ? statuses.filter((status) => status.context === required.context) : [];
       if (!matchingRuns.length && !matchingStatuses.length) missing.push(label(required));
-      for (const run of matchingRuns) record(label(required), conclusion(run.status, run.conclusion));
+      for (const run of matchingRuns) {
+        // Runs are read before suites: an active rerun can make the old result stale.
+        // Gate only this latest run's suite, never other workflows sharing its app.
+        const rerunning = suites.some((suite) => suite.id === run.suiteId && suite.status !== "completed");
+        record(label(required), rerunning ? "pending" : conclusion(run.status, run.conclusion));
+      }
       for (const status of matchingStatuses) record(label(required), statusVerdict(status.state));
     }
   } else {

@@ -487,8 +487,8 @@ describe("CI runtime polling and durable wake outcomes", () => {
     if (change === "branch") h.workspace.branchName = "feature/moved";
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
-    expect(h.ledger().waits[0]?.status).toBe(change === "workspace" || change === "branch" ? "retired" : "open");
-    if (change === "workspace" || change === "branch") {
+    expect(h.ledger().waits[0]?.status).toBe(change === "tenant" ? "open" : "retired");
+    if (change !== "tenant") {
       expect(h.ledger().waits[0]).toMatchObject({ reason: "binding_changed", finishedAt: START });
       expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "poll", outcome: "binding_changed" });
       const attempts = github.pull.mock.calls.length;
@@ -510,6 +510,57 @@ describe("CI runtime polling and durable wake outcomes", () => {
     await h.runtime.poll();
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.ledger().waits[0]?.status).toBe("woken");
+  });
+
+  it.each(["project", "repository", "workspace", "branch"] as const)("retires a confirmed %s change while CI is still pending", async (change) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    if (change === "project") h.issue.projectId = OTHER;
+    if (change === "repository") h.workspace.repoUrl = "https://github.com/acme/other";
+    if (change === "workspace") { h.issue.executionWorkspaceId = OTHER; h.workspace.id = OTHER; }
+    if (change === "branch") h.workspace.branchName = "feature/moved";
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "retired", reason: "binding_changed" });
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["issue", "workspace"] as const)("keeps ambiguous %s reads retryable while CI is pending", async (target) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    if (target === "issue") h.issueGet.mockResolvedValueOnce(null as never);
+    else h.workspaceGet.mockResolvedValueOnce(null as never);
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open" });
+    expect(h.ledger().audits.at(-1)?.outcome).toBe("retryable");
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+  });
+
+  it("rechecks binding after terminal readiness even when the initial binding matched", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockImplementation(() => { h.workspace.branchName = "feature/moved"; return verdict("pass"); });
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "retired", reason: "binding_changed" });
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("does not wake an old successful required run whose associated suite is rerunning", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.snapshot.mockResolvedValue({
+      repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "build", appId: 7 }],
+      runs: [{ id: 10, name: "build", appId: 7, suiteId: 100, status: "completed", conclusion: "success" }],
+      suites: [{ id: 100, appId: 7, status: "in_progress", conclusion: null, createdAt: START, completedAt: null }], statuses: [],
+    });
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().audits.filter((entry) => entry.operation === "wake")).toEqual([]);
   });
 
   it("resolves fresh credentials per operation and retains only a credential-scoped token-free cache", async () => {
@@ -912,6 +963,29 @@ describe("signed check_suite hints", () => {
     expect(h.ledger().deliveries[`${COMPANY}:${DELIVERY}`]).toBe(START);
   });
 
+  it.each(["disabled", "configuration failure", "secret failure"] as const)("isolates an earlier company's %s from a valid signed hint", async (failure) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const ledger = h.ledger();
+    ledger.waits.unshift({ ...ledger.waits[0]!, waitId: "other-company", companyId: OTHER });
+    h.seed(ledger);
+    h.configGet.mockImplementation(async (companyId) => {
+      if (companyId === OTHER && failure === "configuration failure") throw new Error("configuration unavailable");
+      return config(companyId === OTHER && failure === "disabled" ? { enabled: false } : {});
+    });
+    h.resolveSecret.mockImplementation(async (ref, options) => {
+      if ((options as { companyId: string }).companyId === OTHER) throw new Error("secret unavailable");
+      return ref.secretId === WEBHOOK_REF.secretId ? SECRET : TOKEN;
+    });
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.webhook(webhook());
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.anything());
+    expect(h.ledger().waits.find((wait) => wait.companyId === OTHER)?.status).toBe("open");
+    expect(h.ledger().deliveries[`${OTHER}:${DELIVERY}`]).toBeUndefined();
+    expect(h.ledger().deliveries[`${COMPANY}:${DELIVERY}`]).toBe(START);
+  });
+
   it("accepts a signed user-owned repository hint without an organization field", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
@@ -1140,6 +1214,30 @@ describe("CI runtime bounded retention and work quotas", () => {
     h.advance(1);
     await h.runtime.poll();
     expect(h.ledger().waits).toEqual([]);
+  });
+
+  it("advances failed configuration attempts so a healthy company progresses on the next full poll", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const ledger = h.ledger();
+    const original = ledger.waits[0]!;
+    ledger.waits = [
+      ...Array.from({ length: 6 }, (_, index) => ({ ...original, waitId: `failing-${index}`, companyId: OTHER })),
+      { ...original, waitId: "healthy" },
+    ];
+    h.seed(ledger);
+    h.configGet.mockImplementation(async (companyId) => {
+      if (companyId === OTHER) { h.advance(30_000); throw new Error("temporary configuration read failure"); }
+      return clone(h.rawConfig);
+    });
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits.slice(0, 6).every((wait) => wait.lastAttemptAt !== undefined)).toBe(true);
+    h.advance(4 * 60_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits.find((wait) => wait.waitId === "healthy")?.status).toBe("woken");
   });
 
   it("preserves audit evidence while disabled, still recovering, expiring and compacting waits", async () => {

@@ -31,6 +31,7 @@ interface Ledger {
   samples: Record<string, Array<{ sha: string; ms: number }>>;
 }
 const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} });
+class BindingChanged extends Error {}
 
 export function verifyCiSignature(secret: string, rawBody: string, signature: string | undefined): boolean {
   if (!secret || !signature || !/^sha256=[0-9a-f]{64}$/.test(signature)) return false;
@@ -128,6 +129,18 @@ export class CiWakeRuntime {
     return { workspaceId: workspace.id, projectId: issue.projectId, branch: workspace.branchName };
   }
 
+  private async checkBinding(wait: Wait): Promise<void> {
+    const issue = await this.ctx.issues.get(wait.issueId, wait.companyId);
+    // Missing/ambiguous reads are retryable, not evidence that the binding moved.
+    if (!issue || issue.id !== wait.issueId || issue.companyId !== wait.companyId || !issue.projectId || !issue.executionWorkspaceId) throw new Error("issue_binding_refused");
+    if (issue.projectId !== wait.projectId || issue.executionWorkspaceId !== wait.workspaceId) throw new BindingChanged();
+    const workspace = await this.ctx.executionWorkspaces.get(issue.executionWorkspaceId, wait.companyId);
+    if (!workspace || workspace.id !== wait.workspaceId || workspace.companyId !== wait.companyId || !workspace.projectId || !workspace.branchName) throw new Error("workspace_binding_refused");
+    const repo = workspaceRepo(workspace.repoUrl);
+    if (!repo) throw new Error("workspace_binding_refused");
+    if (workspace.projectId !== wait.projectId || repo !== wait.repo || workspace.branchName !== wait.branch) throw new BindingChanged();
+  }
+
   async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
     return this.serialized(async () => {
       const ledger = await this.load();
@@ -223,11 +236,12 @@ export class CiWakeRuntime {
     for (const wait of pending) {
       if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
       try {
+        wait.lastAttemptAt = this.now();
         const config = await this.config(wait.companyId, false);
         // Disabled polling still compacts above, but must not churn per-wait audit evidence.
         if (!config.enabled) continue;
-        wait.lastAttemptAt = this.now();
         if (!config.allowedRepos.includes(wait.repo)) { wait.status = "retired"; wait.reason = "repo_revoked"; wait.finishedAt = this.now(); await this.save(ledger); continue; }
+        await this.checkBinding(wait);
         const github = await this.client(wait.companyId, config, fetch);
         const pr = await github.pull(wait.repo, wait.prNumber);
         if (pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo || pr.headBranch !== wait.branch) {
@@ -239,12 +253,7 @@ export class CiWakeRuntime {
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
         const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs });
         if (verdict.kind === "pending") continue;
-        const binding = await this.binding(wait, wait.companyId, wait.projectId);
-        if (binding.workspaceId !== wait.workspaceId || binding.branch !== wait.branch) {
-          wait.status = "retired"; wait.reason = "binding_changed"; wait.finishedAt = this.now();
-          this.audit(ledger, "poll", "binding_changed", undefined, wait.waitId);
-          await this.save(ledger); continue;
-        }
+        await this.checkBinding(wait);
         const freshConfig = await this.config(wait.companyId);
         if (!freshConfig.allowedRepos.includes(wait.repo) || freshConfig.dryRun !== config.dryRun) throw new Error("configuration_changed");
         const current = await github.pull(wait.repo, wait.prNumber);
@@ -298,8 +307,11 @@ export class CiWakeRuntime {
           // Recording failures after dispatch are never classified as a pre-queue refusal.
           await this.save(ledger);
         }
-      } catch {
-        this.audit(ledger, "poll", "retryable", undefined, wait.waitId);
+      } catch (error) {
+        if (error instanceof BindingChanged) {
+          wait.status = "retired"; wait.reason = "binding_changed"; wait.finishedAt = this.now();
+        }
+        this.audit(ledger, "poll", error instanceof BindingChanged ? "binding_changed" : "retryable", undefined, wait.waitId);
         await this.save(ledger);
       }
     }
@@ -333,14 +345,16 @@ export class CiWakeRuntime {
       this.compact(ledger);
       const companies = [...new Set(ledger.waits.filter((w) => w.status === "open" && w.repo === repo && w.headSha === sha).map((w) => w.companyId))];
       for (const companyId of companies) {
-        const config = await this.config(companyId);
-        if (!config.webhooksEnabled || !config.webhookSecretRef || !config.allowedRepos.includes(repo)) continue;
+        let config: CiConfig;
+        try { config = await this.config(companyId, false); } catch { continue; }
+        if (!config.enabled || !config.webhooksEnabled || !config.webhookSecretRef || !config.allowedRepos.includes(repo)) continue;
         const owner = payload.repository?.owner?.login;
         if (typeof owner !== "string" || owner.toLowerCase() !== repo.split("/")[0]) continue;
         if (payload.organization !== undefined && (typeof payload.organization?.login !== "string" || payload.organization.login.toLowerCase() !== owner.toLowerCase())) continue;
         if (this.now() - this.webhookBudget.since >= 60_000) this.webhookBudget = { since: this.now(), used: 0 };
         if (++this.webhookBudget.used > 6) throw new Error("webhook_verification_budget");
-        const secret = await this.ctx.secrets.resolve(config.webhookSecretRef, { companyId, configPath: "webhookSecretRef" });
+        let secret: string;
+        try { secret = await this.ctx.secrets.resolve(config.webhookSecretRef, { companyId, configPath: "webhookSecretRef" }); } catch { continue; }
         if (!verifyCiSignature(secret, input.rawBody, signature)) continue;
         const replayKey = `${companyId}:${delivery}`;
         if (ledger.deliveries[replayKey]) return;

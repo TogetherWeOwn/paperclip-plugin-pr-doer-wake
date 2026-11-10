@@ -9,7 +9,7 @@ const SHA = "a".repeat(40);
 const TOKEN = "ghp_fixture_credential_not_for_output";
 const timing = { registeredAt: 1_000, now: 10_000, medianMs: 1_000 };
 function run(id = 1, patch: Partial<CiCheckRun> = {}): CiCheckRun {
-  return { id, name: "build", appId: 7, status: "completed", conclusion: "success", ...patch };
+  return { id, name: "build", appId: 7, suiteId: 1, status: "completed", conclusion: "success", ...patch };
 }
 function suite(id = 1, patch: Partial<CiCheckSuite> = {}): CiCheckSuite {
   return { id, appId: 7, status: "completed", conclusion: "success", createdAt: 1_000, completedAt: 5_000, ...patch };
@@ -29,7 +29,7 @@ function pullData(number = 1) {
   };
 }
 function rawRun(id = 1, name = "build") {
-  return { id, name, app: { id: 7 }, status: "completed", conclusion: "success", head_sha: SHA };
+  return { id, name, app: { id: 7 }, check_suite: { id }, status: "completed", conclusion: "success", head_sha: SHA };
 }
 function rawSuite(id = 1) {
   return {
@@ -89,6 +89,46 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(snapshot({ statuses: [
       { id: 10, context: "legacy", state: "pending" }, { id: 2, context: "legacy", state: "success" },
     ] }), timing).kind).toBe("pending");
+  });
+
+  it.each(["queued", "in_progress"])("defers a completed required run while its own suite is %s", (status) => {
+    for (const appId of [7, null]) {
+      const input = snapshot({
+        required: [{ context: "build", appId }], runs: [run()],
+        suites: [suite(1, { status, conclusion: null, completedAt: null })],
+      });
+      expect(evaluateReadiness(input, timing)).toMatchObject({
+        kind: "pending", failed: [], missing: [], pending: [appId === null ? "build" : "build [app 7]"],
+      });
+      input.runs[0]!.conclusion = "failure";
+      expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", failed: [] });
+    }
+  });
+
+  it("uses only the latest required run's suite, not superseded or optional suites from the same app", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }],
+      runs: [run(1), run(2, { suiteId: 2 })],
+      suites: [
+        suite(1, { status: "in_progress", conclusion: null, completedAt: null }),
+        suite(2),
+        suite(3, { status: "queued", conclusion: null, completedAt: null }),
+        suite(4, { conclusion: "failure" }),
+      ],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [], failed: [] });
+    // Suite failure may belong to an optional job in the required workflow.
+    input.suites[1]!.conclusion = "failure";
+    expect(evaluateReadiness(input, timing).kind).toBe("pass");
+  });
+
+  it("does not infer a required run's suite from an app ID when association is unavailable", () => {
+    for (const suiteId of [null, undefined, 99]) {
+      expect(evaluateReadiness(snapshot({
+        required: [{ context: "build", appId: 7 }], runs: [run(1, { suiteId })],
+        suites: [suite(1, { status: "queued", conclusion: null, completedAt: null })],
+      }), timing).kind).toBe("pass");
+    }
   });
 
   it("does not fail prematurely while any present required check remains pending", () => {
@@ -250,10 +290,70 @@ describe("CiGithub REST reads", () => {
     });
     const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "release/one");
     expect(actual.required).toEqual([{ context: "build", appId: 7 }, { context: "legacy", appId: null }, { context: "lint", appId: null }]);
+    expect(actual.runs[0]).toMatchObject({ id: 1, suiteId: 1 });
     expect(actual.suites[0]).toMatchObject({ createdAt: Date.parse("2026-01-01T00:00:00Z"), completedAt: Date.parse("2026-01-01T00:01:00Z") });
     expect(calls[0]!.url.pathname).toContain("/rules/branches/release%2Fone");
     expect(calls[1]!.url.pathname).toContain("/branches/release%2Fone/protection/required_status_checks");
     expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("all");
+  });
+
+  it.each([
+    ["queued", "success"], ["queued", "failure"],
+    ["in_progress", "success"], ["in_progress", "failure"],
+  ])("waits when a required rerun becomes %s after reading old runs, then settles to %s", async (status, result) => {
+    let stage: "old" | "rerun" | "settled" = "old";
+    const { fetch, calls } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "build", app_id: 7 }] });
+      if (url.pathname.endsWith("check-runs")) {
+        const check_runs = stage === "settled"
+          ? [{ ...rawRun(2), check_suite: { id: 1 }, conclusion: result }, rawRun()]
+          : [rawRun()];
+        if (stage === "old") stage = "rerun";
+        return response({ total_count: check_runs.length, check_runs });
+      }
+      if (url.pathname.endsWith("check-suites")) {
+        expect(stage).not.toBe("old");
+        return response({ total_count: 1, check_suites: [stage === "settled"
+          ? { ...rawSuite(), conclusion: result }
+          : { ...rawSuite(), status, conclusion: null }] });
+      }
+    });
+    const github = new CiGithub(fetch, TOKEN);
+    const stale = await github.snapshot(REPO, SHA, "main");
+    expect(stale.runs).toMatchObject([{ id: 1, suiteId: 1, status: "completed", conclusion: "success" }]);
+    expect(evaluateReadiness(stale, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"], failed: [], missing: [] });
+    expect(calls.filter((call) => /\/check-(runs|suites)$/.test(call.url.pathname)).map((call) => call.url.pathname.split("/").at(-1)))
+      .toEqual(["check-runs", "check-suites"]);
+    stage = "settled";
+    expect(evaluateReadiness(await github.snapshot(REPO, SHA, "main"), timing).kind).toBe(result === "success" ? "pass" : "fail");
+  });
+
+  it.each([7, 8])("does not gate required success on an unrelated pending suite from app %i", async (optionalApp) => {
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "build", app_id: 7 }] });
+      if (url.pathname.endsWith("check-runs")) return response({ total_count: 2, check_runs: [rawRun(), {
+        ...rawRun(2, "optional"), app: { id: optionalApp }, status: "in_progress", conclusion: null,
+      }] });
+      if (url.pathname.endsWith("check-suites")) return response({ total_count: 2, check_suites: [rawSuite(), {
+        ...rawSuite(2), app: { id: optionalApp }, status: "in_progress", conclusion: null,
+      }] });
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", pending: [], failed: [] });
+    actual.required = [];
+    expect(evaluateReadiness(actual, timing).kind).toBe("pending");
+  });
+
+  it.each([undefined, null])("accepts an unavailable check-suite association (%s) without inventing one", async (check_suite) => {
+    const { fetch } = fixtures((url) => url.pathname.endsWith("check-runs")
+      ? response({ total_count: 1, check_runs: [{ ...rawRun(), check_suite }] }) : undefined);
+    expect((await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).runs[0]!.suiteId).toBeNull();
+  });
+
+  it("rejects a malformed check-suite association instead of losing it", async () => {
+    const { fetch } = fixtures((url) => url.pathname.endsWith("check-runs")
+      ? response({ total_count: 1, check_runs: [{ ...rawRun(), check_suite: { id: 0 } }] }) : undefined);
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "response" });
   });
 
   it("paginates more than 100 runs, suites, and status history without a combined-status shortcut", async () => {
