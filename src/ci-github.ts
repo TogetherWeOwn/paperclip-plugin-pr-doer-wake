@@ -10,6 +10,10 @@ export type CiFetch = (url: string, init?: RequestInit) => Promise<CiHttpRespons
 export interface CiGithubOptions {
   /** Counts every attempted fetch, including 304s and failed requests, for this instance. */
   maxRequests?: number;
+  /** Synchronous caller admission gate; a refusal consumes no request or transport call. */
+  beforeRequest?: () => void;
+  /** Persist caller admission before starting the transport deadline; a failure sends no HTTP. */
+  onRequestAdmitted?: () => Promise<void>;
   maxPages?: number;
   maxCacheEntries?: number;
   maxCacheBytes?: number;
@@ -212,6 +216,11 @@ export class CiGithub {
   private readonly now: () => number;
   private requests = 0;
   private readonly cache: CiGithubCache;
+  private readonly beforeRequest: (() => void) | undefined;
+  private readonly onRequestAdmitted: (() => Promise<void>) | undefined;
+
+  /** Authoritative admitted attempts, including failed, cached and timed-out transport calls. */
+  get requestCount(): number { return this.requests; }
 
   constructor(
     private readonly fetch: PluginContext["http"]["fetch"] | CiFetch,
@@ -225,6 +234,8 @@ export class CiGithub {
     this.requestTimeoutMs = bounded(options.requestTimeoutMs, 15_000, 30_000);
     this.cache = options.cache ?? new CiGithubCache(options);
     this.now = options.now ?? Date.now;
+    this.beforeRequest = options.beforeRequest;
+    this.onRequestAdmitted = options.onRequestAdmitted;
   }
 
   async pull(repo: string, prNumber: number): Promise<CiPull> {
@@ -448,7 +459,10 @@ export class CiGithub {
   private async attempt(url: string, headers: Record<string, string>, graphqlBody?: string): Promise<CiHttpResponse | Response> {
     if (this.now() < this.cache.backoffUntil) throw new CiGithubError("backoff", undefined, this.cache.backoffUntil);
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
+    this.beforeRequest?.();
     this.requests++;
+    // Caller persistence is not a transport failure and must not trigger a conditional retry.
+    if (this.onRequestAdmitted) await this.onRequestAdmitted();
     try { return await this.deadline(() => this.fetch(url, { method: graphqlBody === undefined ? "GET" : "POST", headers, redirect: "error", ...(graphqlBody === undefined ? {} : { body: graphqlBody }) })); }
     catch (error) {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;

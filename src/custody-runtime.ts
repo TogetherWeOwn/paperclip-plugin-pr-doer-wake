@@ -53,11 +53,9 @@ export class CustodyRuntime {
     for (const receipt of Object.values(ledger.receipts)) if (receipt.status === "attempting") receipt.status = "unconfirmed";
     ledger.report = { at: this.now(), complete: false, rows: [], unknown: [], effects: 0 };
     const started = this.now();
-    let requests = 0;
     let reads = 0;
     let dispatching = false;
-    // Discovery may be incomplete, but it must leave capacity to deliver proven triggers.
-    const inventoryAvailable = () => requests < CUSTODY_LIMITS.requests - 100 && this.now() - started < CUSTODY_LIMITS.tickMs - 30_000;
+    let dispatchReceipt: Receipt | undefined;
     const guard = () => { if (++reads > CUSTODY_LIMITS.hostReads || this.now() - started >= CUSTODY_LIMITS.tickMs) throw new Error("custody_tick_budget"); };
     const audit = (operation: string, outcome: string, effectKey?: string) => {
       ledger.audits.push({ at: this.now(), operation, outcome, ...(effectKey ? { key: effectKey } : {}) });
@@ -142,12 +140,23 @@ export class CustodyRuntime {
       }
       guard();
       const token = await this.ctx.secrets.resolve(config.tokenRef, { companyId: config.companyId, configPath: "githubTokenSecretRef" });
-      const github = new CustodyGithub(async (url, init) => {
-        guard();
-        if (requests >= CUSTODY_LIMITS.requests || (!dispatching && !inventoryAvailable())) throw new Error("custody_request_budget");
-        requests++;
-        return this.ctx.http.fetch(url, init);
-      }, token, { now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100 });
+      // Reserve discovery capacity inside the client's admission gate, before its sole counter advances.
+      const inventoryAvailable = () => github.requestCount < CUSTODY_LIMITS.requests - 100 && this.now() - started < CUSTODY_LIMITS.tickMs - 30_000;
+      const github: CustodyGithub = new CustodyGithub((url, init) => this.ctx.http.fetch(url, init), token, {
+        now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100,
+        beforeRequest: () => {
+          guard();
+          if (!dispatching && !inventoryAvailable()) throw new Error("custody_request_budget");
+        },
+        onRequestAdmitted: async () => {
+          if (dispatchReceipt) {
+            const receipt = dispatchReceipt;
+            dispatchReceipt = undefined; // A conditional retry belongs to the same scheduling turn.
+            await admitDispatch(receipt);
+          }
+          guard();
+        },
+      });
       const repos = await github.repositories(config.org);
       const monitored = new Set(repos);
       for (const repo of Object.keys(ledger.activityAfter)) if (!monitored.has(repo)) delete ledger.activityAfter[repo];
@@ -292,11 +301,12 @@ export class CustodyRuntime {
         }
         if (ledger.report.effects >= CUSTODY_LIMITS.effects) { holdClosure(repo, trigger); unknown("effect_budget"); continue; }
         try {
-          // Budget-denied work keeps its place; admitted preflight rotates independently of spend().
-          if (requests >= CUSTODY_LIMITS.requests) throw new Error("custody_request_budget");
-          await admitDispatch(receipt);
+          // Only the admitted transport advances the turn; inner budget/backoff refusals keep priority.
           await this.confirmConfig(config, guard);
-          const currentPr = await github.pull(pr.repo, pr.number);
+          dispatchReceipt = receipt;
+          let currentPr;
+          try { currentPr = await github.pull(pr.repo, pr.number); }
+          finally { dispatchReceipt = undefined; }
           if (currentPr.headSha !== pr.headSha || currentPr.state !== pr.state || currentPr.merged !== pr.merged) throw new Error("pr_changed");
           guard();
           const fresh = await this.ctx.issues.get(card.id, config.companyId);

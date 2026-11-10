@@ -54,7 +54,8 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
   vi.mocked(loadCustodyCards).mockResolvedValue(cards);
   vi.spyOn(CustodyGithub.prototype, "repositories").mockResolvedValue(["example/project"]);
   const listing = vi.spyOn(CustodyGithub.prototype, "pulls").mockImplementation(async (_repo, status) => status === "open" ? options.open ?? [pull()] : options.closed ?? []);
-  vi.spyOn(CustodyGithub.prototype, "pull").mockImplementation(async (_repo, number) => {
+  vi.spyOn(CustodyGithub.prototype, "pull").mockImplementation(async function (this: any, _repo, number) {
+    await this.attempt(`https://api.github.com/repos/example/project/pulls/${number}`, {});
     const pr = [...(options.open ?? [pull()]), ...(options.closed ?? [])].find((p) => p.number === number)!;
     return { ...pr, baseBranch: "main", draft: false, mergeable: true };
   });
@@ -328,17 +329,143 @@ describe("coverage, summary and cursor controls", () => {
     }
     expect(h.ctx.issues.documents.upsert).toHaveBeenCalledTimes(1);
   });
+  it("retains a backoff-denied turn and revalidates it first after restart", async () => {
+    const h = fixture({ cards: [card({ status: "done" })], open: [pull(), pull({ number: 43 })] });
+    vi.mocked(CustodyGithub.prototype.pull).mockRestore();
+    h.activity.mockResolvedValue(NOW);
+    h.ctx.http.fetch.mockImplementation(async () => ({ status: 429, headers: { "retry-after": "60" }, body: "{}" }));
+    await h.runtime.poll();
+    const first = `example/project#42|terminal|${ISSUE}:done:2`;
+    const second = `example/project#43|terminal|${ISSUE}:done:2`;
+    expect(h.ledger().receipts[first].turn).toBe(1);
+    expect(h.ledger().receipts[second].turn).toBe(0);
+    expect(h.ctx.http.fetch).toHaveBeenCalledTimes(1);
+    h.ctx.http.fetch.mockClear();
+    // A malformed admitted response still yields, without a native effect.
+    h.ctx.http.fetch.mockResolvedValue({ status: 200, headers: {}, body: "{}" });
+    await h.restart().poll();
+    expect(h.ctx.http.fetch.mock.calls.map(([url]) => url.split("/").at(-1))).toEqual(["43", "42"]);
+    expect(h.ledger().receipts[second].turn).toBe(2);
+    expect(h.ledger().receipts[first].turn).toBe(3);
+    expect(h.ledger().report.effects).toBe(0);
+  });
+  it("yields one durable turn for a cached conditional read and its compatibility retry", async () => {
+    const h = fixture({ cards: [card({ status: "done" })] });
+    vi.mocked(CustodyGithub.prototype.pull).mockRestore();
+    h.activity.mockResolvedValue(NOW);
+    const pr = pull();
+    h.ctx.http.fetch.mockImplementation(async (_url, init) => {
+      if ((init?.headers as Record<string, string>)["If-None-Match"]) throw new TypeError("SDK cannot wrap 304");
+      return { status: 200, headers: { etag: '"v1"' }, body: JSON.stringify({
+        number: pr.number, head: { sha: pr.headSha, ref: pr.headBranch, repo: { full_name: pr.repo } },
+        base: { ref: "main", repo: { full_name: pr.repo } }, user: { login: pr.author },
+        state: "open", draft: false, merged: false, mergeable: true,
+      }) };
+    });
+    const first = `example/project#42|terminal|${ISSUE}:done:2`;
+    h.ctx.issues.list.mockResolvedValue([{ id: CHILD, companyId: COMPANY, originKind: CUSTODY_ORIGIN, originId: first }] as any);
+    h.docs.set(CHILD, { body: "x".repeat(250_000) });
+    await h.runtime.poll();
+    expect(h.ledger().receipts[first]).toMatchObject({ turn: 1, status: "pending", childId: CHILD });
+    await h.runtime.poll();
+    expect(h.ctx.http.fetch).toHaveBeenCalledTimes(3);
+    expect(h.ledger().receipts[first]).toMatchObject({ turn: 2, status: "pending" });
+    await h.restart().poll();
+    expect(h.ledger().receipts[first]).toMatchObject({ turn: 3, status: "pending" });
+    expect(h.ledger().report.effects).toBe(0);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+  });
+  it("retains production-budget-denied turns and services a healthy terminal tail across restarts", async () => {
+    const prs = Array.from({ length: 410 }, (_, i) => pull({ number: i + 1,
+      ...(i === 409 ? { headBranch: `work/${PROJECT}` } : {}) }));
+    const h = fixture({ cards: [card({ status: "done" }), card({ id: PROJECT, status: "done", updatedAt: NOW - DAY })], open: prs });
+    // Exercise real inventory, GraphQL, pull and CiGithub.attempt; only HTTP is mocked.
+    vi.restoreAllMocks();
+    const terminalKey = (number: number) => `example/project#${number}|terminal|${number === 410 ? PROJECT : ISSUE}:done:2`;
+    h.state.set(JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" }), {
+      version: 1, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions: {}, audits: [],
+      receipts: Object.fromEntries(prs.map((pr) => [terminalKey(pr.number), { at: NOW, turn: 0, status: "pending", issueId: pr.number === 410 ? PROJECT : ISSUE, ...(pr.number < 410 ? { childId: CHILD } : {}) }])),
+    });
+    h.created.push({ id: CHILD, companyId: COMPANY, status: "todo", assigneeAgentId: ISSUE });
+    h.docs.set(CHILD, { body: "x".repeat(250_000) });
+    const rawPull = (pr: CustodyPull) => ({
+      number: pr.number, state: pr.state, title: pr.title, body: pr.body,
+      user: { login: pr.author, type: "User" },
+      head: { sha: pr.headSha, ref: pr.headBranch, repo: { full_name: pr.repo } },
+      base: { ref: "main", repo: { full_name: pr.repo } },
+      created_at: new Date(pr.createdAt).toISOString(), updated_at: new Date(pr.updatedAt).toISOString(),
+      closed_at: null, merged_at: null, merged: false, draft: false, mergeable: true,
+    });
+    h.ctx.http.fetch.mockImplementation(async (input: string, init?: RequestInit) => {
+      const url = new URL(input);
+      const response = (data: unknown) => ({ status: 200, headers: {}, body: JSON.stringify(data) });
+      if (url.pathname === "/orgs/example/repos") return response([{ id: 1, full_name: "example/project", archived: false }]);
+      if (url.pathname === "/repos/example/project/pulls") {
+        const page = Number(url.searchParams.get("page"));
+        return response(url.searchParams.get("state") === "closed" ? [] : prs.slice((page - 1) * 100, page * 100).map(rawPull));
+      }
+      if (url.pathname === "/graphql") {
+        const { query, variables } = JSON.parse(init!.body as string);
+        const pr = prs[variables.number - 1]!;
+        const connection = (nodes: unknown[]) => ({ totalCount: nodes.length, nodes, pageInfo: { hasNextPage: false, endCursor: null } });
+        const commits = query.includes("checkSuites")
+          ? { totalCount: 1, nodes: [{ commit: { oid: pr.headSha, checkSuites: connection([]) } }] }
+          : connection([{ commit: { oid: pr.headSha, committedDate: new Date(pr.createdAt).toISOString() } }]);
+        return response({ data: { repository: { nameWithOwner: pr.repo, pullRequest: {
+          number: pr.number, state: "OPEN", headRefOid: pr.headSha, createdAt: new Date(pr.createdAt).toISOString(),
+          repository: { nameWithOwner: pr.repo }, ...(query.includes("reviews(") ? { reviews: connection([]) } : { commits }),
+        } } } });
+      }
+      const number = Number(url.pathname.match(/^\/repos\/example\/project\/pulls\/(\d+)$/)?.[1]);
+      if (number) return response(rawPull(prs[number - 1]!));
+      throw new Error(`Unexpected fixture URL: ${url.pathname}`);
+    });
+    const healthyChild = "eeeeeeee-0000-4000-8000-000000000001";
+    h.ctx.issues.create.mockImplementation(async (input) => {
+      const created = { ...input, id: healthyChild };
+      h.created.push(created);
+      return created;
+    });
+    const attempted = new Set<number>();
+    let turns = new Map(prs.map((pr) => [terminalKey(pr.number), 0]));
+    for (let tick = 0; tick < 5; tick++) {
+      h.ctx.http.fetch.mockClear();
+      await h.restart().poll();
+      const urls = h.ctx.http.fetch.mock.calls.map(([url]) => new URL(url));
+      // Seven inventory reads + 364 whole activities = 1099; activity 365 straddles 1100.
+      expect(urls.filter((url) => url.pathname === "/graphql")).toHaveLength(1_093);
+      expect(urls).toHaveLength(1_200);
+      const admitted = urls.flatMap((url) => {
+        const number = Number(url.pathname.match(/^\/repos\/example\/project\/pulls\/(\d+)$/)?.[1]);
+        return number ? [number] : [];
+      });
+      expect(admitted).toHaveLength(100);
+      for (const number of admitted) attempted.add(number);
+      for (const pr of prs) {
+        const receipt = h.ledger().receipts[terminalKey(pr.number)];
+        if (admitted.includes(pr.number)) expect(receipt.turn).toBeGreaterThan(turns.get(terminalKey(pr.number))!);
+        else expect(receipt.turn).toBe(turns.get(terminalKey(pr.number)));
+      }
+      turns = new Map(prs.map((pr) => [terminalKey(pr.number), h.ledger().receipts[terminalKey(pr.number)].turn]));
+      expect(h.ledger().report.effects).toBeLessThanOrEqual(1);
+      if (tick === 0) expect(h.ledger().report.effects).toBe(0);
+    }
+    expect(attempted.size).toBe(410);
+    expect(h.ledger().receipts[terminalKey(410)]).toMatchObject({ status: "woken" });
+    expect(h.ctx.issues.create).toHaveBeenCalledTimes(1);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledExactlyOnceWith(healthyChild, COMPANY, expect.objectContaining({ idempotencyKey: terminalKey(410) }));
+  });
   it("yields pre-mutation dispatch priority across request-exhausted restarts", async () => {
     const prs = Array.from({ length: 410 }, (_, i) => pull({ number: i + 1,
       ...(i === 408 ? { headBranch: `work/${PROJECT}` } : {}), authorIsBot: i === 409 }));
     const h = fixture({ cards: [card(), card({ id: PROJECT, status: "done", updatedAt: NOW - DAY })], open: prs });
     h.docs.set(ISSUE, { body: "x".repeat(250_000) });
     h.activity.mockImplementation(async function (this: any, pr) {
-      for (let i = 0; i < 3; i++) await this.fetch("https://api.github.com/graphql", { method: "POST" });
+      for (let i = 0; i < 3; i++) await this.attempt("https://api.github.com/graphql", { method: "POST" });
       return pr.number <= 300 ? NOW - 9 * DAY : NOW;
     });
     vi.mocked(CustodyGithub.prototype.pull).mockImplementation(async function (this: any, _repo, number) {
-      await this.fetch(`https://api.github.com/repos/example/project/pulls/${number}`);
+      await this.attempt(`https://api.github.com/repos/example/project/pulls/${number}`);
       return { ...prs[number - 1]!, baseBranch: "main", draft: false, mergeable: true };
     });
     h.ctx.issues.create.mockImplementation(async (input) => {
@@ -446,11 +573,11 @@ describe("coverage, summary and cursor controls", () => {
     const prs = Array.from({ length: 410 }, (_, i) => pull({ number: i + 1 }));
     const h = fixture({ open: prs });
     h.activity.mockImplementation(async function (this: any) {
-      for (let i = 0; i < 3; i++) await this.fetch("https://api.github.com/graphql", { method: "POST" });
+      for (let i = 0; i < 3; i++) await this.attempt("https://api.github.com/graphql", { method: "POST" });
       return NOW - 8 * DAY;
     });
     vi.mocked(CustodyGithub.prototype.pull).mockImplementation(async function (this: any, _repo, number) {
-      await this.fetch(`https://api.github.com/repos/example/project/pulls/${number}`);
+      await this.attempt(`https://api.github.com/repos/example/project/pulls/${number}`);
       return { ...prs.find((p) => p.number === number)!, baseBranch: "main", draft: false, mergeable: true };
     });
     await h.runtime.poll();
@@ -464,12 +591,12 @@ describe("coverage, summary and cursor controls", () => {
     const evaluated = new Set<number>();
     let time = NOW;
     h.activity.mockImplementation(async function (this: any, pr, observedAt) {
-      for (let i = 0; i < 3; i++) await this.fetch("https://api.github.com/graphql", { method: "POST" });
+      for (let i = 0; i < 3; i++) await this.attempt("https://api.github.com/graphql", { method: "POST" });
       evaluated.add(pr.number);
       return pr.number === 410 ? observedAt! : time;
     });
     vi.mocked(CustodyGithub.prototype.pull).mockImplementation(async function (this: any, _repo, number) {
-      await this.fetch(`https://api.github.com/repos/example/project/pulls/${number}`);
+      await this.attempt(`https://api.github.com/repos/example/project/pulls/${number}`);
       return { ...prs.find((p) => p.number === number)!, baseBranch: "main", draft: false, mergeable: true };
     });
     for (let tick = 0; tick < 4; tick++) {
