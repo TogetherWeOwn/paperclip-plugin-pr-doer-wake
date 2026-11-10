@@ -40,6 +40,14 @@ describe("stock manifest and config contract", () => {
     expect(validateCiConfig({ ...enabled, webhooksEnabled: true, webhookSecretRef: ref })).toEqual([]);
   });
 
+  it("accepts custody fields alongside either authentication mode in the combined configuration", () => {
+    const app = { enabled: true, allowedRepos: ["example/project"], githubAppId: "123", githubInstallationId: "456", githubAppPrivateKeySecretRef: ref };
+    expect(validateCiConfig({ ...enabled, custodyEnabled: false })).toEqual([]);
+    expect(validateCiConfig({ ...enabled, custodyEnabled: false, custodyDryRun: true })).toEqual([]);
+    expect(validateCiConfig({ ...app, custodyEnabled: false })).toEqual([]);
+    expect(validateCiConfig({ ...enabled, custodyEnabled: false, custodyTypo: true }).length).toBeGreaterThan(0);
+  });
+
   it("accepts App secret-picker fields and rejects partial or ambiguous authentication at both validation layers", () => {
     const app = { enabled: true, allowedRepos: ["example/project"], githubAppId: "123", githubInstallationId: "456", githubAppPrivateKeySecretRef: ref };
     expect(validateInstanceConfig(app, manifest.instanceConfigSchema!).valid).toBe(true);

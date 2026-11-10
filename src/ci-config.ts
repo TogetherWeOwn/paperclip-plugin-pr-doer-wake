@@ -57,7 +57,10 @@ export function parseCiConfig(raw: Record<string, unknown>): CiConfig {
 export function validateCiConfig(raw: Record<string, unknown>): string[] {
   const config = parseCiConfig(raw);
   const errors: string[] = [];
-  const keys = ["enabled", "dryRun", "allowedRepos", "githubTokenSecretRef", "githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef", "webhooksEnabled", "webhookSecretRef", "repoMedianMs"];
+  // The manifest's combined instance config also declares the custody keys
+  // validated by custody-config; the CI validator must recognize them here
+  // (without validating them) so shared configs are not rejected as unknown.
+  const keys = ["enabled", "dryRun", "allowedRepos", "githubTokenSecretRef", "githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef", "webhooksEnabled", "webhookSecretRef", "repoMedianMs", "custodyEnabled", "custodyDryRun", "custodyCompanyId", "custodyOrg", "custodySummaryAgentId", "custodyClosedSince"];
   if (Object.keys(raw).some((key) => !keys.includes(key))) errors.push("unknown configuration field");
   const bearer = Object.hasOwn(raw, "githubTokenSecretRef");
   const app = ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"].some((key) => Object.hasOwn(raw, key));
