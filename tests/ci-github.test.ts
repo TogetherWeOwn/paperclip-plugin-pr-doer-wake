@@ -822,6 +822,51 @@ describe("CiGithub caching, backoff, and caps", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it.each([false, true])("backs off secondary and unclassified 403s without primary exhaustion (Response=%s)", async (native) => {
+    for (const body of [
+      JSON.stringify({ message: "You have exceeded a secondary rate limit." }),
+      JSON.stringify({ message: "Unknown denial" }), "not JSON", "", "null",
+      JSON.stringify({ message: TOKEN }),
+      JSON.stringify({ message: "Resource not accessible by integration", padding: "x".repeat(2000) }),
+    ]) {
+      let now = 10_000;
+      const cache = new CiGithubCache();
+      const headers = { "x-ratelimit-remaining": "4999", "x-ratelimit-reset": "1000" };
+      const fetch = vi.fn(async () => native ? new Response(body, { status: 403, headers }) : { status: 403, headers, body });
+      const options = { cache, now: () => now, maxBodyBytes: 1024 };
+      await expect(new CiGithub(fetch, TOKEN, options).pull(REPO, 1)).rejects.toMatchObject({ code: "http", status: 403, retryAt: 70_000 });
+      now = 69_999;
+      await expect(new CiGithub(fetch, TOKEN, options).pull(REPO, 2)).rejects.toMatchObject({ code: "backoff", retryAt: 70_000 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      now = 70_000;
+      expect((await new CiGithub(fixtures().fetch, TOKEN, options).pull(REPO, 2)).number).toBe(2);
+    }
+  });
+
+  it.each([false, true])("exempts only known permission messages, without suppressing throttle headers (Response=%s)", async (native) => {
+    for (const message of ["Resource not accessible by integration", "Resource not accessible by personal access token"]) {
+      for (const rateHeaders of [{}, { "retry-after": "5" }, { "x-ratelimit-remaining": "0" }]) {
+        const headers = { ...rateHeaders } as Record<string, string>;
+        const cache = new CiGithubCache();
+        const body = JSON.stringify({ message });
+        const fetch: CiFetch = async () => native ? new Response(body, { status: 403, headers }) : { status: 403, headers, body };
+        await expect(new CiGithub(fetch, TOKEN, { cache, now: () => 10_000 }).pull(REPO, 1)).rejects.toMatchObject({ code: "http", status: 403 });
+        expect(cache.backoffUntil).toBe(headers["retry-after"] ? 15_000 : headers["x-ratelimit-remaining"] ? 70_000 : 0);
+      }
+    }
+  });
+
+  it("backs off when a 403 body cannot be read within the existing deadline", async () => {
+    const cache = new CiGithubCache();
+    const denied = new Response("", { status: 403 });
+    denied.text = () => new Promise<string>(() => {});
+    const fetch = vi.fn(async () => denied);
+    const options = { cache, now: () => 10_000, requestTimeoutMs: 1 };
+    await expect(new CiGithub(fetch, TOKEN, options).pull(REPO, 1)).rejects.toMatchObject({ code: "http", status: 403, retryAt: 70_000 });
+    await expect(new CiGithub(fetch, TOKEN, options).pull(REPO, 2)).rejects.toMatchObject({ code: "backoff", retryAt: 70_000 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("honors exhausted quota on successful responses and Retry-After on 503", async () => {
     for (const status of [200, 503]) {
       let calls = 0;

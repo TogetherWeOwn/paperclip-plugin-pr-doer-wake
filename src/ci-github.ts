@@ -399,7 +399,19 @@ export class CiGithub {
     throw new CiGithubError("pages");
   }
 
-  private rateLimit(status: number, headers: Record<string, string> | Headers): void {
+  private async permissionDenied(response: CiHttpResponse | Response): Promise<boolean> {
+    if (response.status !== 403) return false;
+    try {
+      const body = typeof response.body === "string" ? response.body : await this.deadline(() => (response as Response).text());
+      if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > this.maxBodyBytes) return false;
+      const message = object(this.parse(body)).message;
+      // Only positive permission evidence exempts a 403 from conservative backoff.
+      // Never retain, return or log the error body, including unknown throttle text.
+      return message === "Resource not accessible by integration" || message === "Resource not accessible by personal access token";
+    } catch { return false; }
+  }
+
+  private rateLimit(status: number, headers: Record<string, string> | Headers, permissionDenied = false): void {
     const now = this.now();
     const retry = header(headers, "retry-after");
     const remaining = header(headers, "x-ratelimit-remaining");
@@ -414,7 +426,7 @@ export class CiGithub {
       const parsed = Number(reset) * 1000;
       if (Number.isFinite(parsed)) until = Math.max(until, parsed);
     }
-    if ((status === 429 || (status === 403 && retry !== undefined)) && until <= now) until = now + 60_000;
+    if ((status === 429 || (status === 403 && (!permissionDenied || retry !== undefined))) && until <= now) until = now + 60_000;
     if (remaining === "0" && until <= now) until = now + 60_000;
     this.cache.backoffUntil = Math.max(this.cache.backoffUntil, until);
   }
@@ -469,7 +481,7 @@ export class CiGithub {
     // Also fail closed if an SDK/host ignores RequestInit.redirect and follows a redirect.
     if ("redirected" in response && response.redirected) return invalid();
     if ("url" in response && response.url && response.url !== url) return invalid();
-    this.rateLimit(response.status, response.headers);
+    this.rateLimit(response.status, response.headers, await this.permissionDenied(response));
     if (response.status === 304) {
       if (!cached || unconditionalRetry) return invalid();
       return { data: this.parse(cached.body), link: cached.link };
