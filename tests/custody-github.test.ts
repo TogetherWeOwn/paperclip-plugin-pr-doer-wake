@@ -487,6 +487,21 @@ describe("CustodyGithub head seeding", () => {
     expect(await pendingOnly.client.seedHead(pr())).toBeNull();
   });
 
+  it("ignores a pending review with no commit instead of rejecting the seed", async () => {
+    // GitHub returns commit: null for PENDING reviews. That must not fail
+    // the whole reviews connection (and with it the seed, leaving the head
+    // unstaged/UNKNOWN forever); a pending review is simply not evidence.
+    const mixed = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([
+        { id: "p1", state: "PENDING", submittedAt: null, commit: null },
+        review("r1", RECENT),
+      ]))) : undefined);
+    expect(await mixed.client.seedHead(pr())).toBe(Date.parse(RECENT));
+    const pendingOnly = fixtures((_url, init) => String(init?.body).includes("reviews(")
+      ? response(graphql("reviews", connection([{ id: "p1", state: "PENDING", submittedAt: null, commit: null }]))) : undefined);
+    expect(await pendingOnly.client.seedHead(pr())).toBeNull();
+  });
+
   it("requires the head commit and refuses closed PRs", async () => {
     const wrongHead = fixtures((_url, init) => String(init?.body).includes("checkSuites(")
       ? response(graphql("checkSuites", connection([suite()]), {}, 2)) : undefined);

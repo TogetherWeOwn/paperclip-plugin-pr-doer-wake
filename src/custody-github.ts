@@ -167,7 +167,10 @@ export class CustodyGithub extends CiGithub {
       if (!["PENDING", "APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"].includes(text(review.state))) return invalid();
       const at = review.state === "PENDING" ? nullableTimestamp(review.submittedAt) : timestamp(review.submittedAt);
       if (review.state === "PENDING" && at !== null) return invalid();
-      return { key: text(review.id), value: { at, oid: sha(object(review.commit).oid) } };
+      // PENDING reviews carry commit: null; that is not seed evidence, not
+      // a malformed response. A null oid never matches headSha below.
+      const oid = review.commit === null || review.commit === undefined ? null : sha(object(review.commit).oid);
+      return { key: text(review.id), value: { at, oid } };
     });
     const suites = await this.connection(pr, "checkSuites", (value) => {
       const suite = object(value);
