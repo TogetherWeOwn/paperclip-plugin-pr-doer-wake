@@ -21,7 +21,7 @@ interface Ledger {
   attempted: Record<string, number>;
   activityAfter: Record<string, number>;
   dispatchSequence: number;
-  heads: Record<string, { sha: string; at: number | null; provenance?: "seeded" | "warmup" }>;
+  heads: Record<string, { sha: string; at: number | null; provenance?: "seeded" | "warmup"; floor?: number }>;
   dispositions: Record<string, number>;
   audits: Audit[];
   report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number };
@@ -246,10 +246,26 @@ export class CustodyRuntime {
                   // from that SHA would shorten the seven-day warmup into
                   // an early wake, so the legacy timestamp is preserved as
                   // a lower bound and only newer evidence replaces it.
+                  // When the intervening tick has no evidence, idle
+                  // activity must stay UNKNOWN (at=null) without erasing
+                  // that bound: the legacy timestamp is parked in `floor`
+                  // and only enforced when evidence later arrives. A null
+                  // tick must never discard a live warmup floor, or stale
+                  // evidence on the next tick would bypass it.
                   const seeded = await github.seedHead(pr);
                   if (seeded === null) {
+                    if (head.at !== null && !head.provenance) head.floor = head.at;
                     head.at = null;
                     delete head.provenance;
+                  } else if (head.at === null && head.floor !== undefined) {
+                    if (seeded >= head.floor) {
+                      head.at = seeded;
+                      head.provenance = "seeded";
+                    } else {
+                      head.at = head.floor;
+                      head.provenance = "warmup";
+                    }
+                    delete head.floor;
                   } else if (head.at === null || seeded >= head.at) {
                     head.at = seeded;
                     head.provenance = "seeded";
