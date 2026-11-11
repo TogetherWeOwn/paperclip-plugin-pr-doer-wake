@@ -1035,6 +1035,22 @@ describe("CiGithub caching, backoff, and caps", () => {
     expect(detail.length).toBeLessThanOrEqual("unclassified token_exchange exchange_class=suspended exchange_msg=".length + 160);
   });
 
+  it("classifies a token-exchange refusal keyword past the display truncation point", async () => {
+    const message = "A".repeat(170) + " suspended";
+    const fetch: CiFetch = async () => response({ message }, 403);
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).detail).toBe(`unclassified token_exchange exchange_class=suspended exchange_msg=${"A".repeat(160)}`);
+  });
+
+  it("prefers the specific ip_policy over generic enterprise_policy on an overlap message", async () => {
+    const message = "This enterprise has a policy that blocks this installation because its IP address is not in the allow list";
+    const fetch: CiFetch = async () => response({ message }, 403);
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).detail).toBe("unclassified token_exchange exchange_class=ip_policy exchange_msg=This_enterprise_has_a_policy_that_blocks_this_installation_because_its_IP_address_is_not_in_the_allow_list");
+  });
+
   it("never emits an enterprise-policy message from a non-exchange endpoint", async () => {
     const fetch = vi.fn(async () => response({ message: "This enterprise has a policy that blocks this installation" }, 403));
     const error = await new CiGithub(fetch, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);

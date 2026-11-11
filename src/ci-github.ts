@@ -197,11 +197,11 @@ function exchangeDetail(message: string | undefined, path: string): string[] {
   const clean = message.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").replace(/\s+/g, " ").trim();
   if (!clean || clean.length > 1024 || SECRET_SHAPE.test(clean)) return [];
   const truncated = clean.length > EXCHANGE_MESSAGE_MAX ? clean.slice(0, EXCHANGE_MESSAGE_MAX).trimEnd() : clean;
-  const lower = truncated.toLowerCase();
+  const lower = clean.toLowerCase();
   const kind = lower.includes("suspended") ? "suspended"
-    : lower.includes("enterprise") ? "enterprise_policy"
     : lower.includes("ip address") || lower.includes("allow list") || lower.includes("allowlist") ? "ip_policy"
     : lower.includes("saml") || lower.includes("single sign-on") || /\bsso\b/.test(lower) ? "sso_policy"
+    : lower.includes("enterprise") ? "enterprise_policy"
     : lower.includes("resource not accessible") ? "permission"
     : lower.includes("rate limit") ? "rate_limit"
     : lower.includes("bad credentials") ? "bad_credentials"
