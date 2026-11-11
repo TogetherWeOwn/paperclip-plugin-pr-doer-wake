@@ -535,6 +535,17 @@ describe("CI runtime registration authorization", () => {
     expect(JSON.stringify(result)).not.toContain(TOKEN);
   });
 
+  it("carries the classified token-exchange message into the github_http reason and audit detail", async () => {
+    const { CiGithubError } = await import("../src/ci-github.js");
+    const h = setup();
+    github.pull.mockRejectedValue(new CiGithubError("http", 403, undefined, "unclassified token_exchange exchange_class=suspended exchange_msg=This_installation_has_been_suspended"));
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ data: { code: "github_http" } });
+    expect(result.content).toContain("HTTP 403 (unclassified token_exchange exchange_class=suspended exchange_msg=This_installation_has_been_suspended)");
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "github_http", detail: "status=403 unclassified token_exchange exchange_class=suspended exchange_msg=This_installation_has_been_suspended" });
+    expect(JSON.stringify(result)).not.toContain(TOKEN);
+  });
+
   it("maps GitHub client failures to github_<code> without leaking upstream detail", async () => {
     const { CiGithubError } = await import("../src/ci-github.js");
     const h = setup();

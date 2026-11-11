@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   CiGithub, CiGithubCache, CiGithubError, evaluateReadiness,
   type CiCheckRun, type CiCheckSuite, type CiFetch, type CiHttpResponse, type CiSnapshot,
+  type CiTokenExchange, type CiTokenSource,
 } from "../src/ci-github.js";
 
 const REPO = "acme/widgets";
@@ -972,6 +973,90 @@ describe("CiGithub caching, backoff, and caps", () => {
     expect((error as CiGithubError).message).toBe(`GitHub CI http (403) ${detail}`);
     expect((error as CiGithubError).message).not.toContain(TOKEN);
     expect((error as CiGithubError).message).not.toContain(REPO);
+  });
+
+  // An App-mode token source that always mints through the client's own
+  // exchange callback, so the inner access_tokens request carries the fetch's
+  // response. The caller supplies the fetch (403 message, headers, native
+  // Response variant); the JWT is a fixture, never emitted.
+  function failingExchangeSource(): CiTokenSource {
+    return {
+      token: async (_path: string, exchange: CiTokenExchange) => {
+        await exchange("1234567890", "jwt-fixture", { repositories: ["widgets"], permissions: {} });
+        return "should-not-be-reached";
+      },
+      invalidate: () => {},
+    };
+  }
+
+  it.each([
+    ["This installation has been suspended", "unclassified token_exchange exchange_class=suspended exchange_msg=This_installation_has_been_suspended"],
+    ["This enterprise has a policy that blocks this installation", "unclassified token_exchange exchange_class=enterprise_policy exchange_msg=This_enterprise_has_a_policy_that_blocks_this_installation"],
+    ["Your IP address is not in the allow list for this installation", "unclassified token_exchange exchange_class=ip_policy exchange_msg=Your_IP_address_is_not_in_the_allow_list_for_this_installation"],
+    ["This installation requires SAML SSO authentication", "unclassified token_exchange exchange_class=sso_policy exchange_msg=This_installation_requires_SAML_SSO_authentication"],
+    ["Resource not accessible by integration", "permission token_exchange exchange_class=permission exchange_msg=Resource_not_accessible_by_integration"],
+    ["You have exceeded a rate limit", "unclassified token_exchange exchange_class=rate_limit exchange_msg=You_have_exceeded_a_rate_limit"],
+    ["Bad credentials", "unclassified token_exchange exchange_class=bad_credentials exchange_msg=Bad_credentials"],
+    ["Some other refusal", "unclassified token_exchange exchange_class=unknown exchange_msg=Some_other_refusal"],
+  ] as const)("classifies the token-exchange 403 message (%s)", async (message, detail) => {
+    const fetch: CiFetch = async () => response({ message }, 403);
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).status).toBe(403);
+    expect((error as CiGithubError).detail).toBe(detail);
+    expect((error as CiGithubError).message).not.toContain(TOKEN);
+    expect((error as CiGithubError).message).not.toContain("jwt-fixture");
+  });
+
+  it("reads the token-exchange 403 message from a native Response body once", async () => {
+    const fetch: CiFetch = async () => new Response(JSON.stringify({ message: "This installation has been suspended" }), { status: 403 });
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).detail).toBe("unclassified token_exchange exchange_class=suspended exchange_msg=This_installation_has_been_suspended");
+  });
+
+  it("drops a credential-shaped token-exchange message and keeps rate-limit evidence", async () => {
+    const fetch: CiFetch = async () => response({ message: TOKEN }, 403, { "x-ratelimit-remaining": "4999" });
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect((error as CiGithubError).detail).toBe("unclassified token_exchange rl-remaining=4999");
+    expect((error as CiGithubError).message).not.toContain(TOKEN);
+    expect((error as CiGithubError).message).not.toContain("exchange_msg");
+  });
+
+  it("collapses control characters and truncates the token-exchange message to one bounded token", async () => {
+    const message = "This installation has been\n\tsuspended " + "x".repeat(300);
+    const fetch: CiFetch = async () => response({ message }, 403);
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    const detail = (error as CiGithubError).detail!;
+    expect(detail).toContain("exchange_class=suspended");
+    expect(detail).not.toContain("\n");
+    expect(detail).not.toContain("\t");
+    expect(detail).not.toContain("\r");
+    expect(detail.length).toBeLessThanOrEqual("unclassified token_exchange exchange_class=suspended exchange_msg=".length + 160);
+  });
+
+  it("classifies a token-exchange refusal keyword past the display truncation point", async () => {
+    const message = "A".repeat(170) + " suspended";
+    const fetch: CiFetch = async () => response({ message }, 403);
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).detail).toBe(`unclassified token_exchange exchange_class=suspended exchange_msg=${"A".repeat(160)}`);
+  });
+
+  it("prefers the specific ip_policy over generic enterprise_policy on an overlap message", async () => {
+    const message = "This enterprise has a policy that blocks this installation because its IP address is not in the allow list";
+    const fetch: CiFetch = async () => response({ message }, 403);
+    const error = await new CiGithub(fetch, failingExchangeSource(), { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).detail).toBe("unclassified token_exchange exchange_class=ip_policy exchange_msg=This_enterprise_has_a_policy_that_blocks_this_installation_because_its_IP_address_is_not_in_the_allow_list");
+  });
+
+  it("never emits an enterprise-policy message from a non-exchange endpoint", async () => {
+    const fetch = vi.fn(async () => response({ message: "This enterprise has a policy that blocks this installation" }, 403));
+    const error = await new CiGithub(fetch, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect((error as CiGithubError).detail).toBe("unclassified repo_pulls");
+    expect((error as CiGithubError).message).not.toContain("exchange_class");
+    expect((error as CiGithubError).message).not.toContain("enterprise");
   });
 
   it("names throttled endpoints for 429 and leaves other statuses bare", async () => {

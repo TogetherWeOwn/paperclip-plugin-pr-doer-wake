@@ -107,7 +107,12 @@ export interface CiReadiness {
   missingFailAt: number | null;
 }
 export type CiGithubErrorCode = "input" | "auth" | "http" | "network" | "response" | "budget" | "pages" | "backoff" | "timeout";
-/** Deliberately contains neither response bodies, request headers, tokens, nor upstream errors. */
+/**
+ * Deliberately contains neither response bodies, request headers, tokens, nor upstream errors.
+ * The one exception: on a token_exchange refusal, `detail` may carry the exchange endpoint's
+ * fixed GitHub refusal message (see exchangeDetail) — bounded, sanitized, credential-shaped
+ * text refused, never the raw body.
+ */
 export class CiGithubError extends Error {
   constructor(
     public readonly code: CiGithubErrorCode,
@@ -129,6 +134,12 @@ export class CiGithubError extends Error {
  * when it matches a strict shape. Bounded and secret-free: no bodies, no
  * other headers, no tokens. The rate-limit values separate a refused token
  * exchange from an installation rate limit when both answer 403.
+ * For token_exchange 403s only, the endpoint's fixed GitHub refusal message
+ * is also classified and emitted (exchangeDetail): both App consumers
+ * (ci-wake, custody) die at that mint with an identical 403, and the
+ * message — suspended installation vs enterprise/IP/SSO policy vs permission
+ * — is the only decider. It is sanitized to one bounded token, credential
+ * shapes are refused, and no other endpoint's body text is ever emitted.
  * This is the ci-wake twin of the custody diagnostic in PR #19 (TWO-5961):
  * the same templates and shape so registration/poll 403s name their source
  * (token_exchange vs repo_pulls/rules/protection/checks/statuses/actions)
@@ -173,7 +184,31 @@ function rateLimitDetail(headers: Record<string, string> | Headers): string[] {
   }
   return parts;
 }
-function refusalDetail(status: number, permissionDenied: boolean, path: string, headers: Record<string, string> | Headers): string {
+// A token-exchange refusal is the one place a GitHub error `message` leaves the
+// client: a single bounded token plus a fixed class, never the raw body, other
+// JSON fields, or anything credential-shaped. The token Exchange response is a
+// fixed GitHub string (installation suspended, enterprise/IP/SSO policy message,
+// or a permission/rate-limit note); it carries no secret material, but the text is
+// still treated as untrusted: control/format characters collapse to one space, the
+// result is truncated, and SECRET_SHAPE hits drop the message entirely.
+const EXCHANGE_MESSAGE_MAX = 160;
+function exchangeDetail(message: string | undefined, path: string): string[] {
+  if (message === undefined || endpointTemplate(path) !== "token_exchange") return [];
+  const clean = message.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").replace(/\s+/g, " ").trim();
+  if (!clean || clean.length > 1024 || SECRET_SHAPE.test(clean)) return [];
+  const truncated = clean.length > EXCHANGE_MESSAGE_MAX ? clean.slice(0, EXCHANGE_MESSAGE_MAX).trimEnd() : clean;
+  const lower = clean.toLowerCase();
+  const kind = lower.includes("suspended") ? "suspended"
+    : lower.includes("ip address") || lower.includes("allow list") || lower.includes("allowlist") ? "ip_policy"
+    : lower.includes("saml") || lower.includes("single sign-on") || /\bsso\b/.test(lower) ? "sso_policy"
+    : lower.includes("enterprise") ? "enterprise_policy"
+    : lower.includes("resource not accessible") ? "permission"
+    : lower.includes("rate limit") ? "rate_limit"
+    : lower.includes("bad credentials") ? "bad_credentials"
+    : "unknown";
+  return [`exchange_class=${kind}`, `exchange_msg=${truncated.replace(/ /g, "_")}`];
+}
+function refusalDetail(status: number, permissionDenied: boolean, path: string, headers: Record<string, string> | Headers, message?: string): string {
   const kind = status === 429 ? "throttle" : permissionDenied ? "permission" : "unclassified";
   const base = `${kind} ${endpointTemplate(path)}`;
   const suffix: string[] = [];
@@ -184,6 +219,7 @@ function refusalDetail(status: number, permissionDenied: boolean, path: string, 
       const needs = raw.split(";")[0]!.replace(/\s+/g, "");
       if (needs.length <= 128 && NEEDS_PATTERN.test(needs)) suffix.push(`needs=${needs}`);
     }
+    suffix.push(...exchangeDetail(message, path));
   }
   suffix.push(...rateLimitDetail(headers));
   return suffix.length ? `${base} ${suffix.join(" ")}` : base;
@@ -523,16 +559,21 @@ export class CiGithub {
     throw new CiGithubError("pages");
   }
 
-  private async permissionDenied(response: CiHttpResponse | Response): Promise<boolean> {
-    if (response.status !== 403) return false;
+  private async parseErrorBody(response: CiHttpResponse | Response): Promise<{ permissionDenied: boolean; message: string | undefined }> {
+    if (response.status !== 403) return { permissionDenied: false, message: undefined };
     try {
       const body = typeof response.body === "string" ? response.body : await this.deadline(() => (response as Response).text());
-      if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > this.maxBodyBytes) return false;
+      if (typeof body !== "string" || Buffer.byteLength(body, "utf8") > this.maxBodyBytes) return { permissionDenied: false, message: undefined };
       const message = object(this.parse(body)).message;
       // Only positive permission evidence exempts a 403 from conservative backoff.
-      // Never retain, return or log the error body, including unknown throttle text.
-      return message === "Resource not accessible by integration" || message === "Resource not accessible by personal access token";
-    } catch { return false; }
+      // Never retain, return or log the error body, including unknown throttle text:
+      // the single `message` string is the only text that leaves this method, and
+      // only the token_exchange diagnostic ever emits it (see exchangeDetail).
+      return {
+        permissionDenied: message === "Resource not accessible by integration" || message === "Resource not accessible by personal access token",
+        message: typeof message === "string" ? message : undefined,
+      };
+    } catch { return { permissionDenied: false, message: undefined }; }
   }
 
   private rateLimit(status: number, headers: Record<string, string> | Headers, permissionDenied = false): void {
@@ -627,7 +668,8 @@ export class CiGithub {
     // Also fail closed if an SDK/host ignores RequestInit.redirect and follows a redirect.
     if ("redirected" in response && response.redirected) return invalid();
     if ("url" in response && response.url && response.url !== url) return invalid();
-    const denied = await this.permissionDenied(response);
+    const parsedError = await this.parseErrorBody(response);
+    const denied = parsedError.permissionDenied;
     this.rateLimit(response.status, response.headers, denied);
     if (response.status === 304) {
       if (!cached || unconditionalRetry) return invalid();
@@ -638,7 +680,7 @@ export class CiGithub {
     if (!(exchange ? response.status === 201 : statusBody !== undefined ? response.status === 200 || response.status === 201 : response.status === 200)) {
       if (!exchange && response.status === 401 && typeof this.#credential !== "string") this.#credential.invalidate();
       const detail = response.status === 403 || response.status === 429
-        ? refusalDetail(response.status, denied, path, response.headers)
+        ? refusalDetail(response.status, denied, path, response.headers, parsedError.message)
         : undefined;
       throw new CiGithubError("http", response.status, this.cache.backoffUntil > this.now() ? this.cache.backoffUntil : undefined, detail);
     }
