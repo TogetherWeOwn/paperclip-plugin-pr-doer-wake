@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { CUSTODY_READ_LIMITS, loadCustodyCards } from "../src/custody-reader.js";
+import { CUSTODY_READ_LIMITS, loadCustodyCards, loadCustodyTexts, parseWorkProductBindings } from "../src/custody-reader.js";
+
+// Full evidence for a candidate set: metadata for the company, then
+// comments/documents for the selected cards only (TWO-5928 scale fix).
+async function loadAll(ctx: PluginContext, guard: () => void) {
+  const cards = await loadCustodyCards(ctx, COMPANY, guard); // helper keeps metadata phase
+  return loadCustodyTexts(ctx, COMPANY, guard, cards);
+}
 
 type Row = Record<string, unknown>;
 const uuid = (n: number) => `00000000-0000-0000-0000-${n.toString(16).padStart(12, "0")}`;
@@ -99,7 +106,7 @@ describe("loadCustodyCards", () => {
       comments: [comment(), comment(2, { company_id: OTHER }), comment(3, { issue_id: uuid(2) })],
       documents: [document(), document(2, { company_id: OTHER }), document(3, { issue_id: uuid(2) })],
     });
-    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    const result = await loadAll(h.ctx,  h.guard);
     expect(result).toEqual([{
       id: uuid(1), companyId: COMPANY, projectId: uuid(90_003), identifier: "TASK-1",
       title: "Fix https://github.com/acme/widgets/pull/7", description: "Implementation owner",
@@ -128,7 +135,7 @@ describe("loadCustodyCards", () => {
       status, origin_kind: origins[i], project_id: null, identifier: null, description: null,
       completed_at: status === "done" ? AT : null, cancelled_at: status === "cancelled" ? AT : null,
     })) });
-    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    const result = await loadAll(h.ctx,  h.guard);
     expect(result.map((c) => c.status)).toEqual(statuses);
     expect(result.every((c) => c.projectId === null && c.identifier === null)).toBe(true);
     expect(result.find((c) => c.status === "done")?.completedAt).toBe(MS);
@@ -143,13 +150,13 @@ describe("loadCustodyCards", () => {
       card(5, { conversation_agent_id: AGENT, conversation_user_id: "human", conversation_state: "active" }),
       card(6, { origin_kind: "plugin:other:operation" }),
     ] });
-    expect((await loadCustodyCards(h.ctx, COMPANY, h.guard)).map((c) => c.id)).toEqual([uuid(6)]);
+    expect((await loadAll(h.ctx,  h.guard)).map((c) => c.id)).toEqual([uuid(6)]);
     for (const [, params] of h.query.mock.calls.slice(1)) expect(params?.[3]).toBe(`{${uuid(6)}}`);
   });
 
   it("excludes the generated document key before fetching its body", async () => {
     const h = host({ documents: [document(1, { key: "pr-custody" }), document(2)] });
-    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    const result = await loadAll(h.ctx,  h.guard);
     expect(h.get).toHaveBeenCalledExactlyOnceWith(uuid(1), "plan-2", COMPANY);
     expect(result[0]!.texts).toHaveLength(3);
   });
@@ -163,7 +170,7 @@ describe("loadCustodyCards", () => {
       comment(5, { body: "system", author_type: "system" }),
       comment(6, { body: "ambiguous", author_user_id: "human" }),
     ] });
-    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    const result = await loadAll(h.ctx,  h.guard);
     expect(result[0]!.texts.slice(2).map(({ body, ownership }) => ({ body, ownership }))).toEqual([
       { body: "agent", ownership: true }, { body: "human", ownership: false },
       { body: "legacy-agent", ownership: true }, { body: "system", ownership: false },
@@ -177,7 +184,7 @@ describe("loadCustodyCards", () => {
       comments: Array.from({ length: 201 }, (_, i) => comment(i + 1)),
       documents: Array.from({ length: 201 }, (_, i) => document(i + 1)),
     });
-    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    const result = await loadAll(h.ctx,  h.guard);
     expect(result).toHaveLength(201);
     expect(result[0]!.texts).toHaveLength(404);
     const calls = h.query.mock.calls;
@@ -190,7 +197,7 @@ describe("loadCustodyCards", () => {
   it("allows an exactly-at-cap card view only after an exhaustion probe", async () => {
     const count = CUSTODY_READ_LIMITS.cards;
     const h = host({ cards: Array.from({ length: count }, (_, i) => card(i + 1, { description: null })) });
-    expect(await loadCustodyCards(h.ctx, COMPANY, h.guard)).toHaveLength(count);
+    expect(await loadAll(h.ctx,  h.guard)).toHaveLength(count); // metadata-only at-cap view
     const issueCalls = h.query.mock.calls.filter(([sql]) => sql.includes("FROM public.issues\n"));
     expect(issueCalls).toHaveLength(count / 200 + 1);
     expect(issueCalls.at(-1)?.[1]).toEqual([COMPANY, uuid(count), 1]);
@@ -202,7 +209,7 @@ describe("loadCustodyCards", () => {
     ["documents", CUSTODY_READ_LIMITS.documents + 1, document, "issue_documents"],
   ] as const)("rejects %s cap exhaustion rather than returning a partial view", async (key, count, make, table) => {
     const h = host({ [key]: Array.from({ length: count }, (_, i) => make(i + 1)) });
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow(`UNKNOWN custody snapshot: ${table} row budget exceeded`);
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow(`UNKNOWN custody snapshot: ${table} row budget exceeded`);
     expect(h.get).not.toHaveBeenCalled();
     const relevant = h.query.mock.calls.filter(([sql]) => sql.includes(`FROM public.${table}\n`));
     expect(relevant.length).toBeLessThanOrEqual(Math.ceil(count / 200) + 1);
@@ -213,7 +220,7 @@ describe("loadCustodyCards", () => {
     if (table !== "issues") h.query.mockResolvedValueOnce([card()]);
     if (table === "issue_documents") h.query.mockResolvedValueOnce([]);
     h.query.mockResolvedValueOnce([{ ...(table === "issues" ? card() : table === "issue_comments" ? comment() : document()), company_id: OTHER }]);
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("cross-company");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("cross-company");
     expect(h.get).not.toHaveBeenCalled();
   });
 
@@ -223,21 +230,21 @@ describe("loadCustodyCards", () => {
     if (table === "issue_documents") h.query.mockResolvedValueOnce([]);
     const row = table === "issues" ? card() : table === "issue_comments" ? comment() : document();
     h.query.mockResolvedValueOnce([row, row]);
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("duplicate or unordered");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate or unordered");
   });
 
   it("rejects duplicate IDs across page boundaries", async () => {
     const h = host();
     h.query.mockResolvedValueOnce(Array.from({ length: 200 }, (_, i) => card(i + 1)));
     h.query.mockResolvedValueOnce([card(200)]);
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("duplicate or unordered");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate or unordered");
   });
 
   it.each([
     [document(2, { key: "plan-1" })], [document(2, { document_id: uuid(100_001) })],
   ])("rejects duplicate document identity metadata", async (duplicate) => {
     const h = host({ documents: [document(), duplicate] });
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("duplicate document metadata");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate document metadata");
     expect(h.get).not.toHaveBeenCalled();
   });
 
@@ -246,7 +253,7 @@ describe("loadCustodyCards", () => {
     h.query.mockResolvedValueOnce([card()]);
     if (table === "issue_documents") h.query.mockResolvedValueOnce([]);
     h.query.mockResolvedValueOnce([table === "issue_comments" ? comment(1, { issue_id: uuid(99) }) : document(1, { issue_id: uuid(99) })]);
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("unexpected issue");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("unexpected issue");
   });
 
   it.each([
@@ -255,13 +262,13 @@ describe("loadCustodyCards", () => {
   ])("rejects malformed or identity-mismatched document bodies: %j", async (patch) => {
     const h = host({ documents: [document()] });
     h.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "body", updatedAt: AT, ...patch });
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
   it("rejects a document disappearing between metadata and body reads", async () => {
     const h = host({ documents: [document()] });
     h.get.mockResolvedValueOnce(null);
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
   it.each([
@@ -271,18 +278,18 @@ describe("loadCustodyCards", () => {
     { assignee_agent_id: "invalid" }, { project_id: undefined }, { origin_kind: null },
   ])("rejects malformed card data: %j", async (patch) => {
     const h = host({ cards: [card(1, patch)] });
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
   it("accepts a numeric status version without deriving it from mutable timestamps", async () => {
     const h = host({ cards: [card(1, { status_version: 0, updated_at: new Date(AT) })] });
-    expect((await loadCustodyCards(h.ctx, COMPANY, h.guard))[0]!.statusVersion).toBe(0);
+    expect((await loadAll(h.ctx,  h.guard))[0]!.statusVersion).toBe(0);
   });
 
   it.each([null, {}, [null], Array.from({ length: 201 }, (_, i) => card(i + 1))])("rejects malformed host page responses", async (page) => {
     const h = host();
     h.query.mockResolvedValueOnce(page as Row[]);
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
   it.each([
@@ -290,22 +297,22 @@ describe("loadCustodyCards", () => {
     ["description", "界".repeat(90_000)],
   ])("rejects %s character or UTF-8 body budgets", async (field, body) => {
     const h = host({ cards: [card(1, { [field]: body })] });
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
   it("rejects oversized comments and document bodies without truncating them", async () => {
     const comments = host({ comments: [comment(1, { body: "a".repeat(128_001) })] });
-    await expect(loadCustodyCards(comments.ctx, COMPANY, comments.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadAll(comments.ctx,  comments.guard)).rejects.toThrow("UNKNOWN custody snapshot");
     const docs = host({ documents: [document()] });
     docs.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "界".repeat(90_000), updatedAt: AT });
-    await expect(loadCustodyCards(docs.ctx, COMPANY, docs.guard)).rejects.toThrow("body budget");
+    await expect(loadAll(docs.ctx,  docs.guard)).rejects.toThrow("body budget");
   });
 
   it("rejects aggregate evidence bytes during pagination", async () => {
     const body = "a".repeat(128_000);
     const count = Math.floor(CUSTODY_READ_LIMITS.totalBytes / body.length) + 1;
     const h = host({ comments: Array.from({ length: count }, (_, i) => comment(i + 1, { body })) });
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("total byte budget");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("total byte budget");
     // Reject while consuming the page crossing the byte budget.
     expect(h.query).toHaveBeenCalledTimes(1 + Math.ceil(count / 200));
   });
@@ -314,19 +321,19 @@ describe("loadCustodyCards", () => {
     const h = host({ documents: [document()] });
     let count = 0;
     h.guard.mockImplementation(() => { if (++count === stopAt) throw new Error("lease expired"); });
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("lease expired");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("lease expired");
     expect(h.query.mock.calls.length + h.get.mock.calls.length).toBe(stopAt - 1);
   });
 
   it("propagates host errors rather than returning cards already collected", async () => {
     const h = host({ documents: [document()] });
     h.get.mockRejectedValueOnce(new Error("SDK read failed"));
-    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard)).rejects.toThrow("SDK read failed");
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("SDK read failed");
   });
 
   it("returns an empty view without evidence RPCs when no cards remain", async () => {
     const h = host({ cards: [card(1, { origin_kind: OWN })] });
-    expect(await loadCustodyCards(h.ctx, COMPANY, h.guard)).toEqual([]);
+    expect(await loadAll(h.ctx,  h.guard)).toEqual([]);
     expect(h.query).toHaveBeenCalledTimes(1);
     expect(h.get).not.toHaveBeenCalled();
   });
@@ -336,5 +343,39 @@ describe("loadCustodyCards", () => {
     await expect(loadCustodyCards(h.ctx, "invalid", h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
     expect(h.guard).not.toHaveBeenCalled();
     expect(h.query).not.toHaveBeenCalled();
+  });
+
+  it("reads card metadata only, never company-wide comments or documents (TWO-5928)", async () => {
+    const h = host({ comments: [comment()], documents: [document()] });
+    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    expect(result[0]!.texts.map((t) => t.id)).toEqual(["title", "description"]);
+    expect(h.query).toHaveBeenCalledTimes(1);
+    expect(h.query.mock.calls[0]![0]).toContain("FROM public.issues");
+    expect(h.get).not.toHaveBeenCalled();
+  });
+
+  it("loads texts only for the selected candidate cards, with no RPCs for an empty set", async () => {
+    const h = host({ cards: [card(1), card(2)], comments: [comment(1), comment(2, { issue_id: uuid(2) })] });
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    expect(await loadCustodyTexts(h.ctx, COMPANY, h.guard, [])).toEqual([]);
+    const selected = await loadCustodyTexts(h.ctx, COMPANY, h.guard, [cards[0]!]);
+    expect(selected[0]!.texts.map((t) => t.id)).toContain(`comment:${uuid(1)}`);
+    expect(selected[0]!.texts.map((t) => t.id)).not.toContain(`comment:${uuid(2)}`);
+    const textQueries = h.query.mock.calls.filter(([, params]) => Array.isArray(params) && params.length === 4);
+    expect(textQueries.length).toBeGreaterThan(0);
+    for (const [, params] of textQueries) expect(params![3]).toBe(`{${uuid(1)}}`);
+  });
+
+  it("parses only explicit GitHub pull-request work-product bindings", () => {
+    expect(parseWorkProductBindings(undefined)).toEqual([]);
+    expect(parseWorkProductBindings(null)).toEqual([]);
+    expect(parseWorkProductBindings("nope")).toEqual([]);
+    const parsed = parseWorkProductBindings([
+      { type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 } },
+      { type: "branch", provider: "github", url: null, metadata: null },
+      { type: "pull_request", provider: "vercel", url: "x", metadata: null },
+      null, "junk", 42,
+    ]);
+    expect(parsed).toEqual([{ type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 } }]);
   });
 });

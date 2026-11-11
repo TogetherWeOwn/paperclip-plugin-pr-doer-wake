@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { CustodyPull } from "../src/custody-github.js";
 import { CustodyGithub } from "../src/custody-github.js";
-import { loadCustodyCards, type CustodyCard } from "../src/custody-reader.js";
+import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
 import { CUSTODY_ORIGIN, DAY } from "../src/custody-policy.js";
-vi.mock("../src/custody-reader.js", () => ({ loadCustodyCards: vi.fn() }));
+vi.mock("../src/custody-reader.js", () => ({ loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : [] }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const ISSUE = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -52,6 +52,7 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
     },
   };
   vi.mocked(loadCustodyCards).mockResolvedValue(cards);
+  vi.mocked(loadCustodyTexts).mockImplementation(async (_ctx: unknown, _company: string, _guard: () => void, selected: CustodyCard[]) => selected);
   vi.spyOn(CustodyGithub.prototype, "repositories").mockResolvedValue(["example/project"]);
   const listing = vi.spyOn(CustodyGithub.prototype, "pulls").mockImplementation(async (_repo, status) => status === "open" ? options.open ?? [pull()] : options.closed ?? []);
   vi.spyOn(CustodyGithub.prototype, "pull").mockImplementation(async function (this: any, _repo, number) {
@@ -69,7 +70,7 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
   const ledger = () => [...state.entries()].find(([key]) => key.includes("pr-custody-v1"))?.[1];
   return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => { const next = new CustodyRuntime(ctx as unknown as PluginContext, () => now); next.setCustodyCompanyId(COMPANY); return next; } };
 }
-afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); });
+afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); vi.mocked(loadCustodyTexts).mockReset(); });
 
 describe("custody native effects", () => {
   it("saves evidence and wakes assigned open card with exactly the trigger key, once across restart", async () => {
@@ -271,13 +272,22 @@ describe("custody native effects", () => {
 });
 
 describe("coverage, summary and cursor controls", () => {
-  it("records UNKNOWN, never absence, if the card snapshot fails", async () => {
+  it("surfaces UNKNOWN as a failed job run with the reason recorded, never silent success", async () => {
     const h = fixture();
     vi.mocked(loadCustodyCards).mockRejectedValue(new Error("incomplete"));
-    await h.runtime.poll();
-    expect(h.ledger().report).toMatchObject({ complete: false, unknown: ["inventory"] });
+    await expect(h.runtime.poll()).rejects.toThrow("incomplete");
+    expect(h.ledger().report).toMatchObject({ complete: false, unknown: ["inventory"], failure: "incomplete" });
     expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+  it("loads comment/document evidence only for PR-mapped candidates, bounded by PR count", async () => {
+    const h = fixture();
+    await h.runtime.poll();
+    expect(loadCustodyTexts).toHaveBeenCalledTimes(1);
+    const selected = vi.mocked(loadCustodyTexts).mock.calls[0]![3];
+    expect(selected.map((c) => c.id)).toEqual([ISSUE]);
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
   });
   it("reports denied open activity UNKNOWN without pinning unrelated closure coverage", async () => {
     const h = fixture({ cards: [card({ status: "done" })] });
@@ -857,10 +867,13 @@ describe("coverage, summary and cursor controls", () => {
       }
       return set(key, value);
     });
-    await h.restart().poll();
+    // The archive failure surfaces as a failed run (never silent success)
+    // and must not evict the hot tombstone it failed to archive.
+    await expect(h.restart().poll()).rejects.toThrow("archive reply failed");
     expect(Object.keys(h.ledger().receipts)).toHaveLength(20_000);
     expect(h.ledger().receipts[`example/project#42|idle|${NOW - 8 * DAY}`].status).toBe("woken");
     expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.failure).toBe("archive reply failed");
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
   it("coalesces overlapping scheduled callbacks", async () => {

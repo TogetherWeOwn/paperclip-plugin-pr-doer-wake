@@ -28,6 +28,15 @@ export default definePlugin({
     // retargets the already-registered job instead of splitting it from the
     // runtime that onConfigChanged mutates.
     ctx.jobs.register("pr-custody", async () => readyCustody().poll());
+    // Keep the bounded PR->card index fresh between scheduled ticks. The
+    // scheduled job remains the reconciler; events only accelerate it.
+    const custodyEvent = async (event: { companyId: string; entityId?: string; eventType: string }) => readyCustody().onCustodyEvent(event);
+    ctx.events.on("issue.created", custodyEvent);
+    ctx.events.on("issue.updated", custodyEvent);
+    ctx.events.on("issue.comment.created", custodyEvent);
+    ctx.events.on("issue.document.created", custodyEvent);
+    ctx.events.on("issue.document.updated", custodyEvent);
+    ctx.events.on("issue.relations.updated", custodyEvent);
     ctx.tools.register(registrationTool.name, registrationTool, (params, run) => ready().register(params, run));
     ctx.jobs.register("ci-wake-poll", async () => ready().poll());
     ctx.logger.info("ci-wake ready; explicit registration only");

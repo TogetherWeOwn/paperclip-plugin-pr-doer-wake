@@ -6,7 +6,7 @@ import { workspaceRepo, UUID } from "./ci-config.js";
 import { parseCustodyConfig, type CustodyConfig } from "./custody-config.js";
 import { CustodyAppAuth } from "./custody-auth.js";
 import { CustodyGithub, type CustodyPull } from "./custody-github.js";
-import { loadCustodyCards, type CustodyCard } from "./custody-reader.js";
+import { loadCustodyCards, loadCustodyTexts, parseWorkProductBindings, type CustodyCard } from "./custody-reader.js";
 import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prReference, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
 
 export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000 } as const;
@@ -23,10 +23,15 @@ interface Ledger {
   dispatchSequence: number;
   heads: Record<string, { sha: string; at: number | null; provenance?: "seeded" | "warmup"; floor?: number }>;
   dispositions: Record<string, number>;
+  // Bounded incremental index: PR reference -> mapped card id. Rebuilt from
+  // explicit tiers each tick and kept fresh between ticks by native event
+  // subscriptions (see onCustodyEvent). It bounds work-product enrichment
+  // and candidate text loads to PR count, not company history size.
+  prToCards: Record<string, string>;
   audits: Audit[];
-  report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number };
+  report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number; failure?: string };
 }
-const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions: {}, audits: [], report: { at: now, complete: false, rows: [], unknown: [], effects: 0 } });
+const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions: {}, prToCards: {}, audits: [], report: { at: now, complete: false, rows: [], unknown: [], effects: 0 } });
 
 /** One host-managed worker; coalesce overlapping hourly/manual runs. No registration or LLM tool surface. */
 export class CustodyRuntime {
@@ -48,6 +53,41 @@ export class CustodyRuntime {
     this.running = true;
     try { await this.tick(); }
     finally { this.running = false; }
+  }
+
+  /**
+   * Keep the bounded PR->card index fresh between scheduled ticks from
+   * native issue events. Best-effort and self-healing: the next tick
+   * rebuilds prToCards from explicit tiers for every inventoried PR, so a
+   * lost or racy event update can only stale the index, never corrupt it.
+   * Events for other companies are ignored; the handler never reads config
+   * or secrets and never dispatches wakes.
+   */
+  async onCustodyEvent(event: { companyId?: string; entityId?: string; eventType?: string }): Promise<void> {
+    const companyId = this.custodyCompanyId;
+    const cardId = event.entityId;
+    if (!companyId || !cardId || !UUID.test(cardId)) return;
+    if (event.companyId && event.companyId.toLowerCase() !== companyId.toLowerCase()) return;
+    try {
+      const raw = await this.ctx.config.get(companyId);
+      const config = parseCustodyConfig(raw);
+      if (!config || config.companyId.toLowerCase() !== companyId.toLowerCase()) return;
+      const key = { scopeKind: "company" as const, scopeId: config.companyId, namespace: "pr-custody-v1", stateKey: `${config.org}:${config.dryRun ? "dry" : "live"}` };
+      const stored = await this.ctx.state.get(key) as Ledger | null;
+      if (!stored || stored.version !== 1) return;
+      const fresh = await this.ctx.issues.get(cardId, config.companyId);
+      if (!fresh || fresh.companyId !== config.companyId) return;
+      const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
+      for (const binding of bindings) {
+        if (!binding.url) continue;
+        const match = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/i.exec(binding.url);
+        if (!match) continue;
+        const ref = `${match[1]}/${match[2]}#${Number(match[3])}`;
+        stored.prToCards ??= {};
+        stored.prToCards[ref] = cardId;
+      }
+      await this.ctx.state.set(key, stored);
+    } catch { /* Best-effort freshness only; the scheduled tick reconciles. */ }
   }
 
   private async tick(): Promise<void> {
@@ -74,6 +114,7 @@ export class CustodyRuntime {
     if (stored && (stored.version !== 1 || !stored.receipts || !stored.cursors || !stored.attempted || !stored.heads || !stored.dispositions || !Array.isArray(stored.audits))) throw new Error("invalid_custody_ledger");
     const ledger = stored ?? empty(this.now());
     ledger.activityAfter ??= {};
+    ledger.prToCards ??= {};
     ledger.dispatchSequence ??= 0;
     for (const receipt of Object.values(ledger.receipts)) if (receipt.status === "attempting") receipt.status = "unconfirmed";
     ledger.report = { at: this.now(), complete: false, rows: [], unknown: [], effects: 0 };
@@ -200,7 +241,12 @@ export class CustodyRuntime {
       const summaryClosures = new Set<string>();
       const holdClosure = (repo: string, trigger: Trigger) => { if (trigger.kind === "closed") scanned.delete(repo); };
       const holdSummaryClosures = () => { for (const repo of summaryClosures) scanned.delete(repo); };
-      for (const repo of repos.sort((a, b) => (ledger.attempted[a] ?? 0) - (ledger.attempted[b] ?? 0))) {
+      // Phase A: GitHub-first inventory. Collect open+closed PRs per repo
+      // before any card evidence is loaded, so candidate discovery is bounded
+      // by PR count (CUSTODY_LIMITS.prs), never by company card history.
+      const sortedRepos = repos.sort((a, b) => (ledger.attempted[a] ?? 0) - (ledger.attempted[b] ?? 0));
+      const inventories = new Map<string, { open: CustodyPull[]; closed: CustodyPull[]; until: number }>();
+      for (const repo of sortedRepos) {
         try {
           if (!inventoryAvailable()) throw new Error("inventory_budget");
           ledger.attempted[repo] = this.now();
@@ -209,6 +255,44 @@ export class CustodyRuntime {
           const open = await github.pulls(repo, "open");
           const closed = await github.pulls(repo, "closed", ledger.cursors[repo] ?? config.closedSince);
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
+          inventories.set(repo, { open, closed, until });
+        } catch { unknown(repo); }
+      }
+      // Phase B: explicit-tier mapping over metadata only, then bounded
+      // evidence loads for mapped candidates only.
+      const cardsById = new Map(cards.map((c) => [c.id, c]));
+      // Enrich work-product bindings for index-known cards only (bounded by
+      // PR count). New bindings also arrive between ticks via event
+      // subscriptions that maintain prToCards; a failed enrichment leaves
+      // that card without the work_product tier (conservative unmapped).
+      for (const cardId of new Set(Object.values(ledger.prToCards))) {
+        const card = cardsById.get(cardId);
+        if (!card) continue;
+        try {
+          guard();
+          const fresh = await this.ctx.issues.get(cardId, config.companyId);
+          if (fresh && fresh.companyId === config.companyId) card.workProducts = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
+        } catch { unknown(`work_product:${cardId}`); }
+      }
+      const candidates = new Map<string, CustodyCard>();
+      const seenPrs = new Set<string>();
+      for (const [, inv] of inventories) {
+        for (const pr of [...inv.open, ...inv.closed]) {
+          seenPrs.add(prReference(pr));
+          const mapping = mapCustodyCard(pr, cards, registrations, reposByProject, config.companyId);
+          if (mapping.card) {
+            candidates.set(mapping.card.id, mapping.card);
+            ledger.prToCards[prReference(pr)] = mapping.card.id;
+          }
+        }
+      }
+      for (const ref of Object.keys(ledger.prToCards)) if (!seenPrs.has(ref)) delete ledger.prToCards[ref];
+      if (candidates.size) await loadCustodyTexts(this.ctx, config.companyId, guard, [...candidates.values()]);
+      for (const repo of sortedRepos) {
+        try {
+          const inv = inventories.get(repo);
+          if (!inv) continue;
+          const { open, closed, until } = inv;
           // A complete open snapshot proves absence. A reopened PR is
           // re-observed as a first observation and seeded from head-bound
           // evidence, so an already-idle reopened PR can trigger on discovery.
@@ -427,10 +511,15 @@ export class CustodyRuntime {
       ledger.report.complete = ledger.report.unknown.length === 0;
       audit("inventory", ledger.report.complete ? "complete" : "unknown");
       await save();
-    } catch {
+    } catch (error) {
+      // Surface the reason as a failed job run, never as silent success
+      // (TWO-5928): record it in the ledger report, persist best-effort,
+      // then rethrow so the scheduler records this run as failed.
       unknown("inventory");
+      ledger.report.failure = error instanceof Error ? error.message : String(error);
       audit("inventory", "unknown");
-      await save();
+      try { await save(); } catch { /* The rethrown error is the failure signal. */ }
+      throw error;
     }
     this.ctx.logger.info("pr-custody: inventory", { complete: ledger.report.complete, prs: ledger.report.rows.length, unknown: ledger.report.unknown.length, effects: ledger.report.effects, dryRun: config.dryRun });
   }

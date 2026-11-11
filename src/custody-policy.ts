@@ -14,7 +14,7 @@ export interface CustodyRegistration {
    */
   branchVerified?: boolean;
 }
-export interface Mapping { card: CustodyCard | null; source: "registration" | "workspace" | "url" | "identifier" | "unmapped"; candidates: string[] }
+export interface Mapping { card: CustodyCard | null; source: "registration" | "workspace" | "work_product" | "url" | "identifier" | "unmapped"; candidates: string[] }
 export interface Disposition { at: number; action: string; revisit: number | null }
 export interface Trigger { key: string; kind: "idle" | "terminal" | "closed"; epoch: string; at: number }
 
@@ -51,7 +51,26 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   const branchId = /^work\/([0-9a-f-]{36})$/i.exec(pr.headBranch)?.[1];
   const workspace = sameRepo && branchId && UUID.test(branchId) ? pick("workspace", eligible.filter((c) => c.id.toLowerCase() === branchId.toLowerCase() && projectMatches(c))) : null;
   if (workspace) return workspace;
-  const url = pick("url", eligible.filter((c) => c.texts.some((t) => t.ownership && containsPrUrl(t.body, pr))));
+  // Explicit native work-product PR bindings (host-supplied issue_work_products
+  // via Issue.workProducts). Revalidated exactly: GitHub provider, URL token,
+  // and metadata repo/number must all agree with this PR. Malformed or
+  // mismatched bindings are ignored at this tier, never trusted.
+  const workProduct = pick("work_product", eligible.filter((c) => (c.workProducts ?? []).some((w) => {
+    if (w.type !== "pull_request" || w.provider !== "github") return false;
+    if (w.url && !containsPrUrl(w.url, pr)) return false;
+    const meta = w.metadata;
+    if (meta && (typeof meta.repo === "string" || typeof meta.number === "number")) {
+      if (typeof meta.repo === "string" && meta.repo.toLowerCase() !== pr.repo.toLowerCase()) return false;
+      if (typeof meta.number === "number" && meta.number !== pr.number) return false;
+    }
+    return !!w.url || !!meta;
+  })));
+  if (workProduct) return workProduct;
+  // URL tier is title/description only. Comment/document URL claims would
+  // require the full-company history scan (TWO-5928) to prove unique/absent;
+  // comments/documents are read only for already-mapped cards (dispositions
+  // and closure rationale), never as an ownership discovery tier.
+  const url = pick("url", eligible.filter((c) => c.texts.some((t) => t.ownership && (t.id === "title" || t.id === "description") && containsPrUrl(t.body, pr))));
   if (url) return url;
   const identifier = /^([A-Z][A-Z0-9]*-\d+)(?:[-/]|$)/i.exec(pr.headBranch)?.[1]?.toLowerCase();
   const tracker = sameRepo && identifier ? pick("identifier", eligible.filter((c) => c.identifier?.toLowerCase() === identifier && projectMatches(c))) : null;

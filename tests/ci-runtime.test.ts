@@ -188,7 +188,8 @@ describe("native CI plugin entrypoint", () => {
     const h = setup();
     const registerTool = vi.fn<PluginContext["tools"]["register"]>();
     const registerJob = vi.fn<PluginContext["jobs"]["register"]>();
-    Object.assign(h.ctx, { tools: { register: registerTool }, jobs: { register: registerJob } });
+    const subscribeEvent = vi.fn<PluginContext["events"]["on"]>();
+    Object.assign(h.ctx, { tools: { register: registerTool }, jobs: { register: registerJob }, events: { on: subscribeEvent } });
     const clock = vi.spyOn(Date, "now").mockImplementation(h.clock);
     try {
       await ciPlugin.definition.setup(h.ctx);
@@ -242,7 +243,7 @@ describe("native CI plugin entrypoint", () => {
       "agent.tools.register", "execution.workspaces.read", "http.outbound", "issues.checkout", "issues.read", "issues.wakeup",
       "jobs.schedule", "plugin.state.read", "plugin.state.write", "secrets.read-ref", "webhooks.receive",
       "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
-      "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
+      "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate", "events.subscribe",
     ].sort());
     expect(manifest.tools).toEqual([registrationTool]);
     expect(registrationTool.parametersSchema).toMatchObject({ additionalProperties: false, required: ["issueId", "repo", "prNumber", "headSha"] });
