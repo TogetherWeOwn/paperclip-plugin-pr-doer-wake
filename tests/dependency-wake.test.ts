@@ -1,6 +1,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
-import { DependencyWakeRuntime, validateDependencyWakeConfig, type DependencyWakeLedger } from "../src/dependency-wake.js";
+import { DEPENDENCY_WAKE_LIMITS, DependencyWakeRuntime, validateDependencyWakeConfig, type DependencyWakeLedger } from "../src/dependency-wake.js";
 import { validateCiConfig } from "../src/ci-config.js";
 import manifest from "../src/manifest.js";
 import { validateInstanceConfig } from "./fixtures/host-config-validator.js";
@@ -46,8 +46,10 @@ function harness() {
   };
   const runtime = new DependencyWakeRuntime(ctx as unknown as PluginContext, () => START);
   runtime.setCompanyId(COMPANY);
-  const ledger = (mode = "live") => state.get(JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "dependency-wake-v1", stateKey: mode })) as DependencyWakeLedger | undefined;
-  return { ctx, runtime, issues, relations, runs, budgetBlocks, ledger, setConfig: (next: Record<string, unknown>) => { config = next; } };
+  const stateKey = (mode: string) => JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "dependency-wake-v1", stateKey: mode });
+  const ledger = (mode = "live") => state.get(stateKey(mode)) as DependencyWakeLedger | undefined;
+  const seed = (next: DependencyWakeLedger, mode = "live") => { state.set(stateKey(mode), structuredClone(next)); };
+  return { ctx, runtime, issues, relations, runs, budgetBlocks, ledger, seed, setConfig: (next: Record<string, unknown>) => { config = next; } };
 }
 
 describe("dependency wake", () => {
@@ -102,7 +104,7 @@ describe("dependency wake", () => {
     ["no agent assignee", (h) => { h.issues[DEP]!.assigneeAgentId = null; }],
     ["dependent holds an active execution run", (h) => { h.issues[DEP]!.activeRun = { id: "x", status: "running" }; }],
     ["dependent has a queued run", (h) => { h.runs[DEP]!.push({ id: "r2", issueId: DEP, status: "queued", createdAt: iso(START - MIN), startedAt: null, finishedAt: null }); }],
-    ["dependent ran after the blocker finished", (h) => { h.runs[DEP]![0]!.finishedAt = iso(START - 20 * MIN); }],
+    ["dependent started a run after the blocker finished", (h) => { Object.assign(h.runs[DEP]![0]!, { startedAt: iso(START - 25 * MIN), finishedAt: iso(START - 20 * MIN) }); }],
     ["blocker still has a live run (finalize pending)", (h) => { h.runs[BLK] = [{ id: "b1", issueId: BLK, status: "running", createdAt: iso(START - 40 * MIN), startedAt: iso(START - 40 * MIN), finishedAt: null }]; }],
     ["budget invocation block", (h) => { h.budgetBlocks.push({ issueId: DEP, agentId: AGENT }); }],
     ["dependent not in a covered status", (h) => { h.issues[DEP]!.status = "todo"; }],
@@ -119,6 +121,42 @@ describe("dependency wake", () => {
     const h = harness();
     // Host cancels a queued run on reassignment with startedAt=null; it never saw the blocker's completion.
     h.runs[DEP]!.push({ id: "r2", issueId: DEP, status: "cancelled", createdAt: iso(START - 40 * MIN), startedAt: null, finishedAt: iso(START - 20 * MIN) });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("wakes when the dependent's last run started before the blocker finished, even if it ended after", async () => {
+    const h = harness();
+    // The run was built before the blocker finished and had no completion signal from it.
+    h.runs[DEP]![0]!.finishedAt = iso(START - 20 * MIN);
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  // Receipts for other dependents whose blockers are still inside the lookback (newer than DEP's).
+  const heldReceipts = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`${filler(i)}:${BLK2}`, { at: START - MIN, outcome: "woken" as const, blockerDoneAt: START - 5 * MIN }]));
+
+  it("never evicts a still-relevant receipt at the cap, so a wake whose run never started is not repeated", async () => {
+    const h = harness();
+    h.seed({ version: 1, audits: [], receipts: { [`${DEP}:${BLK}`]: { at: START - 25 * MIN, outcome: "woken", blockerDoneAt: START - 30 * MIN, runId: "run-new" }, ...heldReceipts(DEPENDENCY_WAKE_LIMITS.receipts) } });
+    // The queued wake was cancelled before it started, so it sets no run watermark.
+    h.runs[DEP]!.push({ id: "run-new", issueId: DEP, status: "cancelled", createdAt: iso(START - 25 * MIN), startedAt: null, finishedAt: iso(START - 24 * MIN) });
+    for (let n = 0; n < 3; n += 1) await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.receipts[`${DEP}:${BLK}`]?.outcome).toBe("woken");
+  });
+
+  it("fails closed when still-relevant receipts fill the cap, and evicts stale ones first", async () => {
+    const h = harness();
+    h.seed({ version: 1, audits: [], receipts: heldReceipts(DEPENDENCY_WAKE_LIMITS.receipts) });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.lastTick).toMatchObject({ complete: false, wakes: 0 });
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("receipt_capacity");
+    // Receipts whose blocker left the lookback no longer dedupe anything and make room.
+    const stale = heldReceipts(DEPENDENCY_WAKE_LIMITS.receipts);
+    for (const r of Object.values(stale)) r.blockerDoneAt = START - 8 * 1_440 * MIN;
+    h.seed({ ...h.ledger()!, receipts: stale });
     await h.runtime.poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });

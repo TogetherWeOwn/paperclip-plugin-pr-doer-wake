@@ -14,17 +14,19 @@ import { retryableBeforeQueue } from "./native-wake.js";
 export const DEPENDENCY_WAKE_LIMITS = {
   graceMs: 600_000, lookbackMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000,
   maxPerStatus: 1_000, hostReads: 800, wakesPerTick: 10, tickMs: 120_000, audits: 500,
-  // Storage bound, not a dedupe horizon. It is below the worst-case live rate over
-  // the lookback (10 wakes per 5-minute tick), but eviction drops the oldest key
-  // first, and an evicted key re-fires only if the dependent still has not started
-  // a run since its blocker finished (the run watermark below), which a queued
-  // wake makes unlikely; the host idempotency key is also stable per blocker set.
+  // Storage bound. A receipt whose blocker is still inside the lookback is the
+  // dedupe record and is never evicted; when such receipts fill the cap the job
+  // fails closed (no new effect, tick incomplete) instead of risking a repeat.
+  // This is below the worst-case live rate over the lookback (10 wakes per
+  // 5-minute tick, about 20,000), deliberately: one company finishing 5,000
+  // (dependent, blocker) pairs in 7 days is far beyond a normal workload, and the
+  // excess is deferred and reported rather than lost or repeated.
   receipts: 5_000,
 } as const;
 const L = DEPENDENCY_WAKE_LIMITS;
 const STATUSES = ["in_review", "in_progress"] as const;
 const LIVE = new Set(["queued", "running"]);
-const STOPS = ["tick_budget", "wake_budget", "wake_intent_write_failed", "configuration_changed"];
+const STOPS = ["tick_budget", "wake_budget", "receipt_capacity", "wake_intent_write_failed", "configuration_changed"];
 
 export interface DependencyWakeConfig { enabled: boolean; shadow: boolean; companyId: string | null }
 export function parseDependencyWakeConfig(raw: Record<string, unknown>): DependencyWakeConfig {
@@ -54,6 +56,8 @@ interface Tick {
 }
 type Blocker = { id: string; identifier: string | null; status: string };
 const time = (value: unknown): number => (value == null ? NaN : new Date(value as string).getTime());
+/** A receipt still dedupes while its blocker is inside the lookback; after that the blocker is never fresh again. */
+const relevant = (r: Receipt, now: number) => r.blockerDoneAt >= now - L.lookbackMs;
 
 export class DependencyWakeRuntime {
   private companyId: string | null = null;
@@ -125,10 +129,13 @@ export class DependencyWakeRuntime {
       delete ledger.cursor;
       tick.report.complete = !capped && start === 0;
     } catch (error) {
-      tick.audit(error instanceof Error && ["tick_budget", "wake_budget", "configuration_changed"].includes(error.message) ? error.message : "tick_error");
+      tick.audit(error instanceof Error && ["tick_budget", "wake_budget", "receipt_capacity", "configuration_changed"].includes(error.message) ? error.message : "tick_error");
     } finally {
-      const cutoff = this.now() - L.retentionMs;
-      ledger.receipts = Object.fromEntries(Object.entries(ledger.receipts).filter(([, r]) => r.at >= cutoff).sort((a, b) => b[1].at - a[1].at).slice(0, L.receipts));
+      // Still-relevant receipts are kept whatever their number; only stale ones are evicted, oldest first.
+      const now = this.now();
+      const kept = Object.entries(ledger.receipts).filter(([, r]) => relevant(r, now));
+      const stale = Object.entries(ledger.receipts).filter(([, r]) => !relevant(r, now) && r.at >= now - L.retentionMs).sort((a, b) => b[1].at - a[1].at);
+      ledger.receipts = Object.fromEntries([...kept, ...stale.slice(0, Math.max(0, L.receipts - kept.length))]);
       ledger.lastTick = tick.report;
       await this.ctx.state.set(key, ledger);
     }
@@ -164,14 +171,17 @@ export class DependencyWakeRuntime {
     if (!fresh.length) return;
     const dependent = await this.liveRun(tick, issue.id);
     if (dependent.live || dependent.budgetBlocked) return;
-    // A run that never started (e.g. queued, then cancelled on reassignment) saw nothing: no watermark.
-    const lastRun = Math.max(-Infinity, ...dependent.runs.filter((run) => run.startedAt != null).map((run) => time(run.finishedAt ?? run.startedAt)).filter(Number.isFinite));
-    // Only blockers that finished after the dependent last ran; an earlier one was already seen by that run.
+    // Watermark on start only: a run that started before a blocker finished was built without
+    // that completion, even if it ended after it; a run that never started saw nothing at all.
+    const lastRun = Math.max(-Infinity, ...dependent.runs.map((run) => time(run.startedAt)).filter(Number.isFinite));
+    // Only blockers that finished after the dependent's last run started; an earlier one was seen by that run.
     const triggers = fresh.filter((b) => doneAt.get(b.id)! > lastRun);
     if (!triggers.length) return;
     // A done blocker with a live run may still be finalizing its workspace: wait for it.
     for (const b of triggers) if ((await this.liveRun(tick, b.id)).live) return;
     report.eligible += 1;
+    // Fail closed rather than evict a dedupe record: resume at this candidate once old receipts age out.
+    if (Object.values(ledger.receipts).filter((r) => relevant(r, now)).length + triggers.length > L.receipts) throw new Error("receipt_capacity");
     const record = (outcome: Outcome, runId?: string | null) => {
       for (const b of triggers) ledger.receipts[`${issue.id}:${b.id}`] = { at: this.now(), outcome, blockerDoneAt: doneAt.get(b.id)!, ...(runId !== undefined ? { runId } : {}) };
     };
