@@ -275,14 +275,33 @@ describe("CI registration and configuration parsing", () => {
   it.each([
     null, [], "https://github.com/acme/widget/pull/17", {},
     { ...registration, body: "CARD-123" }, { ...registration, branch: BRANCH },
-    { ...registration, issueId: "CARD-123" }, { ...registration, repo: "https://github.com/acme/widget" },
+    { ...registration, issueId: "CARD-123" },
     { ...registration, repo: "acme/." }, { ...registration, repo: "acme/.." },
     { ...registration, repo: "acme/widget?token=secret" }, { ...registration, headSha: "abc1234" },
-    { ...registration, headSha: HEAD.toUpperCase() }, { ...registration, prNumber: "17" },
-    { ...registration, prNumber: 0 }, { ...registration, prNumber: 1.5 },
-    { ...registration, prNumber: 2_147_483_648 },
+    { ...registration, prNumber: 0 }, { ...registration, prNumber: 1.5 }, { ...registration, prNumber: "abc" },
+    { ...registration, prNumber: "17.5" }, { ...registration, prNumber: 2_147_483_648 },
   ])("refuses malformed or non-explicit registrations (%j)", (input) => {
     expect(() => parseRegistration(input)).toThrow("invalid_registration");
+  });
+
+  it("normalizes unambiguous agent variants (SHA case, digit-string PR number, repo URL)", () => {
+    expect(parseRegistration({ ...registration, headSha: HEAD.toUpperCase() })).toEqual(registration);
+    expect(parseRegistration({ ...registration, prNumber: "17" })).toEqual(registration);
+    expect(parseRegistration({ ...registration, repo: "https://github.com/acme/widget" })).toEqual(registration);
+    expect(parseRegistration({ ...registration, repo: "https://github.com/acme/widget.git" })).toEqual(registration);
+    expect(parseRegistration({ ...registration, repo: "git@github.com:acme/widget.git" })).toEqual(registration);
+    expect(() => parseRegistration({ ...registration, repo: "https://github.com/acme/widget/pull/17" })).toThrow("invalid_registration");
+  });
+
+  it("names field shapes without values in invalid-registration diagnostics", () => {
+    let caught: unknown;
+    try { parseRegistration({ ...registration, headSha: "abc1234", extra: "CARD-123" }); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ message: "invalid_registration" });
+    const shape = (caught as { shape: string[] }).shape.join(",");
+    expect(shape).toContain("extra:extra");
+    expect(shape).toContain("headSha:length=7");
+    expect(JSON.stringify(caught)).not.toContain("CARD-123");
+    expect(JSON.stringify(caught)).not.toContain("abc1234");
   });
 
   it.each([
@@ -474,6 +493,31 @@ describe("CI runtime registration authorization", () => {
     expect(JSON.stringify(result)).not.toContain("private host detail");
     expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: code });
     expect(h.ledger().waits).toEqual([]);
+  });
+
+  it("returns the refusal code and safe reason in tool result content", async () => {
+    const h = setup();
+    h.rawConfig.allowedRepos = ["acme/other"];
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ data: { code: "repo_refused" } });
+    expect(result.content).toContain("repo_refused");
+    expect(result.content).toContain("not in the configured allowlist");
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "repo_refused" });
+  });
+
+  it("surfaces the numeric HTTP status for github_http refusals and shape detail in the audit", async () => {
+    const { CiGithubError } = await import("../src/ci-github.js");
+    const h = setup();
+    github.pull.mockRejectedValue(new CiGithubError("http", 403));
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ data: { code: "github_http" } });
+    expect(result.content).toContain("HTTP 403");
+    const h2 = setup();
+    const shapeResult = await h2.runtime.register({ ...registration, headSha: "abc1234" }, run);
+    expect(shapeResult.content).toContain("invalid_registration");
+    expect(shapeResult.content).toContain("headSha:length=7");
+    expect(h2.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "invalid_registration", detail: expect.stringContaining("headSha:length=7") });
+    expect(JSON.stringify(h2.ledger().audits.at(-1))).not.toContain("abc1234");
   });
 
   it("maps GitHub client failures to github_<code> without leaking upstream detail", async () => {

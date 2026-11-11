@@ -1,6 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
-import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, type CiConfig, type Registration } from "./ci-config.js";
+import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, InvalidRegistrationError, type CiConfig, type Registration } from "./ci-config.js";
 import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness } from "./ci-github.js";
 import { CiAppAuth } from "./ci-auth.js";
 import { retryableBeforeQueue } from "./native-wake.js";
@@ -37,7 +37,7 @@ export interface Wait extends Registration {
   lastAttemptAt?: number;
   reason?: string;
 }
-interface Audit { at: number; operation: string; runId?: string; companyId?: string; waitId?: string; outcome: string }
+interface Audit { at: number; operation: string; runId?: string; companyId?: string; waitId?: string; outcome: string; detail?: string }
 interface Ledger {
   version: 1;
   waits: Wait[];
@@ -69,6 +69,56 @@ function refusalCode(error: unknown): string {
   if (error instanceof CiGithubError) return `github_${error.code}`;
   if (error instanceof Error && REFUSAL_CODES.has(error.message)) return error.message;
   return "registration_refused";
+}
+
+/**
+ * Safe, closed reason per refusal code. Reasons are fixed strings (plus the
+ * numeric HTTP status on github_http and the shape-only field summary on
+ * invalid_registration): no upstream bodies, host detail, or argument
+ * values ever cross into agent output.
+ */
+const REFUSAL_REASONS: Record<string, string> = {
+  invalid_registration: "Send exactly issueId (Paperclip issue UUID, not the TWO-#### identifier), repo (owner/repo), prNumber (integer), and headSha (full 40-character commit SHA, e.g. from `git rev-parse HEAD`).",
+  invalid_run_context: "The run context is invalid; register from a fresh run.",
+  invalid_configuration: "Plugin configuration is invalid; ask the operator to check the instance config.",
+  plugin_disabled: "CI wake is not enabled for this company.",
+  repo_refused: "Repository is not in the configured allowlist.",
+  checkout_refused: "This run does not own the issue checkout.",
+  issue_binding_refused: "The execution workspace does not match the issue checkout.",
+  workspace_binding_refused: "The execution workspace does not match the issue checkout.",
+  pr_binding_refused: "The live PR does not match the registered number, head SHA, or repository.",
+  binding_changed: "Workspace binding changed during registration; register from a new run.",
+  registration_requires_new_run: "This wait is bound to a different workspace; register from a new run.",
+  wait_alias_capacity: "CI wait alias capacity reached; retry later.",
+  wait_capacity: "CI wait capacity reached; retry later.",
+  github_auth: "GitHub App token mint failed; ask the operator to check the App installation.",
+  github_backoff: "GitHub budget or backoff is in effect; retry shortly.",
+  github_backoff_capacity: "GitHub budget or backoff is in effect; retry shortly.",
+  github_response: "GitHub returned an unexpected response.",
+  github_pages: "GitHub returned an unexpected response.",
+  github_input: "GitHub returned an unexpected response.",
+  github_network: "GitHub returned an unexpected response.",
+  github_timeout: "GitHub returned an unexpected response.",
+  secret_resolution_timeout: "GitHub credential unavailable; retry shortly.",
+  credential_unavailable: "GitHub credential unavailable; retry shortly.",
+  invalid_ledger: "The stored CI ledger is invalid; ask the operator to inspect it.",
+  registration_refused: "Registration refused.",
+};
+
+function refusalDetail(error: unknown): { code: string; reason: string; auditDetail?: string } {
+  const code = refusalCode(error);
+  let reason = REFUSAL_REASONS[code] ?? REFUSAL_REASONS.registration_refused!;
+  let auditDetail: string | undefined;
+  if (code === "github_http") {
+    const status = error instanceof CiGithubError ? error.status : undefined;
+    reason = status === undefined ? "GitHub request failed." : `GitHub returned HTTP ${status}.`;
+  }
+  if (error instanceof InvalidRegistrationError) {
+    const received = error.shape.join(", ");
+    reason += ` Received: ${received}.`;
+    auditDetail = `shape=${received}`;
+  }
+  return { code, reason, auditDetail };
 }
 
 export function verifyCiSignature(secret: string, rawBody: string, signature: string | undefined): boolean {
@@ -173,8 +223,8 @@ export class CiWakeRuntime {
     await this.ctx.state.set(KEY, ledger);
   }
 
-  private audit(ledger: Ledger, operation: string, outcome: string, run?: ToolRunContext, waitId?: string): void {
-    ledger.audits.push({ at: this.now(), operation, outcome, ...(run && UUID.test(run.runId) && UUID.test(run.companyId) ? { runId: run.runId, companyId: run.companyId } : {}), ...(waitId ? { waitId } : {}) });
+  private audit(ledger: Ledger, operation: string, outcome: string, run?: ToolRunContext, waitId?: string, detail?: string): void {
+    ledger.audits.push({ at: this.now(), operation, outcome, ...(run && UUID.test(run.runId) && UUID.test(run.companyId) ? { runId: run.runId, companyId: run.companyId } : {}), ...(waitId ? { waitId } : {}), ...(detail ? { detail } : {}) });
     while (ledger.audits.length > LIMITS.audit) {
       // Keep the current call's durable intent, but evict older routine intents
       // before wake/refusal evidence. This remains a bounded log, not an archive.
@@ -343,13 +393,15 @@ export class CiWakeRuntime {
         return { content: "CI wait registered", data: { waitId, status: "open", expiresAt: now + LIMITS.waitMs, dryRun: config.dryRun } };
       } catch (error) {
         // Neither host exceptions nor upstream response bodies are safe
-        // agent output. Only the enumerated code crosses the boundary;
-        // the audit row records the same code for operator triage.
-        const code = refusalCode(error);
-        if (ledger === undefined) return { error: `CI registration refused: ${code}`, data: { code } };
-        this.audit(ledger, "register", code, run, waitId);
+        // agent output. Only the enumerated code plus its closed safe
+        // reason cross the boundary, in `content` (the agent-visible
+        // channel) and `data`; the audit row records both for triage.
+        const { code, reason, auditDetail } = refusalDetail(error);
+        const content = `CI registration refused: ${code}. ${reason}`;
+        if (ledger === undefined) return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
+        this.audit(ledger, "register", code, run, waitId, auditDetail);
         await this.save(ledger);
-        return { error: `CI registration refused: ${code}`, data: { code } };
+        return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
       }
     });
   }

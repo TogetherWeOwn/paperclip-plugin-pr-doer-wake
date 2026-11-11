@@ -90,12 +90,59 @@ export interface Registration {
   headSha: string;
 }
 
+/**
+ * Refusal diagnostics for invalid registrations. `shape` names field
+ * problems in terms of names/types/lengths only — never argument values —
+ * so agents can self-correct and operators can replay real calls from the
+ * audit ledger without the ledger holding secret or positional data.
+ */
+export class InvalidRegistrationError extends Error {
+  readonly shape: string[];
+  constructor(shape: string[]) {
+    super("invalid_registration");
+    this.name = "InvalidRegistrationError";
+    this.shape = shape.slice(0, 8);
+  }
+}
+
 export function parseRegistration(value: unknown): Registration {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid_registration");
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new InvalidRegistrationError(["body:not-object"]);
   const p = value as Record<string, unknown>;
-  if (Object.keys(p).length !== 4 || Object.keys(p).some((k) => !["issueId", "repo", "prNumber", "headSha"].includes(k))) throw new Error("invalid_registration");
-  if (typeof p.issueId !== "string" || !UUID.test(p.issueId) || typeof p.repo !== "string" || !REPO.test(p.repo) || p.repo.endsWith("/.") || p.repo.endsWith("/..") || typeof p.headSha !== "string" || !SHA.test(p.headSha) || !Number.isSafeInteger(p.prNumber) || Number(p.prNumber) < 1 || Number(p.prNumber) > 2_147_483_647) throw new Error("invalid_registration");
-  return { issueId: p.issueId.toLowerCase(), repo: p.repo.toLowerCase(), prNumber: Number(p.prNumber), headSha: p.headSha };
+  const shape: string[] = [];
+  const fields = ["issueId", "repo", "prNumber", "headSha"] as const;
+  for (const key of Object.keys(p)) if (!(fields as readonly string[]).includes(key)) shape.push(`extra:${key}`);
+  for (const key of fields) if (!(key in p)) shape.push(`missing:${key}`);
+
+  let issueId: string | null = null;
+  if (typeof p.issueId === "string" && UUID.test(p.issueId)) issueId = p.issueId.toLowerCase();
+  else if ("issueId" in p) shape.push(typeof p.issueId === "string" ? "issueId:not-uuid" : `issueId:${typeof p.issueId}`);
+
+  // Unambiguous normalizations so common agent variants register instead
+  // of refusing: exact GitHub URL forms for repo, case-insensitive hex SHA,
+  // and digit-string PR numbers.
+  let repo: string | null = null;
+  if (typeof p.repo === "string") {
+    const mapped = REPO.test(p.repo) ? p.repo : workspaceRepo(p.repo);
+    if (mapped && !mapped.endsWith("/.") && !mapped.endsWith("/..")) repo = mapped.toLowerCase();
+    else shape.push("repo:not-owner/repo");
+  } else if ("repo" in p) shape.push(`repo:${typeof p.repo}`);
+
+  let prNumber: number | null = null;
+  const rawNumber = p.prNumber;
+  if (typeof rawNumber === "number" || (typeof rawNumber === "string" && /^\d{1,10}$/.test(rawNumber))) {
+    const parsed = Number(rawNumber);
+    if (Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 2_147_483_647) prNumber = parsed;
+  }
+  if (prNumber === null && "prNumber" in p) shape.push(`prNumber:${typeof rawNumber === "string" ? "string-not-digits" : typeof rawNumber}`);
+
+  let headSha: string | null = null;
+  if (typeof p.headSha === "string") {
+    if (/^[0-9a-fA-F]{40}$/.test(p.headSha)) headSha = p.headSha.toLowerCase();
+    else shape.push(/^[0-9a-fA-F]*$/.test(p.headSha) ? `headSha:length=${p.headSha.length}` : "headSha:not-hex");
+  } else if ("headSha" in p) shape.push(`headSha:${typeof p.headSha}`);
+
+  if (shape.length || issueId === null || repo === null || prNumber === null || headSha === null) throw new InvalidRegistrationError(shape);
+  return { issueId, repo, prNumber, headSha };
 }
 
 /** Exact GitHub repository identity; no host aliases, credentials, query or fragment. */
