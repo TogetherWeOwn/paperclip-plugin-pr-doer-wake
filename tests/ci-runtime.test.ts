@@ -243,7 +243,7 @@ describe("native CI plugin entrypoint", () => {
     expect(manifest.tools).toEqual([registrationTool]);
     expect(registrationTool.parametersSchema).toMatchObject({ additionalProperties: false, required: ["issueId", "repo", "prNumber", "headSha"] });
     expect(manifest.jobs).toEqual([
-      expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/4 * * * *" }),
+      expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/15 * * * *" }),
       expect.objectContaining({ jobKey: "pr-custody", schedule: "17 * * * *" }),
     ]);
     expect(manifest.capabilities).not.toContain("issues.update");
@@ -276,7 +276,7 @@ describe("CI registration and configuration parsing", () => {
   });
 
   it.each([
-    { allowedRepos: [] }, { allowedRepos: ["acme/widget", "bad repo"] }, { allowedRepos: Array(101).fill(REPO) },
+    { allowedRepos: [] }, { allowedRepos: ["acme/widget", "bad repo"] }, { allowedRepos: Array(201).fill(REPO) },
     { allowedRepos: ["acme/.."] }, { githubTokenSecretRef: "plaintext" },
     { githubTokenSecretRef: { ...TOKEN_REF, token: TOKEN } },
     { githubTokenSecretRef: { ...TOKEN_REF, version: 0 } },
@@ -1071,27 +1071,27 @@ describe("signed check_suite hints", () => {
     expect(h.ledger().deliveries).toEqual({});
   });
 
-  it("admits at most six structurally valid bodies per minute and rejects excess before ledger, config or secret reads", async () => {
+  it("admits at most the per-minute verification budget and rejects excess before further marker reads", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
     h.resolveSecret.mockClear();
     const invalid = webhook({ signature: `sha256=${"0".repeat(64)}` });
-    for (let index = 0; index < 6; index += 1) {
+    // Verification (secret resolves) binds before admission at the scaled budgets.
+    for (let index = 0; index < LIMITS.webhookVerifyPerMin; index += 1) {
       await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_signature_refused");
     }
-    const reads = h.get.mock.calls.length;
-    const configReads = h.configGet.mock.calls.length;
-    await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_admission_budget");
-    expect(h.get).toHaveBeenCalledTimes(reads);
-    expect(h.configGet).toHaveBeenCalledTimes(configReads);
-    expect(h.resolveSecret).toHaveBeenCalledTimes(6);
+    // Over-budget deliveries resolve no further secrets and wake nothing.
+    await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_verification_budget");
+    expect(h.resolveSecret).toHaveBeenCalledTimes(LIMITS.webhookVerifyPerMin);
+    await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_verification_budget");
+    expect(h.resolveSecret).toHaveBeenCalledTimes(LIMITS.webhookVerifyPerMin);
     expect(h.requestWakeup).not.toHaveBeenCalled();
     h.advance(60_000);
     await expect(h.runtime.webhook(invalid)).rejects.toThrow("webhook_signature_refused");
-    expect(h.resolveSecret).toHaveBeenCalledTimes(7);
+    expect(h.resolveSecret).toHaveBeenCalledTimes(LIMITS.webhookVerifyPerMin + 1);
   });
 
-  it("allows only two outstanding webhooks and rejects overflow before serialization while the runtime lock is occupied", async () => {
+  it("allows only the bounded outstanding webhooks and rejects overflow before serialization while the runtime lock is occupied", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
     const entered = deferred();
@@ -1102,8 +1102,10 @@ describe("signed check_suite hints", () => {
     h.get.mockClear();
     h.configGet.mockClear();
     h.resolveSecret.mockClear();
-    const first = h.runtime.webhook(webhook());
-    const second = h.runtime.webhook(webhook({ delivery: NEXT_DELIVERY }));
+    const pending: Array<Promise<void>> = [];
+    for (let index = 0; index < LIMITS.webhookPending; index += 1) {
+      pending.push(h.runtime.webhook(webhook({ delivery: `bbbbbbbb-bbbb-4bbb-8bbb-${index.toString(16).padStart(12, "0")}` })));
+    }
     try {
       for (let index = 0; index < 3; index += 1) {
         await expect(h.runtime.webhook(webhook())).rejects.toThrow("webhook_admission_budget");
@@ -1114,11 +1116,52 @@ describe("signed check_suite hints", () => {
       expect(h.requestWakeup).not.toHaveBeenCalled();
     } finally {
       release.resolve();
-      await Promise.all([poll, first, second]);
+      await Promise.all([poll, ...pending]);
     }
     // Rejected overflow did not consume admissions or strand outstanding slots.
     await h.runtime.webhook(webhook({ delivery: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac" }));
     expect(h.ledger().deliveries[`${COMPANY}:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac`]).toBe(START);
+  });
+
+  it.each([
+    ["check_run", { check_run: { head_sha: HEAD, conclusion: "success" } }],
+    ["workflow_run", { workflow_run: { head_sha: HEAD, conclusion: "success" } }],
+    ["pull_request", { action: "synchronize", pull_request: { head: { sha: HEAD } } }],
+    ["pull_request", { action: "ready_for_review", pull_request: { head: { sha: HEAD } } }],
+  ])("accepts a signed %s hint and fetches fresh GitHub truth before waking", async (event, payload) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.webhook(webhook({ event, payload }));
+    expect(h.resolveSecret).toHaveBeenCalledWith(WEBHOOK_REF, { companyId: COMPANY, configPath: "webhookSecretRef" });
+    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main");
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a signed pull_request hint for an unregistered head without any GitHub or wake activity", async () => {
+    const h = setup();
+    await h.runtime.webhook(webhook({
+      event: "pull_request",
+      payload: { action: "synchronize", pull_request: { head: { sha: HEAD } } },
+    }));
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["check_run", { action: "rerequested", check_run: { head_sha: HEAD } }],
+    ["workflow_run", { action: "requested", workflow_run: { head_sha: HEAD } }],
+    ["pull_request", { action: "assigned", pull_request: { head: { sha: HEAD } } }],
+  ])("ignores a supported %s event with a non-terminal action without ledger reads", async (event, payload) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    h.get.mockClear();
+    h.resolveSecret.mockClear();
+    await h.runtime.webhook(webhook({ event, payload }));
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
   it("does not let a replay trigger a second poll, including while the registration remains open", async () => {
@@ -1171,12 +1214,48 @@ describe("signed check_suite hints", () => {
     expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
-  it.each(["pull_request", "check_run", "push", "ping"])("ignores unsupported %s events even when their body and signature are malformed", async (event) => {
+  it.each(["push", "ping", "issues", "create"])("ignores unsupported %s events even when their body and signature are malformed", async (event) => {
     const h = setup();
     await h.runtime.webhook(webhook({ event, rawBody: "{", signature: null }));
     expect(h.get).not.toHaveBeenCalled();
     expect(h.resolveSecret).not.toHaveBeenCalled();
     expect(h.requestWakeup).not.toHaveBeenCalled();
+    // Oversized unsupported events are also ignored without parsing.
+    await h.runtime.webhook(webhook({ event, rawBody: " ".repeat(65_537), signature: null }));
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized supported-event body before parsing it", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.pull.mockClear();
+    // Malformed JSON over the cap must fail with webhook_too_large, proving
+    // the size check runs before any parse (a parse would say invalid payload).
+    await expect(h.runtime.webhook(webhook({ rawBody: "{".padEnd(65_537, " ") }))).rejects.toThrow("webhook_too_large");
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("queues a targeted poll that arrives while a poll is in flight instead of dropping it", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    // The in-flight poll sees pending and wakes nothing; only the drained
+    // targeted recheck (pass) may wake — proving the target was queued, not dropped.
+    github.readiness.mockReturnValue(verdict("pass"));
+    github.readiness.mockReturnValueOnce(verdict("pending"));
+    const poll = h.runtime.poll();
+    await entered.promise;
+    const targeted = h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+    release.resolve();
+    await Promise.all([poll, targeted]);
+    expect(github.snapshot).toHaveBeenCalledTimes(2);
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
   it.each([
@@ -1355,6 +1434,25 @@ describe("final-read authorization revalidation", () => {
 });
 
 describe("CI runtime bounded retention and work quotas", () => {
+  it("scales the open-wait, retention, request and wake budgets to the measured 300-wait load", () => {
+    expect(LIMITS.active).toBeGreaterThanOrEqual(300);
+    expect(LIMITS.requestsPerTick).toBeGreaterThanOrEqual(3_600);
+    expect(LIMITS.wakePerTick).toBeGreaterThanOrEqual(100);
+    expect(LIMITS.tickMs).toBeGreaterThanOrEqual(600_000);
+    expect(LIMITS.retained).toBeGreaterThanOrEqual(8_000);
+    expect(LIMITS.audit).toBeGreaterThanOrEqual(5_000);
+    expect(LIMITS.deliveries).toBeGreaterThanOrEqual(10_000);
+    expect(LIMITS.webhookPending).toBeGreaterThanOrEqual(32);
+    expect(LIMITS.webhookAdmissionPerMin).toBeGreaterThanOrEqual(240);
+    expect(LIMITS.webhookVerifyPerMin).toBeGreaterThanOrEqual(120);
+    expect(LIMITS.webhookHintsPerMin).toBeGreaterThanOrEqual(120);
+  });
+
+  it("accepts a 200-repository allowlist covering every active org repo", () => {
+    const repos = Array.from({ length: 200 }, (_, index) => `togetherweown/repo-${index}`);
+    expect(validateCiConfig(config({ allowedRepos: repos }))).toEqual([]);
+  });
+
   it("bounds active waits and refuses overflow before credential access", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
@@ -1413,7 +1511,8 @@ describe("CI runtime bounded retention and work quotas", () => {
     ];
     h.seed(ledger);
     h.configGet.mockImplementation(async (companyId) => {
-      if (companyId === OTHER) { h.advance(30_000); throw new Error("temporary configuration read failure"); }
+      // Six failing attempts consume the whole tick budget before the healthy wait.
+      if (companyId === OTHER) { h.advance(100_000); throw new Error("temporary configuration read failure"); }
       return clone(h.rawConfig);
     });
     github.readiness.mockReturnValue(verdict("pass"));
@@ -1509,7 +1608,7 @@ describe("CI runtime bounded retention and work quotas", () => {
     const h = setup();
     await h.runtime.register(registration, run);
     const ledger = h.ledger();
-    ledger.hints = Object.fromEntries(Array.from({ length: 6 }, (_, index) => [`another-head-${index}`, START]));
+    ledger.hints = Object.fromEntries(Array.from({ length: LIMITS.webhookHintsPerMin }, (_, index) => [`another-head-${index}`, START]));
     h.seed(ledger);
     await h.runtime.webhook(webhook());
     expect(github.snapshot).not.toHaveBeenCalled();

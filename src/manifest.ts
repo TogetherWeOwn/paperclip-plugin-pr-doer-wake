@@ -46,10 +46,10 @@ const manifest: PaperclipPluginManifestV1 = {
   entrypoints: { worker: "./dist/worker.js" },
   tools: [registrationTool],
   jobs: [
-    { jobKey: "ci-wake-poll", displayName: "CI wait poll", description: "Recheck registered open waits without an LLM; retire moved heads and expired waits.", schedule: "*/4 * * * *" },
+    { jobKey: "ci-wake-poll", displayName: "CI wait poll", description: "Backstop recheck of registered open waits without an LLM; webhooks are the primary trigger. Retires moved heads and expired waits.", schedule: "*/15 * * * *" },
     { jobKey: "pr-custody", displayName: "PR custody", description: "Inventory organization PRs and request a disposition once per trigger. Separate opt-in and dry-run; incomplete evidence is UNKNOWN.", schedule: "17 * * * *" },
   ],
-  webhooks: [{ endpointKey: "github-ci", displayName: "GitHub CI hint", description: "Optional phase two: signed check_suite completed events only. Disabled until explicitly configured; payloads never authorize a wake." }],
+  webhooks: [{ endpointKey: "github-ci", displayName: "GitHub CI hint", description: "Phase two (push mode): signed check_suite, check_run, workflow_run and pull_request events only. Disabled until explicitly configured; payloads never authorize a wake, they trigger a fresh GitHub recheck of an already-registered wait." }],
   instanceConfigSchema: {
     type: "object", additionalProperties: false,
     allOf: [
@@ -65,14 +65,14 @@ const manifest: PaperclipPluginManifestV1 = {
       custodyOrg: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$", description: "Organization whose non-archived repositories custody inventories. Separate from the CI registration allowlist." },
       custodySummaryAgentId: { type: "string", format: "uuid", description: "Accountable recipient for daily unmapped/bot inventory and unassigned-card follow-ups." },
       custodyClosedSince: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$", description: "Explicit initial closed-PR inventory boundary in UTC. Later ticks use the stored cursor; no pre-boundary coverage claimed." },
-      allowedRepos: { type: "array", minItems: 0, maxItems: 100, uniqueItems: true, items: { type: "string", maxLength: 140, pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$" }, default: [] },
+      allowedRepos: { type: "array", minItems: 0, maxItems: 200, uniqueItems: true, items: { type: "string", maxLength: 140, pattern: "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$" }, default: [] },
       githubTokenSecretRef: { ...secretRef, description: "Bearer mode only: existing read-only GitHub token. Mutually exclusive with the three App settings; resolved at call time." },
       githubAppId: { type: "string", pattern: "^[1-9][0-9]{0,15}$", description: "App mode: numeric App ID as a decimal string, not a client secret." },
       githubInstallationId: { type: "string", pattern: "^[1-9][0-9]{0,15}$", description: "App mode: existing approved installation ID as a decimal string." },
       githubAppPrivateKeySecretRef: { ...secretRef, description: "App mode: existing approved RSA private-key reference. All three App fields are required. Tokens are narrowed to one allowed repository and fixed read permissions." },
       webhooksEnabled: { type: "boolean", default: false },
       webhookSecretRef: { ...secretRef, description: "Phase two only: webhook HMAC secret stored by the owner in Paperclip." },
-      repoMedianMs: { type: "object", maxProperties: 100, additionalProperties: { type: "integer", minimum: 60000, maximum: 86400000 }, description: "Optional measured per-repo cold-start CI medians in milliseconds; absent entries start at 30 minutes. Replaced by a rolling median of settled registered heads." },
+      repoMedianMs: { type: "object", maxProperties: 200, additionalProperties: { type: "integer", minimum: 60000, maximum: 86400000 }, description: "Optional measured per-repo cold-start CI medians in milliseconds; absent entries start at 30 minutes. Replaced by a rolling median of settled registered heads." },
     },
   },
 };

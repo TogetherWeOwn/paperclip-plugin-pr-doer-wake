@@ -9,7 +9,7 @@ function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
 }
 
-export const LIMITS = { active: 20, retained: 2_000, audit: 1_000, deliveries: 2_000, requestsPerTick: 240, wakePerTick: 20, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 180_000, secretResolveMs: 15_000 } as const;
+export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 600_000, secretResolveMs: 15_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
 export interface CiWakeRuntimeOptions {
   /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
   secretResolveTimeoutMs?: number;
@@ -56,12 +56,42 @@ function header(input: PluginWebhookInput, name: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/**
+ * Extract the exact head SHA a signed delivery claims completion for, or null
+ * when the event/action is not a CI-hint trigger. A returned SHA is only a
+ * ledger lookup key: without an open wait matching it exactly, nothing is read.
+ */
+function webhookHeadSha(event: string | undefined, rawBody: string): string | null {
+  // Unsupported events are ignored without parsing, even when malformed.
+  if (!["check_suite", "check_run", "workflow_run", "pull_request"].includes(event ?? "")) return null;
+  let payload: Record<string, any>;
+  try { payload = JSON.parse(rawBody) as Record<string, any>; } catch { throw new Error("invalid_webhook_payload"); }
+  const shaOf = (value: unknown): string | null => (typeof value === "string" && SHA.test(value) ? value : null);
+  switch (event) {
+    case "check_suite":
+    case "check_run":
+    case "workflow_run": {
+      if (payload?.action !== "completed") return null;
+      const sha = shaOf(event === "check_suite" ? payload.check_suite?.head_sha : event === "check_run" ? payload.check_run?.head_sha : payload.workflow_run?.head_sha);
+      if (!sha) throw new Error("invalid_webhook_payload");
+      return sha;
+    }
+    case "pull_request":
+      // Non-CI transitions (assigned, labeled, ...) carry no head evidence.
+      if (!["opened", "reopened", "synchronize", "ready_for_review"].includes(payload?.action)) return null;
+      return shaOf(payload.pull_request?.head?.sha) ?? (() => { throw new Error("invalid_webhook_payload"); })();
+    default:
+      return null;
+  }
+}
+
 /** One host-managed worker owns this ledger. All entrypoints share its lock, including overlapping job callbacks. */
 export class CiWakeRuntime {
   private lock: Promise<unknown> = Promise.resolve();
   private pollInFlight = false;
   private targetedPoll = false;
   private fullPollRequested = false;
+  private readonly pendingTargets = new Map<string, { companyId: string; repo: string; sha: string }>();
   private pendingWebhooks = 0;
   private webhookAdmissions = { since: 0, used: 0 };
   private readonly caches = new Map<string, CiGithubCache>();
@@ -170,7 +200,10 @@ export class CiWakeRuntime {
     let credential: string | CiAppAuth;
     if (app) {
       const scope = `${companyId}:${authIdentity(config)}:${repo}`;
-      if (!cycle.has(scope)) cycle.set(scope, new CiAppAuth({
+      // A 600s tick outlives one 180s auth cycle: mint a fresh source rather
+      // than reusing an expired one (which would fail every later wait).
+      const existing = cycle.get(scope);
+      if (!existing || existing.expired()) cycle.set(scope, new CiAppAuth({
         appId: app.appId, installationId: app.installationId, repo, now: this.now,
         resolvePrivateKey: () => this.resolveSecret(app.privateKeySecretRef, companyId, "githubAppPrivateKeySecretRef"),
       }));
@@ -260,21 +293,35 @@ export class CiWakeRuntime {
   async poll(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
     if (this.pollInFlight) {
       if (!only && this.targetedPoll) this.fullPollRequested = true;
+      // Queue targeted hints instead of dropping them: a completed head whose
+      // hint arrives mid-poll must not wait for the next backstop tick.
+      else if (only) this.pendingTargets.set(`${only.companyId}:${only.repo}:${only.sha}`, only);
       return;
     }
     this.pollInFlight = true;
     this.targetedPoll = only !== undefined;
     try {
       await this.serialized(() => this.pollLocked(only));
-      if (this.fullPollRequested) {
-        this.targetedPoll = false;
-        this.fullPollRequested = false;
-        await this.serialized(() => this.pollLocked());
+      // Drain requests that arrived while this poll ran (targets may arrive
+      // during the drain too; loop until nothing is left).
+      while (this.fullPollRequested || this.pendingTargets.size > 0) {
+        if (this.fullPollRequested) {
+          this.targetedPoll = false;
+          this.fullPollRequested = false;
+          await this.serialized(() => this.pollLocked());
+        } else {
+          const targets = [...this.pendingTargets.values()];
+          this.pendingTargets.clear();
+          this.targetedPoll = true;
+          for (const target of targets) await this.serialized(() => this.pollLocked(target));
+          this.targetedPoll = false;
+        }
       }
     } finally {
       this.pollInFlight = false;
       this.targetedPoll = false;
       this.fullPollRequested = false;
+      this.pendingTargets.clear();
     }
   }
 
@@ -391,18 +438,24 @@ export class CiWakeRuntime {
 
   async webhook(input: PluginWebhookInput): Promise<void> {
     if (input.endpointKey !== "github-ci") throw new Error("unknown_webhook");
-    if (header(input, "x-github-event") !== "check_suite") return;
+    const event = header(input, "x-github-event");
+    // Unsupported events are ignored without parsing, even when malformed or oversized.
+    if (!["check_suite", "check_run", "workflow_run", "pull_request"].includes(event ?? "")) return;
+    // Supported events: enforce the size cap before any JSON parsing, so an
+    // unauthenticated sender cannot force an oversized parse. An oversized
+    // non-terminal action is therefore rejected rather than ignored — its
+    // action cannot be known without parsing. Within-cap non-terminal
+    // actions are still ignored below without ledger reads.
     if (Buffer.byteLength(input.rawBody, "utf8") > 65_536) throw new Error("webhook_too_large");
+    const sha = webhookHeadSha(event, input.rawBody);
+    if (sha === null) return;
     const signature = header(input, "x-hub-signature-256");
     const delivery = header(input, "x-github-delivery");
     if (!signature || !/^sha256=[0-9a-f]{64}$/.test(signature) || !delivery || !UUID.test(delivery)) throw new Error("invalid_webhook_headers");
     const payload = JSON.parse(input.rawBody) as Record<string, any>;
-    if (payload?.action !== "completed") return;
     const repo = typeof payload.repository?.full_name === "string" ? payload.repository.full_name.toLowerCase() : "";
-    const sha = payload.check_suite?.head_sha;
-    if (typeof sha !== "string" || !SHA.test(sha)) throw new Error("invalid_webhook_payload");
     if (this.now() - this.webhookAdmissions.since >= 60_000) this.webhookAdmissions = { since: this.now(), used: 0 };
-    if (this.pendingWebhooks >= 2 || this.webhookAdmissions.used >= 6) throw new Error("webhook_admission_budget");
+    if (this.pendingWebhooks >= LIMITS.webhookPending || this.webhookAdmissions.used >= LIMITS.webhookAdmissionPerMin) throw new Error("webhook_admission_budget");
     this.webhookAdmissions.used += 1;
     this.pendingWebhooks += 1;
     try { await this.webhookAdmitted(input, repo, sha, signature, delivery); } finally { this.pendingWebhooks -= 1; }
@@ -423,7 +476,7 @@ export class CiWakeRuntime {
         if (typeof owner !== "string" || owner.toLowerCase() !== repo.split("/")[0]) continue;
         if (payload.organization !== undefined && (typeof payload.organization?.login !== "string" || payload.organization.login.toLowerCase() !== owner.toLowerCase())) continue;
         if (this.now() - this.webhookBudget.since >= 60_000) this.webhookBudget = { since: this.now(), used: 0 };
-        if (++this.webhookBudget.used > 6) throw new Error("webhook_verification_budget");
+        if (++this.webhookBudget.used > LIMITS.webhookVerifyPerMin) throw new Error("webhook_verification_budget");
         let secret: string;
         try { secret = await this.resolveSecret(config.webhookSecretRef!, companyId, "webhookSecretRef"); } catch { continue; }
         if (!verifyCiSignature(secret, input.rawBody, signature)) continue;
@@ -433,7 +486,7 @@ export class CiWakeRuntime {
         ledger.deliveries[replayKey] = this.now();
         const hintKey = `${companyId}:${repo}:${sha}`;
         const recent = Object.values(ledger.hints).filter((at) => this.now() - at < 60_000).length;
-        if (recent < 6 && (ledger.hints[hintKey] === undefined || this.now() - ledger.hints[hintKey]! >= 20_000)) {
+        if (recent < LIMITS.webhookHintsPerMin && (ledger.hints[hintKey] === undefined || this.now() - ledger.hints[hintKey]! >= LIMITS.webhookDebounceMs)) {
           ledger.hints[hintKey] = this.now();
           target = { companyId, repo, sha };
         }

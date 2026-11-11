@@ -44,7 +44,7 @@ export function parseCiConfig(raw: Record<string, unknown>): CiConfig {
   return {
     enabled: raw.enabled === true,
     dryRun: raw.dryRun !== false,
-    allowedRepos: repos.filter((r): r is string => typeof r === "string" && REPO.test(r) && !r.endsWith("/.") && !r.endsWith("/..")).slice(0, 100).map((r) => r.toLowerCase()),
+    allowedRepos: repos.filter((r): r is string => typeof r === "string" && REPO.test(r) && !r.endsWith("/.") && !r.endsWith("/..")).slice(0, 200).map((r) => r.toLowerCase()),
     githubTokenSecretRef: secretRef(raw.githubTokenSecretRef),
     githubApp: githubId(raw.githubAppId) && githubId(raw.githubInstallationId) && secretRef(raw.githubAppPrivateKeySecretRef)
       ? { appId: raw.githubAppId, installationId: raw.githubInstallationId, privateKeySecretRef: secretRef(raw.githubAppPrivateKeySecretRef)! } : null,
@@ -68,7 +68,7 @@ export function validateCiConfig(raw: Record<string, unknown>): string[] {
     errors.push("configure exactly one complete authentication mode: githubTokenSecretRef OR githubAppId, githubInstallationId and githubAppPrivateKeySecretRef");
   }
   if (!config.enabled) return errors;
-  if (!config.allowedRepos.length || !Array.isArray(raw.allowedRepos) || config.allowedRepos.length !== raw.allowedRepos.length) errors.push("allowedRepos must contain 1-100 valid owner/repo entries");
+  if (!config.allowedRepos.length || !Array.isArray(raw.allowedRepos) || config.allowedRepos.length !== raw.allowedRepos.length) errors.push("allowedRepos must contain 1-200 valid owner/repo entries");
   if (config.webhooksEnabled && !config.webhookSecretRef) errors.push("webhooksEnabled requires webhookSecretRef");
   if (raw.repoMedianMs !== undefined && (!raw.repoMedianMs || typeof raw.repoMedianMs !== "object" || Array.isArray(raw.repoMedianMs) || Object.keys(raw.repoMedianMs).length !== Object.keys(config.repoMedianMs).length)) errors.push("repoMedianMs must map valid repos to integer durations from 60000 to 86400000 ms");
   return errors;
