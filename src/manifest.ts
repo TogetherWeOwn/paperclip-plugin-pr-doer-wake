@@ -56,7 +56,7 @@ const manifest: PaperclipPluginManifestV1 = {
     type: "object", additionalProperties: false,
     allOf: [
       { if: { anyOf: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"].map((key) => ({ required: [key] })) }, then: { required: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"], not: { required: ["githubTokenSecretRef"] } } },
-      { if: { anyOf: [{ required: ["enabled"], properties: { enabled: { const: true } } }, { required: ["gatesStatusEnabled"], properties: { gatesStatusEnabled: { const: true } } }] }, then: { anyOf: [{ required: ["githubTokenSecretRef"] }, { required: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"] }] } },
+      { if: { anyOf: [{ required: ["enabled"], properties: { enabled: { const: true } } }, { required: ["gatesStatusEnabled"], properties: { gatesStatusEnabled: { const: true } } }, { required: ["prHeadWakeEnabled"], properties: { prHeadWakeEnabled: { const: true } } }] }, then: { anyOf: [{ required: ["githubTokenSecretRef"] }, { required: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"] }] } },
     ],
     properties: {
       enabled: { type: "boolean", default: false },
@@ -72,6 +72,8 @@ const manifest: PaperclipPluginManifestV1 = {
       githubAppId: { type: "string", pattern: "^[1-9][0-9]{0,15}$", description: "App mode: numeric App ID as a decimal string, not a client secret." },
       githubInstallationId: { type: "string", pattern: "^[1-9][0-9]{0,15}$", description: "App mode: existing approved installation ID as a decimal string." },
       githubAppPrivateKeySecretRef: { ...secretRef, description: "App mode: existing approved RSA private-key reference. All three App fields are required. Tokens are narrowed to one allowed repository and fixed read permissions." },
+      prHeadWakeEnabled: { type: "boolean", default: false, description: "Wake pending reviewers (in_review, pending stage) when their PR head changes and settles. Ships disabled; enables a bounded per-(card,SHA) wake only, never status/assignment writes." },
+      prHeadWakeShadow: { type: "boolean", default: true, description: "Shadow mode: compute and log intended pr_head_changed wakes without firing any. Set false only after shadow evidence is accepted." },
       gatesStatusEnabled: { type: "boolean", default: false, description: "Publish paperclip/gates commit statuses from RM merge confirmations. Stays off until the App gains statuses: write; without it the publisher logs missing_permission and never greens a SHA." },
       gatesStatusShadow: { type: "boolean", default: true, description: "Shadow mode: compute and log decisions without POSTing any GitHub status. Set false only after shadow evidence matches RM decisions." },
       releaseManagerAgentId: { type: "string", format: "uuid", description: "The one agent addressed by and resolving merge-authorization confirmations (title Merge <owner/repo>#<n>?, prompt identical, bare-PR-URL details) that publish paperclip/gates. Required when gatesStatusEnabled is true." },

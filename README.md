@@ -35,13 +35,27 @@ Required status-check contexts come from the **PR base branch's effective rules*
 - Without required contexts, all observed suites and latest runs/commit statuses must be terminal. An empty head remains pending; no Actions extension is applied.
 - A missing required context yields a fail wake naming `required check missing` only after twice the repository CI median has elapsed since the last suite completion (registration time if no suite exists), and no present required context remains pending.
 
-The cold-start median is an operator-supplied measured `repoMedianMs` entry, or **30 minutes** when unknown. A rolling sample of up to 31 distinct settled registered heads replaces it. The plugin measures suite creation-to-final-completion, not agent registration-to-wake latency. It never treats an HTTP denial as an absence of required checks. A moved head, closed or merged PR retires the wait without waking. Fresh PR and card/workspace/config reads precede every wake; a concurrent GitHub change after the final read cannot be made atomic with the Paperclip wake.
+The cold-start median is an operator-supplied measured `repoMedianMs` entry, or **30 minutes** when unknown. A rolling sample of up to 31 distinct settled registered heads replaces it. The plugin measures suite creation-to-final-completion, not agent registration-to-wake latency. It never treats an HTTP denial as an absence of required checks. A moved head, closed or merged PR retires the wait without waking the wait's own card. A genuine new head on an open PR may additionally wake pending reviewers under "Reviewer wakes on settled PR head change" below. Fresh PR and card/workspace/config reads precede every wake; a concurrent GitHub change after the final read cannot be made atomic with the Paperclip wake.
 
 The wake reason names pass/fail, repository, short head SHA, failed contexts and missing contexts. The host remains authoritative for assignee, blockers, terminal status, paused agents and budget. A host-deferred (`queued: false`) wait remains open. Exactly matched, known pre-queue accounting/not-sent refusals also remain open; unknown exceptions never authorize retry. A failed pre-dispatch intent write is restored to open when possible, because no wake call has occurred. Dry run logs **`would wake`**, records a terminal dry-run outcome and calls no wake API; switching to live does not replay dry-run completions.
 
 ### At-most-once boundary
 
 Each `(repo, headSha, waitId)` has a durable intent before `ctx.issues.requestWakeup`, plus a stable correlation/idempotency key. The reported target host does **not** deduplicate that key: the plugin ledger, not host deduplication, prevents repeat dispatch. All entrypoints share a single-worker lock, including overlapping scheduled callbacks. If the host reply is lost, the wait becomes `unconfirmed` and is **not retried**; restart treats an unfinished intent the same way. This favors no duplicate requests over guaranteed delivery during an ambiguous failure. The backstop recovers missed work. Do not claim exactly-once delivery or run multiple independent plugin workers against the same ledger: stock state has no cross-worker compare-and-swap.
+
+### Reviewer wakes on settled PR head change
+
+When a registered wait observes a genuine new head on an open, same-repository PR, the plugin records a bounded pending entry (`oldSha`/`newSha`) instead of only retiring the wait. On later ticks the entry is re-read from GitHub, and only when the **new** head has settled (`pass` or `fail` per the readiness rules above; a `pending` head never wakes) does the plugin wake each candidate card that meets **all** of:
+
+- the card lists the PR as a `pull_request` work product (exact URL or repo+number metadata, mirroring custody's work-product tier),
+- the card is `in_review` with a `pending` execution stage that has a current participant, and
+- the current participant is not the pusher/author (see below).
+
+Candidates are discovered from the ledger's own registered waits for that (company, repo, PR): the plugin has no company-enumeration surface and does not query a work-products table, so a card that never registered a wait for the PR is not discovered. The wake uses reason `pr_head_changed` with old/new SHA in the text, `contextSource: "plugin.ci-wake"`, and a stable per-(card, SHA) idempotency key. It is wakeup-only: no status, assignment, monitor or verdict writes.
+
+**Pusher identity design point.** GitHub PR author/pusher identities are logins, never Paperclip agent IDs, so they cannot be mapped to a participant. The plugin therefore excludes a participant only on definite agent-ID equality with a known author agent: the registering agent of any wait for that PR, the card's `returnAssignee`, or the card's assignee. A human participant or otherwise ambiguous identity is **woken**: a spare wake is cheap, an 11-hour review stall is not. Failure mode: a teammate agent pushes a new head while the registering agent differs, producing one spare wake — never a missed wake.
+
+Idempotency is per (card, SHA): the plugin persists a dedupe record before `requestWakeup`, so a lost reply or restart never repeats that (card, SHA) effect; known pre-queue refusals release the record for a later tick, unknown errors stay unconfirmed. Entries expire after seven days and dedupe records after 30 days, under the same tick budgets as CI waits. This path ships **disabled** (`prHeadWakeEnabled`, default `false`) and in **shadow** (`prHeadWakeShadow`, default `true`): shadow logs `would wake` once per head change and fires nothing; switching to live wakes on the next tick. A closed/merged/forked/renumbered PR, a revoked allowlist entry, or a disabled feature drops the pending entry without waking.
 
 ## Configuration and limits
 
@@ -68,6 +82,8 @@ No issue creation/update/comments, company/project enumeration, SQL namespace, s
 | `gatesStatusEnabled` | `false` | Publish `paperclip/gates` commit statuses from RM merge confirmations. Ships off; without the App `statuses: write` grant the publisher fails closed as `missing_permission` and never greens a SHA. |
 | `gatesStatusShadow` | `true` | Shadow mode: compute and log decisions without POSTing any GitHub status. Set `false` only after shadow evidence matches RM decisions. |
 | `releaseManagerAgentId` | unset | The one agent whose accepted merge confirmations publish `paperclip/gates`. Required when `gatesStatusEnabled` is true. |
+| `prHeadWakeEnabled` | `false` | Wake pending reviewers (`in_review`, pending stage) when their PR head changes and settles. Ships disabled; wakeup-only, never status/assignment writes. Requires `enabled` and the same allowlist/auth as CI waits. |
+| `prHeadWakeShadow` | `true` | Shadow mode: compute and log intended `pr_head_changed` wakes without firing any. Set `false` only after shadow evidence is accepted. |
 | `webhooksEnabled` | `false` | Phase-two opt-in only. |
 | `webhookSecretRef` | unset | Owner-held HMAC secret reference, required only in phase two. |
 

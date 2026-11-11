@@ -4,6 +4,8 @@ import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID
 import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness } from "./ci-github.js";
 import { CiAppAuth } from "./ci-auth.js";
 import { retryableBeforeQueue } from "./native-wake.js";
+import { parseWorkProductBindings } from "./custody-reader.js";
+import { prRefFromUrl } from "./custody-policy.js";
 
 function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
@@ -23,6 +25,12 @@ export interface Wait extends Registration {
   workspaceId: string;
   branch: string;
   /**
+   * Registering agent, for the pr-head reviewer-wake pusher exclusion.
+   * Optional: waits persisted before this field existed have no known
+   * pusher agent and are treated as ambiguous (prefer waking).
+   */
+  agentId?: string;
+  /**
    * Binding proof for custody: true only when the workspace branch observed
    * before and after the GitHub read equals the live PR head branch. Repo-only
    * registrations (false) must not be trusted by custody; see custody-policy.
@@ -38,6 +46,22 @@ export interface Wait extends Registration {
   reason?: string;
 }
 interface Audit { at: number; operation: string; runId?: string; companyId?: string; waitId?: string; outcome: string; detail?: string }
+/**
+ * A settled-candidate head change for a PR that still owes reviewer wakes.
+ * Persisted so an unsettled head observed in one tick is rechecked (and
+ * woken) on a later tick even after every wait for the old head retired.
+ * `oldSha` is the head the reviewer last saw; `newSha` is the head now
+ * awaiting settlement. `shadowLogged` suppresses repeat shadow logs.
+ */
+export interface PrHeadPending {
+  companyId: string;
+  repo: string;
+  prNumber: number;
+  oldSha: string;
+  newSha: string;
+  observedAt: number;
+  shadowLogged?: boolean;
+}
 interface Ledger {
   version: 1;
   waits: Wait[];
@@ -45,8 +69,11 @@ interface Ledger {
   deliveries: Record<string, number>;
   hints: Record<string, number>;
   samples: Record<string, Array<{ sha: string; ms: number }>>;
+  prHeadPending: Record<string, PrHeadPending>;
+  /** Per-(company, card, SHA) wake dedupe timestamps for pr_head_changed. */
+  reviewerWakes: Record<string, number>;
 }
-const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} });
+const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {}, prHeadPending: {}, reviewerWakes: {} });
 class BindingChanged extends Error {}
 
 /**
@@ -216,6 +243,9 @@ export class CiWakeRuntime {
     const ledger = await this.ctx.state.get(KEY) as Ledger | null;
     if (!ledger) return empty();
     if (ledger.version !== 1 || !Array.isArray(ledger.waits) || !Array.isArray(ledger.audits) || !ledger.deliveries || !ledger.hints || !ledger.samples) throw new Error("invalid_ledger");
+    // Ledgers persisted before pr_head_changed existed lack these fields.
+    ledger.prHeadPending ??= {};
+    ledger.reviewerWakes ??= {};
     return ledger;
   }
 
@@ -244,6 +274,11 @@ export class CiWakeRuntime {
     for (const repo of Object.keys(ledger.samples)) if (!retainedRepos.has(repo)) delete ledger.samples[repo];
     for (const [id, at] of Object.entries(ledger.deliveries)) if (now - at >= LIMITS.replayMs) delete ledger.deliveries[id];
     for (const [id, at] of Object.entries(ledger.hints)) if (now - at >= 60_000) delete ledger.hints[id];
+    for (const [key, entry] of Object.entries(ledger.prHeadPending)) {
+      if (!entry || typeof entry.companyId !== "string" || typeof entry.repo !== "string" || !Number.isSafeInteger(entry.prNumber) || !SHA.test(entry.newSha) || !SHA.test(entry.oldSha)) delete ledger.prHeadPending[key];
+      else if (now - entry.observedAt >= LIMITS.waitMs) delete ledger.prHeadPending[key];
+    }
+    for (const [key, at] of Object.entries(ledger.reviewerWakes)) if (now - at >= LIMITS.retentionMs) delete ledger.reviewerWakes[key];
   }
 
   private async config(companyId: string, requireEnabled = true): Promise<CiConfig> {
@@ -387,7 +422,7 @@ export class CiWakeRuntime {
         const branchVerified = binding.branch === pr.headBranch && current.branch === pr.headBranch;
         const now = this.now();
         for (const old of ledger.waits) if (old.companyId === run.companyId && old.repo === registration.repo && old.prNumber === registration.prNumber && old.issueId === registration.issueId && old.status === "open") { old.status = "retired"; old.finishedAt = now; old.reason = "superseded"; }
-        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
+        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
         return { content: "CI wait registered", data: { waitId, status: "open", expiresAt: now + LIMITS.waitMs, dryRun: config.dryRun } };
@@ -404,6 +439,56 @@ export class CiWakeRuntime {
         return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
       }
     });
+  }
+
+  /**
+   * Record an observed head change for later reviewer-wake processing.
+   * Only a genuine new head on an open, same-repo PR counts: closes,
+   * merges, forks and number mismatches are not pushes.
+   */
+  private noteHeadChange(ledger: Ledger, companyId: string, repo: string, prNumber: number, oldSha: string, newSha: string): void {
+    if (oldSha === newSha) return;
+    const key = `${companyId}:${repo}:${prNumber}`;
+    const existing = ledger.prHeadPending[key];
+    if (existing && existing.newSha === newSha) return;
+    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now() };
+  }
+
+  /** Exact work-product match for one PR; mirrors custody's work_product tier. */
+  private hasPrWorkProduct(issue: { workProducts?: unknown }, repo: string, prNumber: number): boolean {
+    const bindings = parseWorkProductBindings(issue.workProducts);
+    if (!bindings) return false;
+    const ref = `${repo.toLowerCase()}#${prNumber}`;
+    for (const w of bindings) {
+      if (w.url !== null && prRefFromUrl(w.url) !== ref) continue;
+      const metaRepo = w.metadata && typeof w.metadata.repo === "string" ? w.metadata.repo.toLowerCase() : null;
+      const metaNumber = w.metadata && typeof w.metadata.number === "number" ? w.metadata.number : null;
+      if (metaRepo !== null && metaRepo !== repo.toLowerCase()) continue;
+      if (metaNumber !== null && metaNumber !== prNumber) continue;
+      if ((w.url !== null && prRefFromUrl(w.url) === ref) || (metaRepo !== null && metaNumber !== null)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Pusher/author exclusion. GitHub PR author/pusher identities are
+   * logins, never Paperclip agent IDs, so they cannot be mapped; only
+   * definite agent-ID equality excludes. Ambiguous identity (human
+   * participant, legacy wait without agentId, no returnAssignee) wakes.
+   */
+  private isAuthorParticipant(issue: any, ledger: Ledger, entry: PrHeadPending): boolean {
+    const participant = issue?.executionState?.currentParticipant;
+    if (!participant || participant.type !== "agent" || typeof participant.agentId !== "string") return false;
+    const agent = participant.agentId.toLowerCase();
+    if (!UUID.test(agent)) return false;
+    const authors = new Set<string>();
+    for (const wait of ledger.waits) {
+      if (wait.companyId === entry.companyId && wait.repo === entry.repo && wait.prNumber === entry.prNumber && wait.agentId) authors.add(wait.agentId.toLowerCase());
+    }
+    const returnAgent = issue?.executionState?.returnAssignee?.agentId;
+    if (typeof returnAgent === "string" && UUID.test(returnAgent)) authors.add(returnAgent.toLowerCase());
+    if (typeof issue?.assigneeAgentId === "string" && UUID.test(issue.assigneeAgentId)) authors.add(issue.assigneeAgentId.toLowerCase());
+    return authors.has(agent);
   }
 
   async poll(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
@@ -470,6 +555,9 @@ export class CiWakeRuntime {
         const github = await this.client(wait.companyId, config, wait.repo, fetch, cycle);
         const pr = await github.pull(wait.repo, wait.prNumber);
         if (pr.number !== wait.prNumber || pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo) {
+          if (pr.number === wait.prNumber && pr.state === "open" && !pr.merged && pr.headSha !== wait.headSha && pr.headRepo?.toLowerCase() === wait.repo) {
+            this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, pr.headSha);
+          }
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
         const snapshot = await github.snapshot(wait.repo, wait.headSha, pr.baseBranch);
@@ -492,6 +580,9 @@ export class CiWakeRuntime {
         const revalidated = await this.config(wait.companyId);
         if (!revalidated.allowedRepos.includes(wait.repo) || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
         if (current.number !== wait.prNumber || current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo) {
+          if (current.number === wait.prNumber && current.state === "open" && !current.merged && current.headSha !== wait.headSha && current.headRepo?.toLowerCase() === wait.repo) {
+            this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, current.headSha);
+          }
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
         if (!verdict.missing.length && !samples.some((s) => s.sha === wait.headSha)) {
@@ -547,6 +638,102 @@ export class CiWakeRuntime {
         }
         this.audit(ledger, "poll", error instanceof BindingChanged ? "binding_changed" : "retryable", undefined, wait.waitId);
         await this.save(ledger);
+      }
+    }
+    // Reviewer wakes for observed head changes (settled heads only).
+    {
+      const entries = Object.entries(ledger.prHeadPending)
+        .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
+        .sort((a, b) => a[1].observedAt - b[1].observedAt);
+      for (const [key, entry] of entries) {
+        if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+        try {
+          const config = await this.config(entry.companyId, false);
+          // Feature off: drop the entry rather than accumulate stale wakes.
+          if (!config.enabled || !config.prHeadWakeEnabled) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (!config.allowedRepos.includes(entry.repo)) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          const github = await this.client(entry.companyId, config, entry.repo, fetch, cycle);
+          const current = await github.pull(entry.repo, entry.prNumber);
+          if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (current.headSha !== entry.newSha) {
+            // Newer push superseded the pending head: re-target, keeping the
+            // oldest oldSha the reviewer last saw.
+            entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = false;
+            await this.save(ledger); continue;
+          }
+          const snapshot = await github.snapshot(entry.repo, entry.newSha, current.baseBranch);
+          const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
+          const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
+          const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
+          const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs });
+          // Unsettled heads do not wake yet; the entry stays for a later tick.
+          if (verdict.kind === "pending") continue;
+          const revalidated = await this.config(entry.companyId);
+          if (!revalidated.prHeadWakeEnabled || !revalidated.allowedRepos.includes(entry.repo) || revalidated.prHeadWakeShadow !== config.prHeadWakeShadow || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
+          const candidates = [...new Set(ledger.waits.filter((w) => w.companyId === entry.companyId && w.repo === entry.repo && w.prNumber === entry.prNumber).map((w) => w.issueId))];
+          let outstanding = false;
+          for (const issueId of candidates) {
+            const wakeKey = `${entry.companyId}:${issueId}:${entry.newSha}`;
+            if (ledger.reviewerWakes[wakeKey] !== undefined) continue;
+            let issue: any;
+            try { issue = await this.ctx.issues.get(issueId, entry.companyId); }
+            catch { outstanding = true; continue; }
+            if (!issue || issue.id !== issueId || issue.companyId !== entry.companyId) { outstanding = true; continue; }
+            if (issue.status !== "in_review") continue;
+            const state = issue.executionState;
+            if (!state || state.status !== "pending" || state.currentStageId == null || !state.currentParticipant) continue;
+            if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
+            if (this.isAuthorParticipant(issue, ledger, entry)) continue;
+            const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
+            if (config.prHeadWakeShadow) {
+              if (!entry.shadowLogged) {
+                entry.shadowLogged = true;
+                this.audit(ledger, "pr_head_wake", "would_wake");
+                await this.save(ledger);
+                this.ctx.logger.info("pr-head-wake: would wake", { companyId: entry.companyId, issueId, repo: entry.repo, prNumber: entry.prNumber, oldSha: entry.oldSha, newSha: entry.newSha });
+              }
+              outstanding = true;
+              continue;
+            }
+            // Persist dedupe intent BEFORE the host call. A lost reply or
+            // restart never repeats this (card, SHA) effect.
+            ledger.reviewerWakes[wakeKey] = this.now();
+            this.audit(ledger, "pr_head_wake", "intent");
+            try { await this.save(ledger); } catch {
+              delete ledger.reviewerWakes[wakeKey];
+              outstanding = true; throw new Error("wake_intent_write_failed");
+            }
+            wakes += 1;
+            let result: Awaited<ReturnType<PluginContext["issues"]["requestWakeup"]>>;
+            try {
+              result = await this.ctx.issues.requestWakeup(issueId, entry.companyId, { reason, contextSource: "plugin.ci-wake", idempotencyKey: `pr-head-wake:${entry.repo}:${entry.prNumber}:${entry.newSha}:${issueId}` });
+            } catch (error) {
+              if (retryableBeforeQueue(error)) {
+                delete ledger.reviewerWakes[wakeKey];
+                this.audit(ledger, "pr_head_wake", "host_deferred");
+                outstanding = true;
+              } else {
+                this.audit(ledger, "pr_head_wake", "unconfirmed");
+                this.ctx.logger.warn("pr-head-wake: wake unconfirmed; use the card backstop", { issueId, repo: entry.repo, prNumber: entry.prNumber });
+              }
+              await this.save(ledger);
+              continue;
+            }
+            if (result.queued) {
+              this.audit(ledger, "pr_head_wake", "woken");
+            } else {
+              delete ledger.reviewerWakes[wakeKey];
+              this.audit(ledger, "pr_head_wake", "host_deferred");
+              outstanding = true;
+            }
+            await this.save(ledger);
+          }
+          // Clear only when every candidate is woken/deduped/ineligible/excluded.
+          if (!outstanding && !config.prHeadWakeShadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
+        } catch (error) {
+          this.audit(ledger, "pr_head_wake", "retryable");
+          await this.save(ledger);
+        }
       }
     }
     await this.save(ledger);
