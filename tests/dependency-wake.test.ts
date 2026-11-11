@@ -133,6 +133,18 @@ describe("dependency wake", () => {
     expect(h.ledger()?.receipts[`${DEP}:${BLK}`]?.outcome).toBe("unconfirmed");
   });
 
+  it("treats a budget hold landing after preflight as a deferred wake, not unconfirmed", async () => {
+    const h = harness();
+    h.ctx.issues.requestWakeup.mockImplementationOnce(async () => { h.budgetBlocks.push({ issueId: DEP, agentId: AGENT }); throw new Error("agent daily budget exhausted"); });
+    await h.runtime.poll();
+    expect(h.ledger()?.receipts).toEqual({});
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toEqual(["host_deferred"]);
+    h.budgetBlocks.length = 0;
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(h.ledger()?.receipts[`${DEP}:${BLK}`]?.outcome).toBe("woken");
+  });
+
   it("wakes again for a blocker that reopens and completes a second time", async () => {
     const h = harness();
     await h.runtime.poll();

@@ -193,7 +193,10 @@ export class DependencyWakeRuntime {
       if (result.queued) { record("woken", result.runId); tick.audit("woken", issue.id); }
       else { forget(); tick.audit("host_deferred", issue.id); }
     } catch (error) {
-      if (retryableBeforeQueue(error)) { forget(); tick.audit("host_deferred", issue.id); } else {
+      // A budget hold can start between the preflight check and the host call:
+      // the host throws its reason before dispatch, so a live block is definite
+      // evidence the wake never ran and may safely retry next tick.
+      if (retryableBeforeQueue(error) || (await this.liveRun(tick, issue.id)).budgetBlocked) { forget(); tick.audit("host_deferred", issue.id); } else {
         record("unconfirmed");
         tick.audit("unconfirmed", issue.id);
         this.ctx.logger.warn("dependency-wake: wake unconfirmed", { issueId: issue.id });
