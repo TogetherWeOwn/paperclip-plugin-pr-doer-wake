@@ -109,6 +109,15 @@ describe("custody native effects", () => {
     expect(h.created[0].parentId).toBe(ISSUE);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(CHILD, COMPANY, expect.any(Object));
   });
+  it("marks a PR with an oversized document unknown without dispatching effects", async () => {
+    const h = fixture({ cards: [card({ oversizeDocuments: [CHILD] })], dryRun: true });
+    await h.runtime.poll();
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: "example/project#42", unknown: true })]);
+    expect(h.ledger().report.unknown).toContain(`oversize_document:${CHILD}`);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
+  });
   it("keeps dry run entirely free of card/document/wake effects and live keys separate", async () => {
     const h = fixture({ dryRun: true });
     await h.runtime.poll();

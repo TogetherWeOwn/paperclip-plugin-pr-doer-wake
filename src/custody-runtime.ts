@@ -369,6 +369,12 @@ export class CustodyRuntime {
               if (pr.state === "closed") summaryClosures.add(repo);
               continue;
             }
+            if (mapping.card.oversizeDocuments?.length) {
+              if (pr.state === "closed") complete = false;
+              row.unknown = true;
+              for (const documentId of mapping.card.oversizeDocuments) unknown(`oversize_document:${documentId}`);
+              continue;
+            }
             let owner: CustodyCard;
             try { owner = await this.dispositionClock(mapping.card, pr, ledger, async (id) => await archived("disposition", id) as number | null); }
             catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); continue; }

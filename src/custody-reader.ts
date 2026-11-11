@@ -29,6 +29,7 @@ export interface CustodyCard {
   cancelledAt: number | null;
   texts: Array<{ id?: string; body: string; at: number; ownership: boolean }>;
   workProducts?: WorkProductBinding[];
+  oversizeDocuments?: string[];
 }
 
 // Fail-closed budgets, never truncation limits. An incomplete company view
@@ -160,9 +161,9 @@ export function parseWorkProductBindings(raw: unknown): WorkProductBinding[] | n
 
 function byteBudget() {
   let totalBytes = 0;
-  return (body: string): void => {
+  return (body: string, allowOversize = false): void => {
     const bytes = Buffer.byteLength(body, "utf8");
-    if (body.length > MAX_BODY_CHARS || bytes > MAX_BODY_BYTES) unknown("body budget exceeded");
+    if (!allowOversize && (body.length > MAX_BODY_CHARS || bytes > MAX_BODY_BYTES)) unknown("body budget exceeded");
     totalBytes += bytes;
     if (totalBytes > MAX_TOTAL_BYTES) unknown("total byte budget exceeded");
   };
@@ -331,9 +332,15 @@ export async function loadCustodyTexts(
     if (document.companyId !== companyId || document.issueId !== card.id || document.id !== documentId || document.key !== key) {
       unknown("document missing or identity mismatch");
     }
-    const body = text(document.body, "document body");
-    budget(body);
-    card.texts.push({ id: `document:${documentId}`, body, at: time(document.updatedAt), ownership: true });
+    if (typeof document.body !== "string") unknown("invalid document body");
+    const body = document.body;
+    const at = time(document.updatedAt);
+    budget(body, true);
+    if (body.length > MAX_BODY_CHARS || Buffer.byteLength(body, "utf8") > MAX_BODY_BYTES) {
+      (card.oversizeDocuments ??= []).push(documentId);
+      continue;
+    }
+    card.texts.push({ id: `document:${documentId}`, body, at, ownership: true });
   }
   return [...byId.values()];
 }

@@ -300,12 +300,23 @@ describe("loadCustodyCards", () => {
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
-  it("rejects oversized comments and document bodies without truncating them", async () => {
+  it("rejects oversized comments but marks oversized documents without retaining their bodies", async () => {
     const comments = host({ comments: [comment(1, { body: "a".repeat(128_001) })] });
-    await expect(loadAll(comments.ctx,  comments.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadAll(comments.ctx, comments.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    for (const body of ["a".repeat(128_001), "界".repeat(90_000)]) {
+      const docs = host({ documents: [document(), document(2)] });
+      docs.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body, updatedAt: AT });
+      const [result] = await loadAll(docs.ctx, docs.guard);
+      expect(result!.oversizeDocuments).toEqual([uuid(100_001)]);
+      expect(result!.texts.map((entry) => entry.id)).toContain(`document:${uuid(100_002)}`);
+      expect(result!.texts.map((entry) => entry.id)).not.toContain(`document:${uuid(100_001)}`);
+    }
+  });
+
+  it("counts oversized document bytes against the aggregate budget", async () => {
     const docs = host({ documents: [document()] });
-    docs.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "界".repeat(90_000), updatedAt: AT });
-    await expect(loadAll(docs.ctx,  docs.guard)).rejects.toThrow("body budget");
+    docs.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "a".repeat(CUSTODY_READ_LIMITS.totalBytes + 1), updatedAt: AT });
+    await expect(loadAll(docs.ctx, docs.guard)).rejects.toThrow("total byte budget");
   });
 
   it("rejects aggregate evidence bytes during pagination", async () => {
