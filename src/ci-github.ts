@@ -225,6 +225,15 @@ function refusalDetail(status: number, permissionDenied: boolean, path: string, 
   return suffix.length ? `${base} ${suffix.join(" ")}` : base;
 }
 
+/**
+ * GitHub requires a User-Agent on every REST request and answers UA-less calls
+ * with a 403 text/plain ("Please make sure your request has a User-Agent
+ * header") carrying no rate-limit headers. The host fetch goes through node
+ * http.request, which adds no default User-Agent (unlike global fetch), so the
+ * client sets this one explicitly on every request — token exchange included.
+ * Keep the version in sync with package.json / manifest.ts.
+ */
+export const GITHUB_USER_AGENT = "togetherweown-paperclip-plugin-pr-doer-wake/0.3.0";
 const ORIGIN = "https://api.github.com";
 const PAGE_SIZE = 100;
 // Recognize provider credential shapes without retaining expired/previous tokens.
@@ -646,7 +655,7 @@ export class CiGithub {
     const cached = graphqlBody === undefined && !exchange && statusBody === undefined ? this.cache.get(url) : undefined;
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`,
-      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": GITHUB_USER_AGENT, "X-GitHub-Api-Version": "2022-11-28",
       ...(exchange || statusBody ? { "Content-Type": "application/json" } : {}),
     };
     if (cached) headers["If-None-Match"] = cached.etag;

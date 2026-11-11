@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  CiGithub, CiGithubCache, CiGithubError, evaluateReadiness,
+  CiGithub, CiGithubCache, CiGithubError, evaluateReadiness, GITHUB_USER_AGENT,
   type CiCheckRun, type CiCheckSuite, type CiFetch, type CiHttpResponse, type CiSnapshot,
   type CiTokenExchange, type CiTokenSource,
 } from "../src/ci-github.js";
@@ -277,7 +277,7 @@ describe("CiGithub REST reads", () => {
     expect(actual).toEqual({ repo: REPO, number: 1, headSha: SHA, headBranch: "task-123", headRepo: REPO,
       baseBranch: "release/one", author: "builder", state: "open", draft: false, merged: false, mergeable: null });
     expect(calls[0]!.url.href).toBe(`https://api.github.com/repos/${REPO}/pulls/1`);
-    expect(calls[0]!.init?.headers).toMatchObject({ Authorization: `Bearer ${TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" });
+    expect(calls[0]!.init?.headers).toMatchObject({ Authorization: `Bearer ${TOKEN}`, "User-Agent": GITHUB_USER_AGENT, "X-GitHub-Api-Version": "2022-11-28" });
   });
 
   it("also accepts the installed SDK's standard Response", async () => {
