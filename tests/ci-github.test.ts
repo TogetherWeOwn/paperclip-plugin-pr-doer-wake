@@ -949,6 +949,36 @@ describe("CiGithub caching, backoff, and caps", () => {
     }
   });
 
+  it.each([
+    ["permission", "Resource not accessible by integration", {}, "permission repo_pulls"],
+    ["unclassified", "You have exceeded a secondary rate limit.", {}, "unclassified repo_pulls"],
+    ["permission", "Resource not accessible by personal access token", { "x-accepted-github-permissions": "issues=read,metadata=read" }, "permission repo_pulls needs=issues=read,metadata=read"],
+    // A malformed accepted-permissions value is dropped, never echoed into the message.
+    ["permission", "Resource not accessible by integration", { "x-accepted-github-permissions": "../../etc/passwd" }, "permission repo_pulls"],
+    ["permission", "Resource not accessible by integration", { "x-accepted-github-permissions": "issues=read,metadata=read; secondary rate limit applies" }, "permission repo_pulls needs=issues=read,metadata=read"],
+  ] as const)("names the refused endpoint template and permission kind for 403 (%s)", async (_kind, message, headers, detail) => {
+    const cache = new CiGithubCache();
+    const fetch = vi.fn(async () => response({ message }, 403, headers));
+    const error = await new CiGithub(fetch, TOKEN, { cache, now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).code).toBe("http");
+    expect((error as CiGithubError).status).toBe(403);
+    expect((error as CiGithubError).detail).toBe(detail);
+    expect((error as CiGithubError).message).toBe(`GitHub CI http (403) ${detail}`);
+    expect((error as CiGithubError).message).not.toContain(TOKEN);
+    expect((error as CiGithubError).message).not.toContain(REPO);
+  });
+
+  it("names throttled endpoints for 429 and leaves other statuses bare", async () => {
+    const fetch429 = vi.fn(async () => response({ message: "rate limited" }, 429));
+    const error429 = await new CiGithub(fetch429, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect((error429 as CiGithubError).message).toBe("GitHub CI http (429) throttle repo_pulls");
+    const fetch500 = vi.fn(async () => response({ message: "server error" }, 500));
+    const error500 = await new CiGithub(fetch500, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect((error500 as CiGithubError).detail).toBeUndefined();
+    expect((error500 as CiGithubError).message).toBe("GitHub CI http (500)");
+  });
+
   it("backs off when a 403 body cannot be read within the existing deadline", async () => {
     const cache = new CiGithubCache();
     const denied = new Response("", { status: 403 });
