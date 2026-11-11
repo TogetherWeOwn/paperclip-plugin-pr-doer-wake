@@ -44,7 +44,8 @@ function harness() {
       list: vi.fn(async ({ status, limit }: { status: string; limit?: number }) => Object.values(issues).filter((i) => i.status === status).slice(0, limit)),
       get: vi.fn(async (id: string) => issues[id] ?? null),
       relations: { get: vi.fn(async (id: string) => ({ blockedBy: relations[id] ?? [], blocks: [] })) },
-      summaries: { getOrchestration: vi.fn(async ({ issueId }: { issueId: string }) => ({ runs: runs[issueId] ?? [], invocationBlocks: budgetBlocks })) },
+      // Like the host (getIssueRunSummaries): the newest 100 runs by createdAt, across all agents.
+      summaries: { getOrchestration: vi.fn(async ({ issueId }: { issueId: string }) => ({ runs: [...(runs[issueId] ?? [])].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 100), invocationBlocks: budgetBlocks })) },
       requestWakeup: vi.fn(async (): Promise<{ queued: boolean; runId: string | null }> => ({ queued: true, runId: "run-new" })),
     },
     logger: { info: vi.fn(), warn: vi.fn() },
@@ -111,6 +112,7 @@ describe("dependency wake", () => {
     ["dependent has a queued run", (h) => { h.runs[DEP]!.push({ id: "r2", issueId: DEP, agentId: AGENT, status: "queued", createdAt: iso(START - MIN), startedAt: null, finishedAt: null }); }],
     ["dependent started a run after the blocker finished", (h) => { Object.assign(h.runs[DEP]![0]!, { startedAt: iso(START - 25 * MIN), finishedAt: iso(START - 20 * MIN) }); }],
     ["blocker still has a live run (finalize pending)", (h) => { h.runs[BLK] = [{ id: "b1", issueId: BLK, agentId: REVIEWER, status: "running", createdAt: iso(START - 40 * MIN), startedAt: iso(START - 40 * MIN), finishedAt: null }]; }],
+    ["blocker's run window is full (an older live run may be hidden)", (h) => { h.runs[BLK] = Array.from({ length: 100 }, (_, i) => ({ id: `b${i}`, issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 40 * MIN + i * 1_000), startedAt: iso(START - 40 * MIN + i * 1_000), finishedAt: iso(START - 40 * MIN + i * 1_000 + 500) })); }],
     ["another agent (e.g. a reviewer) has a live run on the dependent", (h) => { h.runs[DEP]!.push({ id: "rv", issueId: DEP, agentId: REVIEWER, status: "running", createdAt: iso(START - 2 * MIN), startedAt: iso(START - 2 * MIN), finishedAt: null }); }],
     ["budget invocation block", (h) => { h.budgetBlocks.push({ issueId: DEP, agentId: AGENT }); }],
     ["dependent not in a covered status", (h) => { h.issues[DEP]!.status = "todo"; }],
@@ -219,6 +221,31 @@ describe("dependency wake", () => {
     h.runs[DEP]!.push({ id: "rv", issueId: DEP, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN), startedAt: iso(START - 20 * MIN), finishedAt: iso(START - 15 * MIN) });
     await h.runtime.poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a run window truncated by the host's 100-row cap as unknown evidence, not as the assignee never running", async () => {
+    // Blocker done at T-30m; the assignee started a run at T-25m and so saw it.
+    const reviewerRuns = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `rv${i}`, issueId: DEP, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN + i * 1_000), startedAt: iso(START - 20 * MIN + i * 1_000), finishedAt: iso(START - 20 * MIN + i * 1_000 + 500) }));
+    for (const [n, audited] of [[99, false], [100, true]] as const) {
+      const h = harness();
+      Object.assign(h.runs[DEP]![0]!, { createdAt: iso(START - 25 * MIN), startedAt: iso(START - 25 * MIN), finishedAt: iso(START - 22 * MIN) });
+      // Newer reviewer runs; at 100 they push the assignee's run out of the window.
+      h.runs[DEP]!.push(...reviewerRuns(n));
+      await h.runtime.poll();
+      expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger()?.receipts).toEqual({});
+      expect(h.ledger()?.audits.map((a) => a.outcome).includes("run_window_truncated")).toBe(audited);
+    }
+  });
+
+  it("fails closed on a full window even when every visible assignee run started before the blocker finished", async () => {
+    // A truncated history hides only runs created earlier, but one of those could have been
+    // queued long and started after the blocker finished: unknown, so audit rather than guess.
+    const h = harness();
+    h.runs[DEP]!.push(...Array.from({ length: 99 }, (_, i) => ({ id: `rv${i}`, issueId: DEP, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 80 * MIN + i * 1_000), startedAt: iso(START - 80 * MIN + i * 1_000), finishedAt: iso(START - 80 * MIN + i * 1_000 + 500) })));
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("run_window_truncated");
   });
 
   it("treats a genuine re-completion (new completedAt epoch) as a new event and wakes once for it", async () => {

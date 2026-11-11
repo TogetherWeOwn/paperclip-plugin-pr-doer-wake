@@ -23,6 +23,9 @@ export const DEPENDENCY_WAKE_LIMITS = {
   // (dependent, blocker) pairs in 7 days is far beyond a normal workload, and the
   // excess is deferred and reported rather than lost or repeated.
   receipts: 5_000,
+  // The host's run summary returns only the newest 100 runs (by createdAt) of ANY agent on the issue
+  // (plugin-host-services getIssueRunSummaries); a full window may have dropped the assignee's runs.
+  hostRunWindow: 100,
 } as const;
 const L = DEPENDENCY_WAKE_LIMITS;
 const STATUSES = ["in_review", "in_progress"] as const;
@@ -158,7 +161,8 @@ export class DependencyWakeRuntime {
     const summary = await tick.read(() => this.ctx.issues.summaries.getOrchestration({ issueId, companyId: tick.companyId }));
     const all = summary.runs.filter((run) => run.issueId === issueId);
     const runs = agentId ? all.filter((run) => run.agentId === agentId) : all;
-    return { runs, live: all.some((run) => LIVE.has(run.status)), budgetBlocked: summary.invocationBlocks.some((b) => b.issueId === issueId) };
+    const truncated = summary.runs.length >= L.hostRunWindow;
+    return { runs, truncated, live: all.some((run) => LIVE.has(run.status)), budgetBlocked: summary.invocationBlocks.some((b) => b.issueId === issueId) };
   }
 
   private async consider(tick: Tick, issue: Issue, status: (typeof STATUSES)[number]): Promise<void> {
@@ -192,8 +196,14 @@ export class DependencyWakeRuntime {
     // Only blockers that finished after the dependent's last run started; an earlier one was seen by that run.
     const triggers = fresh.filter((b) => doneAt.get(b.id)! > lastRun);
     if (!triggers.length) return;
-    // A done blocker with a live run may still be finalizing its workspace: wait for it.
-    for (const b of triggers) if ((await this.liveRun(tick, b.id)).live) return;
+    // A full window may have dropped an assignee run that started after a trigger: unknown, so no wake.
+    if (dependent.truncated) { tick.audit("run_window_truncated", issue.id); return; }
+    // A done blocker with a live run may still be finalizing its workspace: wait for it. A full
+    // window may have dropped an older live run, so it is treated the same way.
+    for (const b of triggers) {
+      const blocker = await this.liveRun(tick, b.id);
+      if (blocker.live || blocker.truncated) return;
+    }
     report.eligible += 1;
     // Fail closed rather than evict a dedupe record: resume at this candidate once old receipts age out.
     if (Object.values(ledger.receipts).filter((r) => relevant(r, now)).length + triggers.length > L.receipts) throw new Error("receipt_capacity");
