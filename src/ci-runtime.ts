@@ -292,8 +292,24 @@ export class CiWakeRuntime {
       for (const [key] of oldest) delete ledger.prHeadPending[key];
     }
     if (Object.keys(ledger.reviewerWakes).length > LIMITS.reviewerWakes) {
-      const oldest = Object.entries(ledger.reviewerWakes).sort((a, b) => a[1] - b[1]).slice(0, Object.keys(ledger.reviewerWakes).length - LIMITS.reviewerWakes);
-      for (const [key] of oldest) delete ledger.reviewerWakes[key];
+      // Never evict a dedupe record a still-pending entry relies on: its
+      // successfully-woken candidates would be woken again on the next
+      // tick. (Keys are companyId:issueId:sha; UUIDs and SHAs carry no
+      // colons, so membership is a (company, sha) pair check.)
+      const live = new Set(Object.values(ledger.prHeadPending).map((entry) => `${entry.companyId}:${entry.newSha}`));
+      const evictable = Object.entries(ledger.reviewerWakes)
+        .filter(([key]) => { const [c, , s] = key.split(":"); return !live.has(`${c}:${s}`); })
+        .sort((a, b) => a[1] - b[1]);
+      const excess = Object.keys(ledger.reviewerWakes).length - LIMITS.reviewerWakes;
+      for (const [key] of evictable.slice(0, excess)) delete ledger.reviewerWakes[key];
+      // Protected records alone exceeding the cap: evict oldest overall
+      // rather than grow without bound (pending entries are capped at
+      // 1,000, bounding this in practice).
+      const remaining = Object.keys(ledger.reviewerWakes).length - LIMITS.reviewerWakes;
+      if (remaining > 0) {
+        const oldest = Object.entries(ledger.reviewerWakes).sort((a, b) => a[1] - b[1]).slice(0, remaining);
+        for (const [key] of oldest) delete ledger.reviewerWakes[key];
+      }
     }
   }
 
@@ -438,6 +454,16 @@ export class CiWakeRuntime {
         const branchVerified = binding.branch === pr.headBranch && current.branch === pr.headBranch;
         const now = this.now();
         for (const old of ledger.waits) if (old.companyId === run.companyId && old.repo === registration.repo && old.prNumber === registration.prNumber && old.issueId === registration.issueId && old.status === "open") { old.status = "retired"; old.finishedAt = now; old.reason = "superseded"; }
+        // The normal flow is push-then-register: an open wait never survives
+        // long enough for a poll to observe the moved head, and a settled
+        // wait is never polled again. Registering a new head therefore
+        // records the change itself when the most recent prior wait for this
+        // card/PR was for a different head (the live PR head was verified
+        // above, so a differing prior head means the PR really moved).
+        const prior = ledger.waits
+          .filter((w) => w.companyId === run.companyId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.issueId === registration.issueId)
+          .sort((a, b) => b.registeredAt - a.registeredAt)[0];
+        if (prior) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior.headSha, registration.headSha);
         ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
@@ -690,6 +716,15 @@ export class CiWakeRuntime {
           if (verdict.kind === "pending") continue;
           const revalidated = await this.config(entry.companyId);
           if (!revalidated.prHeadWakeEnabled || !revalidated.allowedRepos.includes(entry.repo) || revalidated.prHeadWakeShadow !== config.prHeadWakeShadow || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
+          // Mirror the CI path: re-read the live PR after the readiness
+          // snapshot and before any wake intent. A push during the snapshot
+          // must retarget the entry, never wake for the stale SHA.
+          const checked = await github.pull(entry.repo, entry.prNumber);
+          if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (checked.headSha !== entry.newSha || checked.baseBranch !== current.baseBranch) {
+            entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
+            await this.save(ledger); continue;
+          }
           // dryRun is the global rollback kill-switch: it forces no-fire
           // (effective shadow) exactly like prHeadWakeShadow, so an operator
           // rollback via dryRun: true silences this path too.
@@ -720,6 +755,11 @@ export class CiWakeRuntime {
               outstanding = true;
               continue;
             }
+            // Per-tick wake budget applies inside the candidate loop too:
+            // one PR can have many eligible cards. Stop dispatching, keep
+            // the entry, and resume the rest on the next tick; already
+            // woken cards stay deduped via reviewerWakes.
+            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
             // Persist dedupe intent BEFORE the host call. A lost reply or
             // restart never repeats this (card, SHA) effect.
             ledger.reviewerWakes[wakeKey] = this.now();
