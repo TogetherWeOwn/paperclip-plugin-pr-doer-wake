@@ -113,10 +113,80 @@ export class CiGithubError extends Error {
     public readonly code: CiGithubErrorCode,
     public readonly status?: number,
     public readonly retryAt?: number,
+    public readonly detail?: string,
   ) {
-    super(`GitHub CI ${code}${status === undefined ? "" : ` (${status})`}`);
+    super(`GitHub CI ${code}${status === undefined ? "" : ` (${status})`}${detail === undefined ? "" : ` ${detail}`}`);
     this.name = "CiGithubError";
   }
+}
+
+/**
+ * Refusal diagnostics for 403/429 only: a fixed allowlist of endpoint
+ * templates (never the raw URL, which can carry a repository or branch name),
+ * a fixed kind (permission evidence vs throttle vs unclassified), the
+ * permissions GitHub itself reported as accepted on a 403, and the
+ * rate-limit header values (remaining / retry-after), each re-emitted only
+ * when it matches a strict shape. Bounded and secret-free: no bodies, no
+ * other headers, no tokens. The rate-limit values separate a refused token
+ * exchange from an installation rate limit when both answer 403.
+ * This is the ci-wake twin of the custody diagnostic in PR #19 (TWO-5961):
+ * the same templates and shape so registration/poll 403s name their source
+ * (token_exchange vs repo_pulls/rules/protection/checks/statuses/actions)
+ * in the ledger audit and the agent-facing refusal reason.
+ */
+const ENDPOINT_TEMPLATES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^\/app\/installations\/[1-9][0-9]{0,15}\/access_tokens$/, "token_exchange"],
+  [/^\/orgs\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/repos$/, "org_repos"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/issues\/[1-9][0-9]*\/comments$/, "repo_issue_comments"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/pulls(?:\/[1-9][0-9]*)?$/, "repo_pulls"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/commits\/[a-fA-F0-9]{40}\/(?:check-runs|check-suites)$/, "repo_checks"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/check-suites\/[1-9][0-9]*$/, "repo_checks"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/commits\/[a-fA-F0-9]{40}\/statuses$/, "repo_statuses"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/actions\/runs(?:\/[1-9][0-9]*(\/attempts\/[1-9][0-9]*\/jobs)?)?$/, "repo_actions"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/rules\/branches\/[^/]+$/, "repo_rules"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/branches\/[^/]+\/protection\/required_status_checks$/, "repo_branch_protection"],
+  [/^\/graphql$/, "graphql"],
+];
+function endpointTemplate(path: string): string {
+  const bare = path.split("?")[0] ?? "";
+  return ENDPOINT_TEMPLATES.find(([pattern]) => pattern.test(bare))?.[1] ?? "other";
+}
+// GitHub's accepted-permission list, e.g. "metadata=read,issues=read". Up to
+// four entries; anything else is dropped rather than echoed.
+const NEEDS_PATTERN = /^[a-z_]+=(read|write|admin)(,[a-z_]+=(read|write|admin)){0,3}$/;
+// Rate-limit evidence distinguishes a refused token exchange (quota left,
+// no retry-after) from an installation rate limit (remaining 0 and/or
+// retry-after) when both answer 403. Only strict shapes are re-emitted.
+const REMAINING_PATTERN = /^\d{1,10}$/;
+const RETRY_SECONDS_PATTERN = /^\d{1,6}$/;
+const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+function rateLimitDetail(headers: Record<string, string> | Headers): string[] {
+  const parts: string[] = [];
+  const remaining = header(headers, "x-ratelimit-remaining")?.trim();
+  if (remaining !== undefined && REMAINING_PATTERN.test(remaining)) parts.push(`rl-remaining=${remaining}`);
+  const retry = header(headers, "retry-after")?.trim();
+  if (retry !== undefined && RETRY_SECONDS_PATTERN.test(retry)) {
+    parts.push(`retry-after=${retry}`);
+  } else if (retry !== undefined && HTTP_DATE.test(retry)) {
+    const parsed = Date.parse(retry);
+    if (Number.isFinite(parsed)) parts.push(`retry-after=${Math.floor(parsed / 1000)}`);
+  }
+  return parts;
+}
+function refusalDetail(status: number, permissionDenied: boolean, path: string, headers: Record<string, string> | Headers): string {
+  const kind = status === 429 ? "throttle" : permissionDenied ? "permission" : "unclassified";
+  const base = `${kind} ${endpointTemplate(path)}`;
+  const suffix: string[] = [];
+  if (status === 403) {
+    const raw = header(headers, "x-accepted-github-permissions");
+    if (raw !== undefined) {
+      // The header may carry trailing guidance after ';'; only the list before it is ours.
+      const needs = raw.split(";")[0]!.replace(/\s+/g, "");
+      if (needs.length <= 128 && NEEDS_PATTERN.test(needs)) suffix.push(`needs=${needs}`);
+    }
+  }
+  suffix.push(...rateLimitDetail(headers));
+  return suffix.length ? `${base} ${suffix.join(" ")}` : base;
 }
 
 const ORIGIN = "https://api.github.com";
@@ -557,7 +627,8 @@ export class CiGithub {
     // Also fail closed if an SDK/host ignores RequestInit.redirect and follows a redirect.
     if ("redirected" in response && response.redirected) return invalid();
     if ("url" in response && response.url && response.url !== url) return invalid();
-    this.rateLimit(response.status, response.headers, await this.permissionDenied(response));
+    const denied = await this.permissionDenied(response);
+    this.rateLimit(response.status, response.headers, denied);
     if (response.status === 304) {
       if (!cached || unconditionalRetry) return invalid();
       return { data: this.parse(cached.body, token), link: cached.link };
@@ -566,7 +637,10 @@ export class CiGithub {
     // status number is accepted, then strictly projected before returning.
     if (!(exchange ? response.status === 201 : statusBody !== undefined ? response.status === 200 || response.status === 201 : response.status === 200)) {
       if (!exchange && response.status === 401 && typeof this.#credential !== "string") this.#credential.invalidate();
-      throw new CiGithubError("http", response.status, this.cache.backoffUntil > this.now() ? this.cache.backoffUntil : undefined);
+      const detail = response.status === 403 || response.status === 429
+        ? refusalDetail(response.status, denied, path, response.headers)
+        : undefined;
+      throw new CiGithubError("http", response.status, this.cache.backoffUntil > this.now() ? this.cache.backoffUntil : undefined, detail);
     }
     let body: string;
     try { body = typeof response.body === "string" ? response.body : await this.deadline(() => (response as Response).text()); }

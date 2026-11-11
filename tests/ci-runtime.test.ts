@@ -514,12 +514,25 @@ describe("CI runtime registration authorization", () => {
     const result = await h.runtime.register(registration, run);
     expect(result).toMatchObject({ data: { code: "github_http" } });
     expect(result.content).toContain("HTTP 403");
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "github_http", detail: "status=403" });
     const h2 = setup();
     const shapeResult = await h2.runtime.register({ ...registration, headSha: "abc1234" }, run);
     expect(shapeResult.content).toContain("invalid_registration");
     expect(shapeResult.content).toContain("headSha:length=7");
     expect(h2.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "invalid_registration", detail: expect.stringContaining("headSha:length=7") });
     expect(JSON.stringify(h2.ledger().audits.at(-1))).not.toContain("abc1234");
+  });
+
+  it("names the endpoint class in the github_http reason and audit when the diagnostic is present", async () => {
+    const { CiGithubError } = await import("../src/ci-github.js");
+    const h = setup();
+    github.pull.mockRejectedValue(new CiGithubError("http", 403, undefined, "permission token_exchange needs=metadata=read rl-remaining=0 retry-after=60"));
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ data: { code: "github_http" } });
+    expect(result.content).toContain("HTTP 403 (permission token_exchange");
+    expect(result.content).toContain("rl-remaining=0");
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "github_http", detail: "status=403 permission token_exchange needs=metadata=read rl-remaining=0 retry-after=60" });
+    expect(JSON.stringify(result)).not.toContain(TOKEN);
   });
 
   it("maps GitHub client failures to github_<code> without leaking upstream detail", async () => {

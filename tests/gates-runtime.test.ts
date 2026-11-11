@@ -91,6 +91,14 @@ function setup(options: { config?: Record<string, unknown>; interactions?: unkno
 beforeEach(() => { vi.clearAllMocks(); });
 
 describe("gates status runtime", () => {
+  it("writes no drain/intent audit when the queue is empty (disabled sweep is silent)", async () => {
+    const h = setup({ config: gatesConfig({ gatesStatusEnabled: false }) });
+    h.seed({ version: 1, queue: [], published: {}, audits: [] });
+    await h.runtime.drain();
+    expect(h.ledger().audits).toEqual([]);
+    expect(h.ledger().queue).toEqual([]);
+  });
+
   it("publishes success for an RM-accepted merge confirmation and drains the queue entry", async () => {
     const h = setup();
     await h.enqueue();

@@ -141,7 +141,16 @@ function refusalDetail(error: unknown): { code: string; reason: string; auditDet
   let auditDetail: string | undefined;
   if (code === "github_http") {
     const status = error instanceof CiGithubError ? error.status : undefined;
-    reason = status === undefined ? "GitHub request failed." : `GitHub returned HTTP ${status}.`;
+    const detail = error instanceof CiGithubError ? error.detail : undefined;
+    reason = status === undefined ? "GitHub request failed." : detail === undefined ? `GitHub returned HTTP ${status}.` : `GitHub returned HTTP ${status} (${detail}).`;
+    // The audit ledger is the durable triage record: when the agent-facing
+    // reason is masked upstream (e.g. a gateway that drops plugin content),
+    // the numeric status here still distinguishes permission (403) from
+    // missing repo access (404) from throttling (429). When the 403/429
+    // diagnostic is present it also names the allowlisted endpoint class
+    // (and, for 403, the required permissions) so the failing call is
+    // identifiable without raw URLs/repos/branches in the ledger.
+    if (status !== undefined) auditDetail = detail === undefined ? `status=${status}` : `status=${status} ${detail}`;
   }
   if (error instanceof InvalidRegistrationError) {
     const received = error.shape.join(", ");
