@@ -769,6 +769,13 @@ function label(check: CiRequiredContext): string {
   return check.appId === null ? check.context : `${check.context} [app ${check.appId}]`;
 }
 
+/** Suites that can still contribute checks or represent observed work. */
+export function relevantSuites(snapshot: CiSnapshot): CiSnapshot["suites"] {
+  return snapshot.suites.filter((suite) => suite.latestCheckRunsCount !== 0
+    || !["queued", "in_progress"].includes(suite.status)
+    || snapshot.runs.some((run) => run.suiteId === suite.id && run.appId === suite.appId));
+}
+
 /** Pure, conservative readiness: no network, wall clock, branch fallback, or PR body policy. */
 export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTiming): CiReadiness {
   if (![timing.now, timing.registeredAt, timing.medianMs].every(Number.isFinite) || timing.medianMs <= 0) {
@@ -779,9 +786,7 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   // Multiple workflows share the GitHub Actions app ID; app ID is not suite identity.
   // Installed Apps can leave empty queued suites forever. Unknown states and suites
   // referenced by observed runs retain generation safety, even if a later count is zero.
-  const suites = snapshot.suites.filter((suite) => suite.latestCheckRunsCount !== 0
-    || !["queued", "in_progress"].includes(suite.status)
-    || snapshot.runs.some((run) => run.suiteId === suite.id && run.appId === suite.appId));
+  const suites = relevantSuites(snapshot);
   const completions = suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
   const lastSuiteCompletedAt = completions.length ? Math.max(...completions) : null;
   // A partial set of completions cannot start grace while another suite may still register checks.

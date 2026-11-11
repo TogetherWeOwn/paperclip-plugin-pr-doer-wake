@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
 import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, InvalidRegistrationError, type CiConfig, type Registration } from "./ci-config.js";
-import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness } from "./ci-github.js";
+import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness, relevantSuites } from "./ci-github.js";
 import { CiAppAuth } from "./ci-auth.js";
 import { retryableBeforeQueue } from "./native-wake.js";
 import { parseWorkProductBindings } from "./custody-reader.js";
@@ -646,9 +646,10 @@ export class CiWakeRuntime {
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
         if (!verdict.missing.length && !samples.some((s) => s.sha === wait.headSha)) {
-          const starts = snapshot.suites.map((s) => s.createdAt).filter((n): n is number => n !== null);
-          const finishes = snapshot.suites.map((s) => s.completedAt).filter((n): n is number => n !== null);
-          if (starts.length && finishes.length && finishes.length === snapshot.suites.length) {
+          const suites = relevantSuites(snapshot);
+          const starts = suites.map((s) => s.createdAt).filter((n): n is number => n !== null);
+          const finishes = suites.map((s) => s.completedAt).filter((n): n is number => n !== null);
+          if (starts.length && finishes.length && finishes.length === suites.length) {
             const duration = Math.max(...finishes) - Math.min(...starts);
             if (duration >= 60_000 && duration <= 86_400_000) {
               ledger.samples[`${wait.companyId}:${wait.repo}`] = [...samples, { sha: wait.headSha, ms: duration }].slice(-31);
