@@ -59,6 +59,8 @@ type Ledger = {
   deliveries: Record<string, number>;
   hints: Record<string, number>;
   samples: Record<string, Array<{ sha: string; ms: number }>>;
+  prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: string[] }>;
+  reviewerWakes?: Record<string, number>;
 };
 const clone = <T>(value: T): T => structuredClone(value);
 const waitData = (result: ToolResult) => result.data as { waitId: string; status: string; expiresAt: number };
@@ -616,6 +618,260 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]).toMatchObject({ status: "retired", reason: "head_moved_or_closed" });
     expect(github.snapshot).not.toHaveBeenCalled();
     expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  describe("pr head reviewer wakes", () => {
+    const prWorkProduct = { type: "pull_request", provider: "github", url: `https://github.com/${REPO}/pull/17`, metadata: { repo: REPO, number: 17 } };
+    function inReviewIssue(h: ReturnType<typeof setup>, participantAgentId: string) {
+      Object.assign(h.issue, {
+        status: "in_review",
+        workProducts: [prWorkProduct],
+        executionState: {
+          status: "pending", currentStageId: "stage-1", currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: participantAgentId },
+        },
+      });
+    }
+    // Register against HEAD, then move the live PR head to NEXT_HEAD.
+    async function movedHead(h: ReturnType<typeof setup>) {
+      await h.runtime.register(registration, run);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+    }
+
+    it("wakes a pending reviewer once the new head settles", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.ledger().waits[0]).toMatchObject({ status: "retired", reason: "head_moved_or_closed" });
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      const [issueId, companyId, wake] = h.requestWakeup.mock.calls[0]!;
+      expect(issueId).toBe(ISSUE);
+      expect(companyId).toBe(COMPANY);
+      expect(wake).toMatchObject({
+        reason: expect.stringContaining("pr_head_changed"),
+        contextSource: "plugin.ci-wake",
+        idempotencyKey: `pr-head-wake:${REPO}:17:${NEXT_HEAD}:${ISSUE}`,
+      });
+      expect((wake as { reason: string }).reason).toContain(NEXT_HEAD.slice(0, 7));
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("does not re-wake the same (card, SHA) whose dedupe record exists", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      // A duplicate delivery of the same head change must wake nobody again.
+      const ledger = h.ledger();
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("ignores a head change on a repo outside the allowlist", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.prHeadPending = { [`${COMPANY}:other/repo:17`]: { companyId: COMPANY, repo: "other/repo", prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger as Ledger);
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("ignores cards that are not in_review with a pending stage", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      // Fixture card is in_progress with no execution state: not eligible.
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("excludes the pending participant when it is the pusher/author agent", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, AGENT); // AGENT registered the wait.
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("wakes a reviewer whose card assignee IS the participant (production shape)", async () => {
+      // On a real in_review card Paperclip reassigns the card to the pending
+      // participant, so assignee == participant. Excluding on assignee would
+      // silently exclude every reviewer (the pre-fix dead-on-arrival bug).
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      h.issue.assigneeAgentId = OTHER;
+      await movedHead(h); // AGENT registered the wait; OTHER is not an author agent.
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("treats dryRun as forcing no-fire even when prHeadWakeShadow is false", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, dryRun: true });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1);
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1); // retained for a later live tick
+      await h.runtime.poll();
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1); // no repeat shadow log
+    });
+
+    it("does not wake while the new head is still settling", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pending"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      github.readiness.mockReturnValue(verdict("fail")); // settled (failed CI still settles)
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("records the head change at register time (push-then-register flow)", async () => {
+      // A settled wait is never polled again, so the new registration must
+      // itself record the change versus the most recent prior wait.
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      await h.runtime.register(registration, run); // head A
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll(); // wait A settles (woken); no open wait remains
+      expect(h.ledger().waits[0]).toMatchObject({ status: "woken" });
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+      inReviewIssue(h, OTHER);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      await h.runtime.register({ ...registration, headSha: NEXT_HEAD }, run); // head B
+      expect(h.ledger().prHeadPending).toMatchObject({ [`${COMPANY}:${REPO}:17`]: { oldSha: HEAD, newSha: NEXT_HEAD } });
+      const wakesBefore = h.requestWakeup.mock.calls.length;
+      await h.runtime.poll();
+      // The new wait's own CI wake (author card) plus one pr_head_changed
+      // reviewer wake.
+      expect(h.requestWakeup.mock.calls.length).toBe(wakesBefore + 2);
+      const [, , wake] = h.requestWakeup.mock.calls.at(-1)!;
+      expect(wake).toMatchObject({ reason: expect.stringContaining("pr_head_changed") });
+      expect((wake as { reason: string }).reason).toContain(HEAD.slice(0, 7));
+      expect((wake as { reason: string }).reason).toContain(NEXT_HEAD.slice(0, 7));
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("retargets instead of waking when a push lands during the snapshot", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      const THIRD_HEAD = "c".repeat(40);
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD })).mockResolvedValue(pull({ headSha: THIRD_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll(); // first read: NEXT_HEAD; post-snapshot read: THIRD_HEAD
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending).toMatchObject({ [`${COMPANY}:${REPO}:17`]: { oldSha: NEXT_HEAD, newSha: THIRD_HEAD } });
+      await h.runtime.poll(); // now THIRD_HEAD reads consistently and wakes
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ idempotencyKey: `pr-head-wake:${REPO}:17:${THIRD_HEAD}:${ISSUE}` });
+    });
+
+    it("does not wake when dryRun is flipped during the post-snapshot PR re-read", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [{ companyId: COMPANY, repo: REPO, prNumber: 17, issueId: ISSUE, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" }] as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger as Ledger);
+      // Operator rollback lands during the final (post-snapshot) PR read.
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD }))
+        .mockImplementation(async () => { h.rawConfig.dryRun = true; return pull({ headSha: NEXT_HEAD }); });
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1); // retained, not fired
+    });
+
+    it("keeps the original oldSha on a base-branch-only edit", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [{ companyId: COMPANY, repo: REPO, prNumber: 17, issueId: ISSUE, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" }] as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger as Ledger);
+      // Head stays NEXT_HEAD; only the base changes mid-tick.
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, baseBranch: "main" }))
+        .mockResolvedValue(pull({ headSha: NEXT_HEAD, baseBranch: "release" }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending).toMatchObject({ [`${COMPANY}:${REPO}:17`]: { oldSha: HEAD, newSha: NEXT_HEAD } });
+      // Next tick against the new base wakes with the original old -> new SHA.
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      const reason = (h.requestWakeup.mock.calls[0]![2] as { reason: string }).reason;
+      expect(reason).toContain(HEAD.slice(0, 7));
+      expect(reason).toContain(NEXT_HEAD.slice(0, 7));
+    });
+
+    it("caps wakes per tick inside the candidate loop and resumes next tick", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ids = Array.from({ length: 101 }, (_v, i) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`);
+      h.issueGet.mockImplementation(async (id: string) => ({ ...clone(h.issue), id }));
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = ids.map((issueId) => ({ companyId: COMPANY, repo: REPO, prNumber: 17, issueId, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" })) as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger as Ledger);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(100); // LIMITS.wakePerTick
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1); // entry retained
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(101); // the last one resumes
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("never evicts dedupe records a still-pending entry relies on", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const protectedKey = `${COMPANY}:${ISSUE}:${NEXT_HEAD}`;
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [{ companyId: COMPANY, repo: REPO, prNumber: 17, issueId: ISSUE, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" }] as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      ledger.reviewerWakes = { [protectedKey]: START - 2 }; // oldest, but protected
+      for (let i = 0; i < 10_000; i++) ledger.reviewerWakes[`${COMPANY}:00000000-0000-4000-8000-${String(i).padStart(12, "0")}:${"d".repeat(40)}`] = START - 1 + i;
+      h.seed(ledger as Ledger);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled(); // dedupe intact: no repeat wake
+      expect(h.ledger().reviewerWakes?.[protectedKey]).toBe(START - 2);
+      expect(Object.keys(h.ledger().reviewerWakes ?? {})).toHaveLength(10_000); // cap still enforced
+    });
+
+    it("logs intended wakes in shadow mode and fires none", async () => {
+      const h = setup({ prHeadWakeEnabled: true }); // shadow defaults to true
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1);
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      await h.runtime.poll();
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1);
+    });
   });
 
   it.each([{ headSha: NEXT_HEAD }, { baseBranch: "release" }])("rechecks the live PR immediately before wake and refuses changes (%j)", async (overrides) => {
