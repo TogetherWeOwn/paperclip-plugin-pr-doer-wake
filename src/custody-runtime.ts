@@ -375,8 +375,10 @@ export class CustodyRuntime {
                 const head = ledger.heads[ref];
                 if (!head || head.sha !== pr.headSha) {
                   if (!head && Object.keys(ledger.heads).length >= CUSTODY_LIMITS.prs) throw new Error("head_capacity");
-                  // Preserve observed head transitions while disposition evidence is incomplete.
-                  ledger.heads[ref] = { sha: pr.headSha, at: this.now(), provenance: "warmup" };
+                  // Preserve transitions, but leave first observations unseeded until evidence is complete.
+                  ledger.heads[ref] = head
+                    ? { sha: pr.headSha, at: this.now(), provenance: "warmup" }
+                    : { sha: pr.headSha, at: null };
                 }
               }
               if (pr.state === "closed") complete = false;

@@ -118,6 +118,19 @@ describe("custody native effects", () => {
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
   });
+  it("does not trust a first head observation made with oversized evidence", async () => {
+    const source = card({ oversizeDocuments: [CHILD] });
+    const h = fixture({ cards: [source] });
+    h.seedHead.mockResolvedValue(null);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"]).toMatchObject({ sha: "a".repeat(40), at: null });
+    source.oversizeDocuments = [];
+    h.advance(8 * DAY);
+    await h.runtime.poll();
+    expect(h.seedHead).toHaveBeenCalled();
+    expect(h.ledger().heads["example/project#42"].at).toBeNull();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
   it("preserves head warmup when oversized evidence hides a force-push revert", async () => {
     const open = [pull()];
     const source = card();
