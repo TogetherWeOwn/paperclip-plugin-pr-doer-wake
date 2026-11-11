@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CiGithubCache, type CiFetch, type CiGithubOptions, type CiHttpResponse } from "../src/ci-github.js";
+import { CiGithubCache, GITHUB_USER_AGENT, type CiFetch, type CiGithubOptions, type CiHttpResponse } from "../src/ci-github.js";
 import { CustodyGithub, type CustodyPull } from "../src/custody-github.js";
 
 const REPO = "acme/widgets";
@@ -83,6 +83,10 @@ describe("CustodyGithub REST enumeration", () => {
     expect(repos).not.toContain("acme/repo-1");
     expect(calls).toHaveLength(2);
     expect(calls[0]!.url.searchParams.get("type")).toBe("all");
+    // Custody rides the same CiGithub transport: every request carries the User-Agent.
+    for (const call of calls) {
+      expect((call.init?.headers as Record<string, string>)["User-Agent"]).toBe(GITHUB_USER_AGENT);
+    }
   });
 
   it("lists more than 100 open PRs without search or requiring total_count", async () => {

@@ -1,7 +1,7 @@
 import { generateKeyPairSync, verify } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { CiAppAuth, APP_PERMISSIONS } from "../src/ci-auth.js";
-import { CiGithub, CiGithubCache, type CiFetch } from "../src/ci-github.js";
+import { CiGithub, CiGithubCache, GITHUB_USER_AGENT, type CiFetch } from "../src/ci-github.js";
 import { validateCiConfig } from "../src/ci-config.js";
 
 const ref = { type: "secret_ref", secretId: "aaaaaaaa-0000-4000-8000-000000000001" };
@@ -69,6 +69,10 @@ describe("App installation authentication", () => {
     expect(JSON.parse(Buffer.from(payload!, "base64url").toString())).toEqual({ iss: "123", iat: START / 1000 - 60, exp: START / 1000 + 300 });
     expect(verify("RSA-SHA256", Buffer.from(`${header}.${payload}`), publicKey, Buffer.from(signature!, "base64url"))).toBe(true);
     expect((h.calls[1]?.init?.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
+    // GitHub 403s UA-less requests: the exchange and every read carry the User-Agent.
+    for (const call of [h.calls[0]!, h.calls[1]!]) {
+      expect((call.init?.headers as Record<string, string>)["User-Agent"]).toBe(GITHUB_USER_AGENT);
+    }
     for (const value of [TOKEN, KEY, jwt]) {
       expect(JSON.stringify(h.auth)).not.toContain(value);
       expect(JSON.stringify(h.github)).not.toContain(value);
