@@ -1,6 +1,6 @@
 {
   "name": "@togetherweown/paperclip-plugin-pr-doer-wake",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Paperclip CI completion wakes for explicitly registered PR cards. Fifteen-minute backstop polling with signed webhook push, required-check readiness and dry-run by default. Never guesses ownership from PR text or branch prefixes.",
   "license": "MIT",
   "type": "module",

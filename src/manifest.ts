@@ -15,7 +15,7 @@ const secretRef = {
 export const registrationTool = {
   name: "ci_wait_register",
   displayName: "Register CI completion wait",
-  description: "After pushing an owned PR, register its exact issue, repository, PR number and head SHA. The caller must own the checkout; binding is the execution workspace identity plus the live PR number and head SHA — the PR head branch need not equal the workspace branch name. Repeated calls in one run are idempotent; after a manual rerun, register from a new run. Refusals return an enumerated secret-free code. Never guesses ownership from text or branches.",
+  description: "After pushing an owned PR, register its exact issue, repository, PR number and head SHA. Send exactly four fields: issueId (the Paperclip issue UUID, not the TWO-#### identifier), repo (owner/repo; a github.com URL is also accepted), prNumber (integer; a digit string is also accepted), headSha (full 40-character commit SHA, e.g. from `git rev-parse HEAD`; uppercase hex is accepted and lowercased). The caller must own the checkout; binding is the execution workspace identity plus the live PR number and head SHA — the PR head branch need not equal the workspace branch name. Repeated calls in one run are idempotent; after a manual rerun, register from a new run. Refusals return an enumerated secret-free code plus a safe reason in the tool result content; the reason names the received field shapes (types/lengths only, never values). Never guesses ownership from text or branches.",
   parametersSchema: {
     type: "object", additionalProperties: false,
     required: ["issueId", "repo", "prNumber", "headSha"],
@@ -31,7 +31,7 @@ export const registrationTool = {
 const manifest: PaperclipPluginManifestV1 = {
   id: "togetherweown.pr-doer-wake",
   apiVersion: 1,
-  version: "0.2.0",
+  version: "0.3.0",
   displayName: "CI wake and PR custody",
   description: "Explicit CI completion waits plus opt-in hourly organization PR custody. Independent dry-run defaults, bounded native wakes and disposition cards; no automatic PR mutation.",
   author: "TogetherWeOwn",
