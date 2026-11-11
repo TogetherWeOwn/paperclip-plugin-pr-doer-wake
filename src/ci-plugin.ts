@@ -1,11 +1,13 @@
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import { UUID, validateCiConfig } from "./ci-config.js";
 import { CiWakeRuntime } from "./ci-runtime.js";
+import { GatesStatusRuntime } from "./gates-runtime.js";
 import { registrationTool } from "./manifest.js";
 import { CustodyRuntime } from "./custody-runtime.js";
 import { validateCustodyConfig } from "./custody-config.js";
 
 let runtime: CiWakeRuntime | null = null;
+let gates: GatesStatusRuntime | null = null;
 let custodyRuntime: CustodyRuntime | null = null;
 // Last validated capture, retained across setup re-runs and applied to each
 // fresh runtime so a capture is never lost when the runtime is recreated.
@@ -13,6 +15,10 @@ let capturedCustodyCompanyId: string | null = null;
 function ready(): CiWakeRuntime {
   if (!runtime) throw new Error("ci-wake_not_initialized");
   return runtime;
+}
+function readyGates(): GatesStatusRuntime {
+  if (!gates) throw new Error("gates_not_initialized");
+  return gates;
 }
 function readyCustody(): CustodyRuntime {
   if (!custodyRuntime) throw new Error("custody_not_initialized");
@@ -22,6 +28,7 @@ function readyCustody(): CustodyRuntime {
 export default definePlugin({
   async setup(ctx) {
     runtime = new CiWakeRuntime(ctx);
+    gates = new GatesStatusRuntime(ctx);
     custodyRuntime = new CustodyRuntime(ctx);
     custodyRuntime.setCustodyCompanyId(capturedCustodyCompanyId);
     // Dereference the module-level runtime at fire time so a setup re-run
@@ -30,7 +37,9 @@ export default definePlugin({
     ctx.jobs.register("pr-custody", async () => readyCustody().poll());
     ctx.tools.register(registrationTool.name, registrationTool, (params, run) => ready().register(params, run));
     ctx.jobs.register("ci-wake-poll", async () => ready().poll());
-    ctx.logger.info("ci-wake ready; explicit registration only");
+    ctx.jobs.register("gates-status-sweep", async () => readyGates().drain());
+    ctx.events.on("issue.updated", async (event) => readyGates().handleIssueUpdated(event));
+    ctx.logger.info("ci-wake ready; explicit registration only; gates publisher registered (disabled by default)");
   },
   // The host replays stored company config through configChanged (including at
   // worker startup, before scheduled jobs register). Capture custodyCompanyId

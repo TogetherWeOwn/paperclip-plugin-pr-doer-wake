@@ -16,11 +16,16 @@ describe("stock manifest and config contract", () => {
       "agent.tools.register", "plugin.state.read", "plugin.state.write", "http.outbound", "secrets.read-ref",
       "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
       "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
+      "events.subscribe", "issue.interactions.read",
     ]));
     expect(manifest.database?.coreReadTables).toEqual(["issues", "issue_comments", "issue_documents"]);
     expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")?.schedule).toBe("17 * * * *");
+    expect(manifest.jobs?.find((job) => job.jobKey === "gates-status-sweep")?.schedule).toBe("*/4 * * * *");
     expect(manifest.tools?.map((tool) => tool.name)).toEqual(["ci_wait_register"]);
     expect(manifest.jobs?.[0]?.schedule).toBe("*/15 * * * *");
+    const props = manifest.instanceConfigSchema?.properties as Record<string, Record<string, unknown>> | undefined;
+    expect(props?.gatesStatusEnabled).toMatchObject({ type: "boolean", default: false });
+    expect(props?.gatesStatusShadow).toMatchObject({ type: "boolean", default: true });
   });
 
   it("accepts disabled defaults and allowlist revocation but refuses enabling an empty allowlist", () => {
@@ -29,6 +34,26 @@ describe("stock manifest and config contract", () => {
       expect(validateCiConfig(config)).toEqual([]);
     }
     expect(validateCiConfig({ ...enabled, allowedRepos: [] }).length).toBeGreaterThan(0);
+  });
+
+  it("validates the gates publisher config: RM required when enabled, auth required, shadow defaults true", () => {
+    expect(parseCiConfig({})).toMatchObject({ gatesStatusEnabled: false, gatesStatusShadow: true, releaseManagerAgentId: null });
+    const RM = "aaaaaaaa-0000-4000-8000-000000000002";
+    const gates = { gatesStatusEnabled: true, releaseManagerAgentId: RM, allowedRepos: ["example/project"], githubTokenSecretRef: ref };
+    expect(validateInstanceConfig(gates, manifest.instanceConfigSchema!).valid).toBe(true);
+    expect(validateCiConfig(gates)).toEqual([]);
+    expect(parseCiConfig(gates)).toMatchObject({ gatesStatusEnabled: true, gatesStatusShadow: true, releaseManagerAgentId: RM });
+    expect(parseCiConfig({ ...gates, gatesStatusShadow: false }).gatesStatusShadow).toBe(false);
+    // Missing RM, non-UUID RM, missing auth, and mixed auth all fail closed at both layers.
+    for (const config of [
+      { gatesStatusEnabled: true, allowedRepos: ["example/project"], githubTokenSecretRef: ref },
+      { ...gates, releaseManagerAgentId: "not-a-uuid" },
+      { gatesStatusEnabled: true, releaseManagerAgentId: RM, allowedRepos: ["example/project"] },
+      { ...gates, githubAppId: "123", githubInstallationId: "456", githubAppPrivateKeySecretRef: ref },
+    ]) {
+      expect(validateCiConfig(config).length).toBeGreaterThan(0);
+    }
+    expect(validateCiConfig({ gatesStatusEnabled: true, releaseManagerAgentId: RM, allowedRepos: ["example/project"] })).toContain("configure exactly one complete authentication mode: githubTokenSecretRef OR githubAppId, githubInstallationId and githubAppPrivateKeySecretRef");
   });
 
   it("accepts actual secret-picker objects without requiring a webhook in polling mode", () => {
