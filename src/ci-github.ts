@@ -777,9 +777,11 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   const runs = latest(snapshot.runs, (run) => JSON.stringify([run.name, run.appId]));
   const statuses = latest(snapshot.statuses, (status) => status.context);
   // Multiple workflows share the GitHub Actions app ID; app ID is not suite identity.
-  // Installed Apps can leave empty queued suites forever; only a known zero is absent.
-  // Every other observed suite must finish without branch requirements, including older IDs.
-  const suites = snapshot.suites.filter((suite) => suite.status === "completed" || suite.latestCheckRunsCount !== 0);
+  // Installed Apps can leave empty queued suites forever. Unknown states and suites
+  // referenced by observed runs retain generation safety, even if a later count is zero.
+  const suites = snapshot.suites.filter((suite) => suite.latestCheckRunsCount !== 0
+    || !["queued", "in_progress"].includes(suite.status)
+    || snapshot.runs.some((run) => run.suiteId === suite.id && run.appId === suite.appId));
   const completions = suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
   const lastSuiteCompletedAt = completions.length ? Math.max(...completions) : null;
   // A partial set of completions cannot start grace while another suite may still register checks.

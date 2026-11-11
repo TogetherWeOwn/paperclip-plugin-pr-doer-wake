@@ -90,6 +90,25 @@ describe("evaluateReadiness", () => {
     }
   });
 
+  it.each(["queued", "in_progress"])("retains zero-count %s suites referenced by observed runs", (status) => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }], runs: [run()],
+      suites: [suite(1, { status, conclusion: null, completedAt: null, latestCheckRunsCount: 0 })],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"] });
+    input.required = [];
+    expect(evaluateReadiness(input, timing).kind).toBe("pending");
+    input.required = [{ context: "legacy", appId: null }];
+    input.statuses = [{ id: 1, context: "legacy", state: "success" }];
+    expect(evaluateReadiness(input, timing).kind).toBe("pending");
+  });
+
+  it.each(["unknown", "pending", "waiting"])("retains zero-count suites with unrecognized status %s", (status) => {
+    const suites = [suite(2, { status, conclusion: null, completedAt: null, latestCheckRunsCount: 0 })];
+    expect(evaluateReadiness(snapshot({ runs: [run()], suites }), timing).kind).toBe("pending");
+    expect(evaluateReadiness(snapshot({ required: [{ context: "build", appId: 7 }], runs: [run(1, { suiteId: null })], suites }), timing).kind).toBe("pending");
+  });
+
   it("does not let an empty suite satisfy missing required checks or suppress their grace", () => {
     const phantom = suite(2, { status: "queued", conclusion: null, completedAt: null, latestCheckRunsCount: 0 });
     const input = snapshot({ required: [{ context: "build", appId: 7 }], suites: [phantom] });
