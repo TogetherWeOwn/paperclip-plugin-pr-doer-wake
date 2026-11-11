@@ -7,7 +7,7 @@ import { parseCustodyConfig, type CustodyConfig } from "./custody-config.js";
 import { CustodyAppAuth } from "./custody-auth.js";
 import { CustodyGithub, type CustodyPull } from "./custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, parseWorkProductBindings, type CustodyCard } from "./custody-reader.js";
-import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prReference, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
+import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prIndexRef, prReference, prRefFromUrl, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
 
 export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000 } as const;
 type Receipt = { at: number; turn?: number; status: "pending" | "attempting" | "woken" | "unconfirmed" | "cleared"; phase?: "create" | "wake"; issueId?: string; childId?: string };
@@ -59,14 +59,23 @@ export class CustodyRuntime {
    * Keep the bounded PR->card index fresh between scheduled ticks from
    * native issue events. Best-effort and self-healing: the next tick
    * rebuilds prToCards from explicit tiers for every inventoried PR, so a
-   * lost or racy event update can only stale the index, never corrupt it.
-   * Events for other companies are ignored; the handler never reads config
-   * or secrets and never dispatches wakes.
+   * lost event update can only stale the index, never corrupt it. A tick
+   * in progress owns the ledger — events arriving during one are skipped
+   * (the tick rebuilds the index anyway), so an event can never read a
+   * pre-tick ledger and write it back over fresh receipts/heads/report.
+   * Only issue-level events proceed: work products change with the issue,
+   * never with a comment or document write, so comment/document events
+   * cannot add a binding and are ignored without reads. The ledger is
+   * written back only when the index actually changes. Events for other
+   * companies are ignored; the handler never reads secrets and never
+   * dispatches wakes.
    */
   async onCustodyEvent(event: { companyId?: string; entityId?: string; eventType?: string }): Promise<void> {
+    if (this.running) return;
     const companyId = this.custodyCompanyId;
     const cardId = event.entityId;
     if (!companyId || !cardId || !UUID.test(cardId)) return;
+    if (event.eventType !== undefined && !["issue.created", "issue.updated", "issue.relations.updated"].includes(event.eventType)) return;
     if (event.companyId && event.companyId.toLowerCase() !== companyId.toLowerCase()) return;
     try {
       const raw = await this.ctx.config.get(companyId);
@@ -78,15 +87,21 @@ export class CustodyRuntime {
       const fresh = await this.ctx.issues.get(cardId, config.companyId);
       if (!fresh || fresh.companyId !== config.companyId) return;
       const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
+      // Absent field: the tick treats this as UNKNOWN; a best-effort event
+      // simply cannot add anything and must not write.
+      if (!bindings) return;
+      stored.prToCards ??= {};
+      let changed = false;
       for (const binding of bindings) {
         if (!binding.url) continue;
-        const match = /github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/i.exec(binding.url);
-        if (!match) continue;
-        const ref = `${match[1]}/${match[2]}#${Number(match[3])}`;
-        stored.prToCards ??= {};
-        stored.prToCards[ref] = cardId;
+        const ref = prRefFromUrl(binding.url);
+        if (!ref) continue;
+        if (stored.prToCards[ref] !== cardId) {
+          stored.prToCards[ref] = cardId;
+          changed = true;
+        }
       }
-      await this.ctx.state.set(key, stored);
+      if (changed) await this.ctx.state.set(key, stored);
     } catch { /* Best-effort freshness only; the scheduled tick reconciles. */ }
   }
 
@@ -261,28 +276,44 @@ export class CustodyRuntime {
       // Phase B: explicit-tier mapping over metadata only, then bounded
       // evidence loads for mapped candidates only.
       const cardsById = new Map(cards.map((c) => [c.id, c]));
-      // Enrich work-product bindings for index-known cards only (bounded by
-      // PR count). New bindings also arrive between ticks via event
-      // subscriptions that maintain prToCards; a failed enrichment leaves
-      // that card without the work_product tier (conservative unmapped).
-      for (const cardId of new Set(Object.values(ledger.prToCards))) {
+      // Enrich work-product bindings for every card in a project that owns
+      // at least one inventoried repo, plus any card the index already
+      // knows. A card bound to a PR only by a work product (a dormant/done
+      // card with no registration, workspace branch, URL text or tracker
+      // identifier) is discoverable only through this tier, so enrichment
+      // must reach cards the cold ledger has never seen — restricting it
+      // to index-known cards would leave such cards unmapped forever
+      // while the tick still reports complete=true. Every eligible card
+      // is enriched each tick, bounded by the existing host-read and tick
+      // budgets (guard throws fail closed as a surfaced inventory
+      // failure); event subscriptions only accelerate discovery between
+      // ticks. A missing/unreadable workProducts field is UNKNOWN, never
+      // treated as proven-absent (see parseWorkProductBindings).
+      const enrichIds = new Set<string>(Object.values(ledger.prToCards));
+      for (const card of cards) {
+        if (card.projectId !== null && [...(reposByProject.get(card.projectId) ?? [])].some((repo) => monitored.has(repo))) enrichIds.add(card.id);
+      }
+      for (const cardId of enrichIds) {
         const card = cardsById.get(cardId);
         if (!card) continue;
         try {
           guard();
           const fresh = await this.ctx.issues.get(cardId, config.companyId);
-          if (fresh && fresh.companyId === config.companyId) card.workProducts = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
+          if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`); continue; }
+          const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
+          if (bindings === null) { unknown(`work_product:${cardId}`); continue; }
+          card.workProducts = bindings;
         } catch { unknown(`work_product:${cardId}`); }
       }
       const candidates = new Map<string, CustodyCard>();
       const seenPrs = new Set<string>();
       for (const [, inv] of inventories) {
         for (const pr of [...inv.open, ...inv.closed]) {
-          seenPrs.add(prReference(pr));
+          seenPrs.add(prIndexRef(pr));
           const mapping = mapCustodyCard(pr, cards, registrations, reposByProject, config.companyId);
           if (mapping.card) {
             candidates.set(mapping.card.id, mapping.card);
-            ledger.prToCards[prReference(pr)] = mapping.card.id;
+            ledger.prToCards[prIndexRef(pr)] = mapping.card.id;
           }
         }
       }

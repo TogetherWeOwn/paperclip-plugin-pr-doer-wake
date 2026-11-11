@@ -367,15 +367,19 @@ describe("loadCustodyCards", () => {
   });
 
   it("parses only explicit GitHub pull-request work-product bindings", () => {
-    expect(parseWorkProductBindings(undefined)).toEqual([]);
-    expect(parseWorkProductBindings(null)).toEqual([]);
-    expect(parseWorkProductBindings("nope")).toEqual([]);
+    // A missing field is null (fail-closed UNKNOWN), never a silent []: the
+    // host detail route always returns an array, so absence means the field
+    // was not supplied and no proven "no bindings" claim can be made.
+    expect(parseWorkProductBindings(undefined)).toBeNull();
+    expect(parseWorkProductBindings(null)).toBeNull();
+    expect(parseWorkProductBindings("nope")).toBeNull();
+    expect(parseWorkProductBindings([])).toEqual([]);
     const parsed = parseWorkProductBindings([
-      { type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 } },
+      { type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 }, externalId: "acme/widgets#7", status: "ready_for_review" },
       { type: "branch", provider: "github", url: null, metadata: null },
       { type: "pull_request", provider: "vercel", url: "x", metadata: null },
       null, "junk", 42,
     ]);
-    expect(parsed).toEqual([{ type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 } }]);
+    expect(parsed).toEqual([{ type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 }, externalId: "acme/widgets#7", status: "ready_for_review" }]);
   });
 });

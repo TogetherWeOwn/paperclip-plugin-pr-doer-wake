@@ -5,6 +5,12 @@ export interface WorkProductBinding {
   provider: string;
   url: string | null;
   metadata: Record<string, unknown> | null;
+  // Lifecycle annotations retained from the host payload for audit. They are
+  // never used for ownership matching: only type/provider/url/metadata are
+  // identity (externalId/status describe the PR's state, not which card owns
+  // it), so a status change cannot create or move ownership.
+  externalId: string | null;
+  status: string | null;
 }
 
 export interface CustodyCard {
@@ -42,6 +48,13 @@ export interface CustodyCard {
 //      already mapped to a PR in the current GitHub inventory. That set is
 //      bounded by the PR count, not the company card count, so the 64 MiB
 //      ceiling is no longer reachable at company scale.
+//
+// Peak memory is two independent 64 MiB phase budgets, so up to ~128 MiB if
+// both phases saturate in one tick (the previous single-total design capped
+// the peak at 64 MiB; per-row, per-body and row-count caps are unchanged).
+// Each phase still fails closed at its own ceiling, and the phase-2 set is
+// bounded by PR count, so the combined peak is not reachable from company
+// history size alone.
 //
 // Comment/document URL text is no longer an ownership tier: proving a
 // comment-URL claim unique or absent requires the full-company history
@@ -106,15 +119,24 @@ function excluded(origin: string): boolean {
 
 /**
  * Parse native issue work-product PR bindings from an Issue payload's
- * `workProducts` array (when the host supplies it). Only explicit
- * pull-request bindings from GitHub are retained; malformed entries are
- * ignored rather than failing the whole snapshot because a single
- * unrelated work product must not poison custody evidence. Callers must
- * treat a binding as authoritative only through mapCustodyCard's
- * work_product tier, which revalidates repo/number/URL exactly.
+ * `workProducts` field. Only explicit pull-request bindings from GitHub are
+ * retained; malformed entries are ignored rather than failing the whole
+ * snapshot because a single unrelated work product must not poison custody
+ * evidence. Callers must treat a binding as authoritative only through
+ * mapCustodyCard's work_product tier, which revalidates repo/number/URL
+ * exactly.
+ *
+ * Returns null when the host does not supply the field at all (missing or
+ * non-array). The shared Issue.workProducts is optional for payload
+ * compatibility, and the installed host's detail route always populates it
+ * as an array (GET /issues/:id spreads listForIssue, which returns [] when
+ * there are no bindings), but an absent field is fail-closed UNKNOWN here —
+ * never silently treated as "no bindings" — so a host that omits it can
+ * never produce a false complete=true. Callers with a non-null result may
+ * treat an empty array as a proven-absent field.
  */
-export function parseWorkProductBindings(raw: unknown): WorkProductBinding[] {
-  if (!Array.isArray(raw)) return [];
+export function parseWorkProductBindings(raw: unknown): WorkProductBinding[] | null {
+  if (!Array.isArray(raw)) return null;
   const out: WorkProductBinding[] = [];
   for (const entry of raw) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
@@ -127,7 +149,11 @@ export function parseWorkProductBindings(raw: unknown): WorkProductBinding[] {
     if (row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)) {
       metadata = row.metadata as Record<string, unknown>;
     }
-    out.push({ type, provider, url, metadata });
+    out.push({
+      type, provider, url, metadata,
+      externalId: typeof row.externalId === "string" ? row.externalId : null,
+      status: typeof row.status === "string" ? row.status : null,
+    });
   }
   return out;
 }

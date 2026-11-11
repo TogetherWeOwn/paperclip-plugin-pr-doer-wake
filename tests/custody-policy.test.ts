@@ -64,14 +64,32 @@ describe("custody ownership is conservative and ordered", () => {
   });
   it("uses explicit work-product PR bindings before URL text, revalidated exactly", () => {
     const pr = pull({ headBranch: "feat/change" });
-    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 } };
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: "example/project#42", status: "ready_for_review" };
     expect(map(pr, [card({ workProducts: [binding] })]).source).toBe("work_product");
     expect(map(pr, [card({ workProducts: [{ ...binding, url: "https://github.com/example/project/pull/43" }] })]).card).toBeNull();
     expect(map(pr, [card({ workProducts: [{ ...binding, metadata: { repo: "other/project", number: 42 } }] })]).card).toBeNull();
-    expect(map(pr, [card({ workProducts: [{ type: "branch", provider: "github", url: null, metadata: null }] })]).card).toBeNull();
+    expect(map(pr, [card({ workProducts: [{ type: "branch", provider: "github", url: null, metadata: null, externalId: null, status: null }] })]).card).toBeNull();
     const ambiguous = map(pr, [card({ workProducts: [binding] }), card({ id: PROJECT, workProducts: [binding] })]);
     expect(ambiguous.card).toBeNull();
     expect(ambiguous.source).toBe("work_product");
+  });
+  it("rejects partial work-product metadata with no matching URL (empty, repo-only, number-only)", () => {
+    const pr = pull({ headBranch: "feat/change" });
+    const base = { type: "pull_request", provider: "github", url: null, externalId: null, status: null };
+    for (const metadata of [{}, { repo: "example/project" }, { number: 42 }]) {
+      const result = map(pr, [card({ workProducts: [{ ...base, metadata }] })]);
+      expect(result.card).toBeNull();
+      expect(result.source).toBe("unmapped");
+    }
+    // Both fields present and equal: matches without a URL. A matching URL
+    // alone also suffices even with partial metadata.
+    expect(map(pr, [card({ workProducts: [{ ...base, metadata: { repo: "example/project", number: 42 } }] })]).source).toBe("work_product");
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/42", metadata: {} }] })]).source).toBe("work_product");
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project" } }] })]).source).toBe("work_product");
+    // A URL naming a different PR never matches via metadata, and metadata
+    // disagreeing with a matching URL is inconsistent, so it never matches.
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/43", metadata: { repo: "example/project", number: 42 } }] })]).card).toBeNull();
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/42", metadata: { repo: "other/project", number: 42 } }] })]).card).toBeNull();
   });
   it.each(["https://evil.test/?u=https://github.com/example/project/pull/42", "https://github.com/example/project/pull/420", "https://github.com/example/project/pull/42evil", "https://github.com.evil.test/example/project/pull/42", "https://github.com/example/project/pull/42/files"]) ("rejects spoofed URL %s", (body) => expect(containsPrUrl(body, pull())).toBe(false));
   it("makes ambiguous URL ownership UNMAPPED rather than selecting latest", () => {

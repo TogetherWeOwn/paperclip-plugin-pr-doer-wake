@@ -20,6 +20,22 @@ export interface Trigger { key: string; kind: "idle" | "terminal" | "closed"; ep
 
 function escape(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 export function prReference(pr: Pick<CustodyPull, "repo" | "number">): string { return `${pr.repo}#${pr.number}`; }
+/**
+ * Canonical key for the bounded prToCards index. GitHub repo names are
+ * case-insensitive, so the index lowercases the repo to make event-written
+ * and tick-written keys agree regardless of which side spelled the URL.
+ */
+export function prIndexRef(pr: Pick<CustodyPull, "repo" | "number">): string { return `${pr.repo.toLowerCase()}#${pr.number}`; }
+/**
+ * Extract the index ref from a work-product URL, or null. Anchored to the
+ * full URL (allowing only a query/fragment tail) so a PR URL embedded in
+ * another host's query, or a longer PR number, can never produce a ref —
+ * the extraction counterpart of containsPrUrl's token discipline.
+ */
+export function prRefFromUrl(url: string): string | null {
+  const match = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:[?#].*)?$/i.exec(url);
+  return match ? `${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}#${Number(match[3])}` : null;
+}
 export function prUrl(pr: Pick<CustodyPull, "repo" | "number">): string { return `https://github.com/${pr.repo}/pull/${pr.number}`; }
 
 /** Tokens only; never accept a URL embedded in another host's query or a longer PR number. */
@@ -52,18 +68,24 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   const workspace = sameRepo && branchId && UUID.test(branchId) ? pick("workspace", eligible.filter((c) => c.id.toLowerCase() === branchId.toLowerCase() && projectMatches(c))) : null;
   if (workspace) return workspace;
   // Explicit native work-product PR bindings (host-supplied issue_work_products
-  // via Issue.workProducts). Revalidated exactly: GitHub provider, URL token,
-  // and metadata repo/number must all agree with this PR. Malformed or
-  // mismatched bindings are ignored at this tier, never trusted.
+  // via Issue.workProducts). Revalidated exactly: a binding matches only when
+  // its URL is a token-exact match for this PR, or when metadata carries
+  // BOTH repo and number, both equal to this PR. Partial metadata (empty
+  // object, repo-only, number-only) with no matching URL never matches, so
+  // one malformed binding cannot claim an unrelated PR. A URL naming a
+  // different PR, or metadata whose present fields disagree, is ignored at
+  // this tier, never trusted. externalId/status are lifecycle annotations
+  // retained on the binding; they play no role in identity matching.
   const workProduct = pick("work_product", eligible.filter((c) => (c.workProducts ?? []).some((w) => {
     if (w.type !== "pull_request" || w.provider !== "github") return false;
-    if (w.url && !containsPrUrl(w.url, pr)) return false;
+    const urlOk = w.url !== null && containsPrUrl(w.url, pr);
+    if (w.url !== null && !urlOk) return false;
     const meta = w.metadata;
-    if (meta && (typeof meta.repo === "string" || typeof meta.number === "number")) {
-      if (typeof meta.repo === "string" && meta.repo.toLowerCase() !== pr.repo.toLowerCase()) return false;
-      if (typeof meta.number === "number" && meta.number !== pr.number) return false;
-    }
-    return !!w.url || !!meta;
+    const metaRepo = meta && typeof meta.repo === "string" ? meta.repo : null;
+    const metaNumber = meta && typeof meta.number === "number" ? meta.number : null;
+    if (metaRepo !== null && metaRepo.toLowerCase() !== pr.repo.toLowerCase()) return false;
+    if (metaNumber !== null && metaNumber !== pr.number) return false;
+    return urlOk || (metaRepo !== null && metaNumber !== null);
   })));
   if (workProduct) return workProduct;
   // URL tier is title/description only. Comment/document URL claims would
