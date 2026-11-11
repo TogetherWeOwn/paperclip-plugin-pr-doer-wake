@@ -6,6 +6,7 @@ import plugin from "../src/ci-plugin.js";
 import manifest from "../src/manifest.js";
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
+const OTHER = "bbbbbbbb-0000-4000-8000-000000000001";
 const PROJECT = "cccccccc-0000-4000-8000-000000000001";
 const TOKEN = "synthetic-custody-sdk-token";
 const SCHEDULED_AT = "2026-10-20T12:17:00Z";
@@ -29,7 +30,7 @@ type HostCall = { method: string; params: Record<string, unknown> };
  * resolveRequiredCompanyId refuses it during scheduled (proactive, company-less)
  * job invocations. No SDK mock, no host/core, and no network are involved.
  */
-async function custodyHost() {
+async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig) {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const lines = createInterface({ input: stdout });
@@ -66,7 +67,7 @@ async function custodyHost() {
             // Mirror the production gate: proactive job invocations carry no
             // company scope, so a company-less read is refused here.
             if (!params.companyId) replyError(id, "company context is required");
-            else reply(id, custodyConfig);
+            else reply(id, storedConfig);
             return;
           case "state.get":
             reply(id, state.get(keyOf(params)) ?? null);
@@ -138,6 +139,57 @@ describe("scheduled pr-custody job over the real SDK/host contract", () => {
 
       expect(h.calls.some((c) => c.method === "config.get")).toBe(false);
       expect(h.ledger()).toBeUndefined();
+    } finally { h.stop(); }
+  });
+
+  it("never reads the other company when a delivery for a company names a different company in its field", async () => {
+    const mismatched = { ...custodyConfig, custodyCompanyId: OTHER };
+    const h = await custodyHost(mismatched);
+    try {
+      await h.send("initialize-mismatch", "initialize", initialize);
+      // Delivery is scoped to COMPANY but its stored field names OTHER:
+      // the capture must not adopt OTHER, and the tick must not read
+      // config for the wrong company at all.
+      await h.send("config-mismatch", "configChanged", { config: mismatched, companyId: COMPANY });
+      await h.send("job-mismatch", "runJob", runJob);
+
+      const configReads = h.calls.filter((c) => c.method === "config.get");
+      expect(configReads.some((c) => c.params.companyId === OTHER)).toBe(false);
+      expect(configReads).toHaveLength(0);
+      expect(h.ledger()).toBeUndefined();
+    } finally { h.stop(); }
+  });
+
+  it("never reads config when the delivery carries no company scope", async () => {
+    const h = await custodyHost();
+    try {
+      await h.send("initialize-unscoped", "initialize", initialize);
+      await h.send("config-unscoped", "configChanged", { config: custodyConfig, companyId: null });
+      await h.send("job-unscoped", "runJob", runJob);
+
+      expect(h.calls.some((c) => c.method === "config.get")).toBe(false);
+      expect(h.ledger()).toBeUndefined();
+    } finally { h.stop(); }
+  });
+
+  it("another company's later delivery neither retargets nor disables the captured custody company", async () => {
+    const h = await custodyHost();
+    try {
+      await h.send("initialize-multicompany", "initialize", initialize);
+      await h.send("config-a", "configChanged", { config: custodyConfig, companyId: COMPANY });
+      // A delivery scoped to a different company must not clear the capture
+      // for COMPANY. The stored config bytes are identical, so this reaches
+      // onConfigChanged past the SDK single-tenant guard (which rejects a
+      // second distinct company's *different* config before the plugin sees
+      // it); the plugin's own binding then ignores it because the field
+      // names COMPANY, not the delivering company.
+      await h.send("config-b", "configChanged", { config: custodyConfig, companyId: OTHER });
+      await h.send("job-multicompany", "runJob", runJob);
+
+      const configReads = h.calls.filter((c) => c.method === "config.get");
+      expect(configReads.length).toBeGreaterThan(0);
+      expect(configReads.every((c) => c.params.companyId === COMPANY)).toBe(true);
+      expect(h.ledger()?.report.complete).toBe(true);
     } finally { h.stop(); }
   });
 });

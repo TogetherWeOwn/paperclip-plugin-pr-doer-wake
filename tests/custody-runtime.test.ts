@@ -243,6 +243,18 @@ describe("custody native effects", () => {
     expect(h.ctx.issues.create).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
+  it("fails closed when the config read for the captured company names a different company", async () => {
+    const h = fixture();
+    // The stored field was edited to another company between delivery and
+    // tick: operating on config.companyId would pivot custody and its
+    // secret resolution to the wrong tenant, so the tick must do nothing.
+    h.config.custodyCompanyId = "bbbbbbbb-0000-4000-8000-000000000001";
+    await h.runtime.poll();
+    expect(h.ledger()).toBeUndefined();
+    expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
   it("does not dispatch after company configuration is revoked mid-scan", async () => {
     const h = fixture();
     h.activity.mockImplementation(async () => { h.config.custodyEnabled = false; return NOW - 8 * DAY; });
