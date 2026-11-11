@@ -51,16 +51,49 @@ describe("custody ownership is conservative and ordered", () => {
     for (const owner of [card({ companyId: PROJECT }), card({ projectId: null }), card({ projectId: ISSUE })]) expect(map(pull(), [owner]).card).toBeNull();
     expect(map(pull({ headRepo: "other/fork" }), [card()]).card).toBeNull();
   });
-  it("matches URL tokens, including title/document/agent comment evidence, but not human-only ownership", () => {
+  it("matches URL tokens in title/description only, but not human-only ownership or comment/document text", () => {
     const pr = pull({ headBranch: "feat/change" });
     for (const body of ["https://github.com/example/project/pull/42", "[PR](https://github.com/example/project/pull/42)", "<https://github.com/example/project/pull/42>"]) {
-      expect(map(pr, [card({ texts: [{ body, at: NOW, ownership: true }] })]).source).toBe("url");
+      expect(map(pr, [card({ texts: [{ id: "title", body, at: NOW, ownership: true }] })]).source).toBe("url");
+      expect(map(pr, [card({ texts: [{ id: "description", body, at: NOW, ownership: true }] })]).source).toBe("url");
     }
-    expect(map(pr, [card({ texts: [{ body: "https://github.com/example/project/pull/42", at: NOW, ownership: false }] })]).card).toBeNull();
+    expect(map(pr, [card({ texts: [{ id: "title", body: "https://github.com/example/project/pull/42", at: NOW, ownership: false }] })]).card).toBeNull();
+    // Comment/document URL claims are not a discovery tier (TWO-5928): they
+    // would need the full-company history scan to prove unique/absent.
+    expect(map(pr, [card({ texts: [{ id: "comment:1", body: "https://github.com/example/project/pull/42", at: NOW, ownership: true }] })]).card).toBeNull();
+  });
+  it("uses explicit work-product PR bindings before URL text, revalidated exactly", () => {
+    const pr = pull({ headBranch: "feat/change" });
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: "example/project#42", status: "ready_for_review" };
+    expect(map(pr, [card({ workProducts: [binding] })]).source).toBe("work_product");
+    expect(map(pr, [card({ workProducts: [{ ...binding, url: "https://github.com/example/project/pull/43" }] })]).card).toBeNull();
+    expect(map(pr, [card({ workProducts: [{ ...binding, metadata: { repo: "other/project", number: 42 } }] })]).card).toBeNull();
+    expect(map(pr, [card({ workProducts: [{ type: "branch", provider: "github", url: null, metadata: null, externalId: null, status: null }] })]).card).toBeNull();
+    const ambiguous = map(pr, [card({ workProducts: [binding] }), card({ id: PROJECT, workProducts: [binding] })]);
+    expect(ambiguous.card).toBeNull();
+    expect(ambiguous.source).toBe("work_product");
+  });
+  it("rejects partial work-product metadata with no matching URL (empty, repo-only, number-only)", () => {
+    const pr = pull({ headBranch: "feat/change" });
+    const base = { type: "pull_request", provider: "github", url: null, externalId: null, status: null };
+    for (const metadata of [{}, { repo: "example/project" }, { number: 42 }]) {
+      const result = map(pr, [card({ workProducts: [{ ...base, metadata }] })]);
+      expect(result.card).toBeNull();
+      expect(result.source).toBe("unmapped");
+    }
+    // Both fields present and equal: matches without a URL. A matching URL
+    // alone also suffices even with partial metadata.
+    expect(map(pr, [card({ workProducts: [{ ...base, metadata: { repo: "example/project", number: 42 } }] })]).source).toBe("work_product");
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/42", metadata: {} }] })]).source).toBe("work_product");
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project" } }] })]).source).toBe("work_product");
+    // A URL naming a different PR never matches via metadata, and metadata
+    // disagreeing with a matching URL is inconsistent, so it never matches.
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/43", metadata: { repo: "example/project", number: 42 } }] })]).card).toBeNull();
+    expect(map(pr, [card({ workProducts: [{ ...base, url: "https://github.com/example/project/pull/42", metadata: { repo: "other/project", number: 42 } }] })]).card).toBeNull();
   });
   it.each(["https://evil.test/?u=https://github.com/example/project/pull/42", "https://github.com/example/project/pull/420", "https://github.com/example/project/pull/42evil", "https://github.com.evil.test/example/project/pull/42", "https://github.com/example/project/pull/42/files"]) ("rejects spoofed URL %s", (body) => expect(containsPrUrl(body, pull())).toBe(false));
   it("makes ambiguous URL ownership UNMAPPED rather than selecting latest", () => {
-    const text = { body: "https://github.com/example/project/pull/42", at: NOW, ownership: true };
+    const text = { id: "title", body: "https://github.com/example/project/pull/42", at: NOW, ownership: true };
     expect(map(pull({ headBranch: "feat/change" }), [card({ texts: [text] }), card({ id: PROJECT, texts: [text] })]).card).toBeNull();
   });
   it("uses tracker identifiers last and never across repositories", () => {

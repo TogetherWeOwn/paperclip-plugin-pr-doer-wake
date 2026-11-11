@@ -14,12 +14,28 @@ export interface CustodyRegistration {
    */
   branchVerified?: boolean;
 }
-export interface Mapping { card: CustodyCard | null; source: "registration" | "workspace" | "url" | "identifier" | "unmapped"; candidates: string[] }
+export interface Mapping { card: CustodyCard | null; source: "registration" | "workspace" | "work_product" | "url" | "identifier" | "unmapped"; candidates: string[] }
 export interface Disposition { at: number; action: string; revisit: number | null }
 export interface Trigger { key: string; kind: "idle" | "terminal" | "closed"; epoch: string; at: number }
 
 function escape(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 export function prReference(pr: Pick<CustodyPull, "repo" | "number">): string { return `${pr.repo}#${pr.number}`; }
+/**
+ * Canonical key for the bounded prToCards index. GitHub repo names are
+ * case-insensitive, so the index lowercases the repo to make event-written
+ * and tick-written keys agree regardless of which side spelled the URL.
+ */
+export function prIndexRef(pr: Pick<CustodyPull, "repo" | "number">): string { return `${pr.repo.toLowerCase()}#${pr.number}`; }
+/**
+ * Extract the index ref from a work-product URL, or null. Anchored to the
+ * full URL (allowing only a query/fragment tail) so a PR URL embedded in
+ * another host's query, or a longer PR number, can never produce a ref —
+ * the extraction counterpart of containsPrUrl's token discipline.
+ */
+export function prRefFromUrl(url: string): string | null {
+  const match = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/pull\/(\d+)(?:[?#].*)?$/i.exec(url);
+  return match ? `${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}#${Number(match[3])}` : null;
+}
 export function prUrl(pr: Pick<CustodyPull, "repo" | "number">): string { return `https://github.com/${pr.repo}/pull/${pr.number}`; }
 
 /** Tokens only; never accept a URL embedded in another host's query or a longer PR number. */
@@ -51,7 +67,32 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   const branchId = /^work\/([0-9a-f-]{36})$/i.exec(pr.headBranch)?.[1];
   const workspace = sameRepo && branchId && UUID.test(branchId) ? pick("workspace", eligible.filter((c) => c.id.toLowerCase() === branchId.toLowerCase() && projectMatches(c))) : null;
   if (workspace) return workspace;
-  const url = pick("url", eligible.filter((c) => c.texts.some((t) => t.ownership && containsPrUrl(t.body, pr))));
+  // Explicit native work-product PR bindings (host-supplied issue_work_products
+  // via Issue.workProducts). Revalidated exactly: a binding matches only when
+  // its URL is a token-exact match for this PR, or when metadata carries
+  // BOTH repo and number, both equal to this PR. Partial metadata (empty
+  // object, repo-only, number-only) with no matching URL never matches, so
+  // one malformed binding cannot claim an unrelated PR. A URL naming a
+  // different PR, or metadata whose present fields disagree, is ignored at
+  // this tier, never trusted. externalId/status are lifecycle annotations
+  // retained on the binding; they play no role in identity matching.
+  const workProduct = pick("work_product", eligible.filter((c) => (c.workProducts ?? []).some((w) => {
+    if (w.type !== "pull_request" || w.provider !== "github") return false;
+    const urlOk = w.url !== null && containsPrUrl(w.url, pr);
+    if (w.url !== null && !urlOk) return false;
+    const meta = w.metadata;
+    const metaRepo = meta && typeof meta.repo === "string" ? meta.repo : null;
+    const metaNumber = meta && typeof meta.number === "number" ? meta.number : null;
+    if (metaRepo !== null && metaRepo.toLowerCase() !== pr.repo.toLowerCase()) return false;
+    if (metaNumber !== null && metaNumber !== pr.number) return false;
+    return urlOk || (metaRepo !== null && metaNumber !== null);
+  })));
+  if (workProduct) return workProduct;
+  // URL tier is title/description only. Comment/document URL claims would
+  // require the full-company history scan (TWO-5928) to prove unique/absent;
+  // comments/documents are read only for already-mapped cards (dispositions
+  // and closure rationale), never as an ownership discovery tier.
+  const url = pick("url", eligible.filter((c) => c.texts.some((t) => t.ownership && (t.id === "title" || t.id === "description") && containsPrUrl(t.body, pr))));
   if (url) return url;
   const identifier = /^([A-Z][A-Z0-9]*-\d+)(?:[-/]|$)/i.exec(pr.headBranch)?.[1]?.toLowerCase();
   const tracker = sameRepo && identifier ? pick("identifier", eligible.filter((c) => c.identifier?.toLowerCase() === identifier && projectMatches(c))) : null;

@@ -15,7 +15,7 @@ describe("stock manifest and config contract", () => {
       "webhooks.receive", "jobs.schedule", "issues.read", "issues.wakeup", "issues.checkout", "execution.workspaces.read",
       "agent.tools.register", "plugin.state.read", "plugin.state.write", "http.outbound", "secrets.read-ref",
       "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
-      "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
+      "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate", "events.subscribe",
     ]));
     expect(manifest.database?.coreReadTables).toEqual(["issues", "issue_comments", "issue_documents"]);
     expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")?.schedule).toBe("17 * * * *");

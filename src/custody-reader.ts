@@ -1,5 +1,18 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
+export interface WorkProductBinding {
+  type: string;
+  provider: string;
+  url: string | null;
+  metadata: Record<string, unknown> | null;
+  // Lifecycle annotations retained from the host payload for audit. They are
+  // never used for ownership matching: only type/provider/url/metadata are
+  // identity (externalId/status describe the PR's state, not which card owns
+  // it), so a status change cannot create or move ownership.
+  externalId: string | null;
+  status: string | null;
+}
+
 export interface CustodyCard {
   id: string;
   companyId: string;
@@ -15,10 +28,38 @@ export interface CustodyCard {
   completedAt: number | null;
   cancelledAt: number | null;
   texts: Array<{ id?: string; body: string; at: number; ownership: boolean }>;
+  workProducts?: WorkProductBinding[];
 }
 
-// These are fail-closed budgets, never truncation limits. An incomplete company
-// view cannot establish that an owner/disposition is unique or absent.
+// Fail-closed budgets, never truncation limits. An incomplete company view
+// cannot establish that an owner/disposition is unique or absent.
+//
+// Scale fix (TWO-5928): the previous reader downloaded every comment (76.5 MB)
+// and every linked document body for all 5,925 company cards on every tick,
+// exceeding the 64 MiB total-byte budget by construction. Evidence is now
+// acquired in two bounded phases:
+//
+//   1. loadCustodyCards reads only card metadata (titles/descriptions) for
+//      the whole company. At ~24 MB this fits the 64 MiB ceiling and the
+//      20k row cap, and it is sufficient for every explicit ownership tier
+//      (registration, workspace branch, identifier, title/description URL,
+//      work-product PR bindings).
+//   2. loadCustodyTexts reads comments and document bodies only for cards
+//      already mapped to a PR in the current GitHub inventory. That set is
+//      bounded by the PR count, not the company card count, so the 64 MiB
+//      ceiling is no longer reachable at company scale.
+//
+// Peak memory is two independent 64 MiB phase budgets, so up to ~128 MiB if
+// both phases saturate in one tick (the previous single-total design capped
+// the peak at 64 MiB; per-row, per-body and row-count caps are unchanged).
+// Each phase still fails closed at its own ceiling, and the phase-2 set is
+// bounded by PR count, so the combined peak is not reachable from company
+// history size alone.
+//
+// Comment/document URL text is no longer an ownership tier: proving a
+// comment-URL claim unique or absent requires the full-company history
+// scan that cannot complete. Dispositions and closure rationale are still
+// read from comments/documents, but only for the mapped candidate card.
 const PAGE_SIZE = 200;
 export const CUSTODY_READ_LIMITS = {
   cards: 20_000, comments: 100_000, documents: 10_000, totalBytes: 64 * 1024 * 1024,
@@ -77,21 +118,68 @@ function excluded(origin: string): boolean {
 }
 
 /**
- * Bounded read-only company evidence, using only stock SDK host RPCs. This is a
- * materialized view, not a cross-RPC database transaction. Any host/read/budget
- * failure rejects the entire view; callers must treat rejection as UNKNOWN.
+ * Parse native issue work-product PR bindings from an Issue payload's
+ * `workProducts` field. Only explicit pull-request bindings from GitHub are
+ * retained; malformed entries are ignored rather than failing the whole
+ * snapshot because a single unrelated work product must not poison custody
+ * evidence. Callers must treat a binding as authoritative only through
+ * mapCustodyCard's work_product tier, which revalidates repo/number/URL
+ * exactly.
+ *
+ * Returns null when the host does not supply the field at all (missing or
+ * non-array). The shared Issue.workProducts is optional for payload
+ * compatibility, and the installed host's detail route always populates it
+ * as an array (GET /issues/:id spreads listForIssue, which returns [] when
+ * there are no bindings), but an absent field is fail-closed UNKNOWN here —
+ * never silently treated as "no bindings" — so a host that omits it can
+ * never produce a false complete=true. Callers with a non-null result may
+ * treat an empty array as a proven-absent field.
+ */
+export function parseWorkProductBindings(raw: unknown): WorkProductBinding[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: WorkProductBinding[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const row = entry as Row;
+    const type = typeof row.type === "string" ? row.type : "";
+    const provider = typeof row.provider === "string" ? row.provider : "";
+    if (type !== "pull_request" || provider !== "github") continue;
+    const url = typeof row.url === "string" ? row.url : null;
+    let metadata: Record<string, unknown> | null = null;
+    if (row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)) {
+      metadata = row.metadata as Record<string, unknown>;
+    }
+    out.push({
+      type, provider, url, metadata,
+      externalId: typeof row.externalId === "string" ? row.externalId : null,
+      status: typeof row.status === "string" ? row.status : null,
+    });
+  }
+  return out;
+}
+
+function byteBudget() {
+  let totalBytes = 0;
+  return (body: string): void => {
+    const bytes = Buffer.byteLength(body, "utf8");
+    if (body.length > MAX_BODY_CHARS || bytes > MAX_BODY_BYTES) unknown("body budget exceeded");
+    totalBytes += bytes;
+    if (totalBytes > MAX_TOTAL_BYTES) unknown("total byte budget exceeded");
+  };
+}
+
+/**
+ * Bounded read-only company card metadata (titles/descriptions only). This is
+ * a materialized view, not a cross-RPC database transaction. Any host/read/
+// budget failure rejects the entire view; callers must treat rejection as
+ * UNKNOWN. Comment/document evidence is loaded separately for mapped cards
+ * by loadCustodyTexts, never by a full-company scan.
  */
 export async function loadCustodyCards(
   ctx: PluginContext, companyId: string, guard: () => void,
 ): Promise<CustodyCard[]> {
   id(companyId);
-  let totalBytes = 0;
-  function budget(body: string): void {
-    const bytes = Buffer.byteLength(body, "utf8");
-    if (body.length > MAX_BODY_CHARS || bytes > MAX_BODY_BYTES) unknown("body budget exceeded");
-    totalBytes += bytes;
-    if (totalBytes > MAX_TOTAL_BYTES) unknown("total byte budget exceeded");
-  }
+  const budget = byteBudget();
   async function rows(table: Table, columns: string, cap: number, visit: (row: Row) => void, issueIds?: string[]): Promise<void> {
     let count = 0;
     let cursor: string | null = null;
@@ -151,10 +239,57 @@ export async function loadCustodyCards(
     }
     cards.set(card.id, card);
   });
-  if (cards.size === 0) return [];
-  const issueIds = [...cards.keys()];
+  return [...cards.values()];
+}
+
+/**
+ * Load comments + linked document bodies for an explicit candidate set only.
+ * Appends to each card's texts in place and returns the same array. Callers
+ * should pass only cards already mapped to a PR in the current inventory so
+ * the byte budget tracks PR count, not company history size. Any failure
+ * rejects the whole batch (fail closed): callers must treat the affected
+ * PRs as UNKNOWN, never as evidence-free.
+ */
+export async function loadCustodyTexts(
+  ctx: PluginContext, companyId: string, guard: () => void, cards: CustodyCard[],
+): Promise<CustodyCard[]> {
+  id(companyId);
+  if (!cards.length) return cards;
+  const byId = new Map<string, CustodyCard>();
+  for (const card of cards) {
+    if (card.companyId !== companyId) unknown("cross-company candidate card");
+    if (byId.has(card.id)) continue;
+    byId.set(card.id, card);
+  }
+  const budget = byteBudget();
+  const issueIds = [...byId.keys()];
+  async function rows(table: Table, columns: string, cap: number, visit: (row: Row) => void): Promise<void> {
+    let count = 0;
+    let cursor: string | null = null;
+    for (;;) {
+      const limit = Math.min(PAGE_SIZE, cap - count + 1);
+      const sql = `SELECT ${columns} FROM public.${table}
+        WHERE company_id = $1 AND ($2::uuid IS NULL OR id > $2::uuid)
+        AND issue_id = ANY($4::uuid[])
+        ORDER BY id ASC LIMIT $3`;
+      guard();
+      const page = await ctx.db.query(sql, [companyId, cursor, limit, `{${issueIds.join(",")}}`]);
+      if (!Array.isArray(page) || page.length > limit) unknown(`${table} malformed page`);
+      for (const value of page) {
+        const row = record(value);
+        if (row.company_id !== companyId) unknown(`${table} cross-company row`);
+        const next = id(row.id);
+        if (cursor !== null && next <= cursor) unknown(`${table} duplicate or unordered row`);
+        cursor = next;
+        if (count === cap) unknown(`${table} row budget exceeded`);
+        count++;
+        visit(row);
+      }
+      if (page.length < limit) return;
+    }
+  }
   function parent(row: Row): CustodyCard {
-    const card = cards.get(id(row.issue_id));
+    const card = byId.get(id(row.issue_id));
     if (!card) unknown("evidence references an unexpected issue");
     return card;
   }
@@ -170,7 +305,7 @@ export async function loadCustodyCards(
     const body = text(row.body, "comment body");
     budget(body);
     card.texts.push({ id: `comment:${id(row.id)}`, body, at: time(row.updated_at), ownership: agent !== null && user === null && (authorType === null || authorType === "agent") });
-  }, issueIds);
+  });
 
   // Never join public.documents: only metadata is an allowed core table. Scan
   // all metadata before fetching bodies so excessive documents fail without RPC fanout.
@@ -188,7 +323,7 @@ export async function loadCustodyCards(
     seenKeys.add(identity);
     seenDocuments.add(documentId);
     if (key !== "pr-custody") documents.push({ card, documentId, key });
-  }, issueIds);
+  });
   for (const { card, documentId, key } of documents) {
     guard();
     const value = await ctx.issues.documents.get(card.id, key, companyId);
@@ -200,5 +335,5 @@ export async function loadCustodyCards(
     budget(body);
     card.texts.push({ id: `document:${documentId}`, body, at: time(document.updatedAt), ownership: true });
   }
-  return [...cards.values()];
+  return [...byId.values()];
 }

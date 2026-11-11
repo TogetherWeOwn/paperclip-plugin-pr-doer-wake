@@ -40,7 +40,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "webhooks.receive", "jobs.schedule", "issues.read", "issues.wakeup", "issues.checkout",
     "execution.workspaces.read", "agent.tools.register", "plugin.state.read", "plugin.state.write",
     "http.outbound", "secrets.read-ref", "issues.create", "issue.documents.read", "issue.documents.write",
-    "issue.relations.read", "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
+    "issue.relations.read", "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate", "events.subscribe",
   ],
   database: { namespaceSlug: "pr_custody", migrationsDir: "custody-migrations", coreReadTables: ["issues", "issue_comments", "issue_documents"] },
   entrypoints: { worker: "./dist/worker.js" },

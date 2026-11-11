@@ -2,10 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { CustodyPull } from "../src/custody-github.js";
 import { CustodyGithub } from "../src/custody-github.js";
-import { loadCustodyCards, type CustodyCard } from "../src/custody-reader.js";
+import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
 import { CUSTODY_ORIGIN, DAY } from "../src/custody-policy.js";
-vi.mock("../src/custody-reader.js", () => ({ loadCustodyCards: vi.fn() }));
+vi.mock("../src/custody-reader.js", () => ({ loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const ISSUE = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -40,7 +40,12 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
       listWorkspaces: vi.fn(async (projectId: string) => [{ projectId, repoUrl: "https://github.com/example/project" }]),
     },
     issues: {
-      get: vi.fn(async (id: string) => cards.find((c) => c.id === id) ?? created.find((c) => c.id === id) ?? null),
+      // The host detail route always returns workProducts as an array; model
+      // that here so cards are proven-absent unless a test opts into absence.
+      get: vi.fn(async (id: string) => {
+        const found = cards.find((c) => c.id === id) ?? created.find((c) => c.id === id);
+        return found ? { ...found, workProducts: (found as any).workProducts ?? [] } : null;
+      }),
       list: vi.fn(async ({ originId }: any) => created.filter((c) => c.originId === originId)),
       create: vi.fn(async (input: any) => { const c = { ...input, id: CHILD }; created.push(c); return c; }),
       requestWakeup: vi.fn(async () => ({ queued: true, runId: ISSUE })),
@@ -52,6 +57,7 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
     },
   };
   vi.mocked(loadCustodyCards).mockResolvedValue(cards);
+  vi.mocked(loadCustodyTexts).mockImplementation(async (_ctx: unknown, _company: string, _guard: () => void, selected: CustodyCard[]) => selected);
   vi.spyOn(CustodyGithub.prototype, "repositories").mockResolvedValue(["example/project"]);
   const listing = vi.spyOn(CustodyGithub.prototype, "pulls").mockImplementation(async (_repo, status) => status === "open" ? options.open ?? [pull()] : options.closed ?? []);
   vi.spyOn(CustodyGithub.prototype, "pull").mockImplementation(async function (this: any, _repo, number) {
@@ -69,7 +75,7 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
   const ledger = () => [...state.entries()].find(([key]) => key.includes("pr-custody-v1"))?.[1];
   return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => { const next = new CustodyRuntime(ctx as unknown as PluginContext, () => now); next.setCustodyCompanyId(COMPANY); return next; } };
 }
-afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); });
+afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); vi.mocked(loadCustodyTexts).mockReset(); });
 
 describe("custody native effects", () => {
   it("saves evidence and wakes assigned open card with exactly the trigger key, once across restart", async () => {
@@ -271,13 +277,22 @@ describe("custody native effects", () => {
 });
 
 describe("coverage, summary and cursor controls", () => {
-  it("records UNKNOWN, never absence, if the card snapshot fails", async () => {
+  it("surfaces UNKNOWN as a failed job run with the reason recorded, never silent success", async () => {
     const h = fixture();
     vi.mocked(loadCustodyCards).mockRejectedValue(new Error("incomplete"));
-    await h.runtime.poll();
-    expect(h.ledger().report).toMatchObject({ complete: false, unknown: ["inventory"] });
+    await expect(h.runtime.poll()).rejects.toThrow("incomplete");
+    expect(h.ledger().report).toMatchObject({ complete: false, unknown: ["inventory"], failure: "incomplete" });
     expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+  it("loads comment/document evidence only for PR-mapped candidates, bounded by PR count", async () => {
+    const h = fixture();
+    await h.runtime.poll();
+    expect(loadCustodyTexts).toHaveBeenCalledTimes(1);
+    const selected = vi.mocked(loadCustodyTexts).mock.calls[0]![3];
+    expect(selected.map((c) => c.id)).toEqual([ISSUE]);
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
   });
   it("reports denied open activity UNKNOWN without pinning unrelated closure coverage", async () => {
     const h = fixture({ cards: [card({ status: "done" })] });
@@ -857,16 +872,20 @@ describe("coverage, summary and cursor controls", () => {
       }
       return set(key, value);
     });
-    await h.restart().poll();
+    // The archive failure surfaces as a failed run (never silent success)
+    // and must not evict the hot tombstone it failed to archive.
+    await expect(h.restart().poll()).rejects.toThrow("archive reply failed");
     expect(Object.keys(h.ledger().receipts)).toHaveLength(20_000);
     expect(h.ledger().receipts[`example/project#42|idle|${NOW - 8 * DAY}`].status).toBe("woken");
     expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.failure).toBe("archive reply failed");
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
-  it("coalesces overlapping scheduled callbacks", async () => {
+  it("coalesces overlapping scheduled callbacks into one tick", async () => {
     const h = fixture();
     await Promise.all([h.runtime.poll(), h.runtime.poll()]);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(loadCustodyCards).toHaveBeenCalledTimes(1);
   });
 
   it("seeds first-observed heads so already-idle PRs trigger without a fresh seven-day warmup", async () => {
@@ -1036,5 +1055,168 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.seedHead).not.toHaveBeenCalled();
     expect(h.ledger().heads["example/project#42"]).toEqual({ sha: "b".repeat(40), at: NOW + 3 * DAY, provenance: "warmup" });
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+});
+
+describe("work-product discovery from a cold ledger", () => {
+  it("maps a work-product-only card in one tick from an empty ledger", async () => {
+    // A dormant card bound to its PR only by a native work product: no
+    // registration, workspace-branch, title/description URL or tracker
+    // identifier claim. Enrichment must reach it from a cold ledger.
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: "example/project#42", status: "ready_for_review" };
+    const h = fixture({ cards: [card({ workProducts: [binding] })], open: [pull({ headBranch: "feat/change" })] });
+    await h.runtime.poll();
+    expect(h.ctx.issues.get).toHaveBeenCalledWith(ISSUE, COMPANY);
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: "example/project#42", mapping: "work_product", cardId: ISSUE })]);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
+    expect(h.ledger().report.complete).toBe(true);
+  });
+  it("enriches and maps a projectless work-product-only card", async () => {
+    // The work-product tier has no project gate, so projectless cards must
+    // be enriched too or they map unmapped while the tick reports complete.
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: "example/project#42", status: "ready_for_review" };
+    const h = fixture({ cards: [card({ projectId: null, workProducts: [binding] })], open: [pull({ headBranch: "feat/change" })] });
+    await h.runtime.poll();
+    expect(h.ctx.issues.get).toHaveBeenCalledWith(ISSUE, COMPANY);
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: "example/project#42", mapping: "work_product", cardId: ISSUE })]);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
+    expect(h.ledger().report.complete).toBe(true);
+  });
+  it("defers all effects when a work-product enrichment read fails", async () => {
+    // A failed enrichment could hide the true work-product owner, so a
+    // lower-tier (title URL) match must not receive the wake this tick.
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const h = fixture({ cards: [urlCard] });
+    h.ctx.issues.get.mockRejectedValueOnce(new Error("read failed"));
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain(`work_product:${ISSUE}`);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.rows).toHaveLength(1);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+  it("does not stamp a Phase B-starved repo in Phase A, so it rotates first next tick", async () => {
+    const h = fixture({ open: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [
+      { projectId, repoUrl: "https://github.com/example/project" },
+      { projectId, repoUrl: "https://github.com/example/tail" },
+    ]);
+    h.listing.mockImplementation(async (repo, status) => status === "open"
+      ? (repo === "example/tail" ? [pull({ repo: "example/tail", headRepo: "example/tail" })] : [pull()])
+      : []);
+    // Phase B on the first repo advances time past the inventory budget,
+    // starving the second repo's evidence pass inside this tick.
+    h.activity.mockImplementation(async (pr) => {
+      if (pr.repo === "example/project") h.advance(210_000);
+      return NOW - 8 * DAY;
+    });
+    await h.runtime.poll();
+    expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_000);
+    expect(h.ledger().attempted["example/tail"]).toBeUndefined();
+    expect(h.ledger().report.unknown).toContain("example/tail#42");
+    // Next tick the starved repo sorts first and is inventoried first.
+    h.listing.mockClear();
+    await h.restart().poll();
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+  });
+  it("treats a missing workProducts field as UNKNOWN, never as proven-absent", async () => {
+    const h = fixture({ open: [pull({ headBranch: "feat/change" })] });
+    h.ctx.issues.get.mockImplementation(async () => ({ id: ISSUE, companyId: COMPANY, projectId: PROJECT, identifier: "TASK-42", title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null }));
+    await h.runtime.poll();
+    expect(h.ledger().report.rows[0]).toMatchObject({ mapping: "unmapped", cardId: null });
+    expect(h.ledger().report.unknown).toContain(`work_product:${ISSUE}`);
+    expect(h.ledger().report.complete).toBe(false);
+  });
+});
+
+describe("onCustodyEvent index freshness", () => {
+  const STATE_KEY = JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" });
+  const seedLedger = (h: ReturnType<typeof fixture>, prToCards: Record<string, string>) => {
+    h.state.set(STATE_KEY, { version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions: {}, audits: [], prToCards, report: { at: NOW, complete: false, rows: [], unknown: [], effects: 0 } });
+  };
+  const eventIssue = (h: ReturnType<typeof fixture>, url: string | null) => {
+    h.ctx.issues.get.mockImplementation(async () => ({ ...card(), workProducts: [{ type: "pull_request", provider: "github", url, metadata: { repo: "example/project", number: 42 } }] }));
+  };
+  it("writes the ledger only when the index changes, normalizing the ref case", async () => {
+    const h = fixture();
+    seedLedger(h, {});
+    eventIssue(h, "https://github.com/Example/Project/pull/42");
+    await h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" });
+    expect(h.ctx.state.set).toHaveBeenCalledTimes(1);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
+  });
+  it("does not write when the index is already current", async () => {
+    const h = fixture();
+    seedLedger(h, { "example/project#42": ISSUE });
+    eventIssue(h, "https://github.com/example/project/pull/42");
+    await h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.created" });
+    expect(h.ctx.state.set).not.toHaveBeenCalled();
+  });
+  it("ignores comment/document events without reads", async () => {
+    const h = fixture();
+    seedLedger(h, {});
+    eventIssue(h, "https://github.com/example/project/pull/42");
+    await h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.comment.created" });
+    await h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.document.updated" });
+    expect(h.ctx.issues.get).not.toHaveBeenCalled();
+    expect(h.ctx.state.set).not.toHaveBeenCalled();
+  });
+  it("refuses unanchored or cross-host PR URLs", async () => {
+    const h = fixture();
+    seedLedger(h, {});
+    eventIssue(h, "https://github.com/example/project/pull/42/files");
+    await h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" });
+    expect(h.ctx.state.set).not.toHaveBeenCalled();
+    expect(h.ledger().prToCards).toEqual({});
+  });
+  it("queues an event behind a running tick instead of racing its writes", async () => {
+    const h = fixture();
+    seedLedger(h, {});
+    let release!: (v: CustodyCard[]) => void;
+    const gate = new Promise<CustodyCard[]>((resolve) => { release = resolve; });
+    vi.mocked(loadCustodyCards).mockImplementationOnce(() => gate);
+    const ticking = h.runtime.poll();
+    // Let the tick reach the gated card load; the event must serialize
+    // behind the tick through the shared mutex — it cannot read or write
+    // the ledger while the tick is mid-flight, and it is not dropped now.
+    await new Promise((resolve) => setImmediate(resolve));
+    eventIssue(h, "https://github.com/example/project/pull/42");
+    let eventDone = false;
+    const evented = h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" }).then(() => { eventDone = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.ctx.issues.get).not.toHaveBeenCalled();
+    expect(eventDone).toBe(false);
+    release(h.cards);
+    await ticking;
+    await evented;
+    expect(eventDone).toBe(true);
+    // The tick's full cycle ran and persisted; the queued event then ran.
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it("does not let a tick starting mid event-handler lose its settled receipt", async () => {
+    const h = fixture();
+    seedLedger(h, {});
+    // Gate the event handler's issue read so the tick starts after the
+    // handler has begun — the exact interleaving a boolean-flag check
+    // cannot close. The tick must wait for the handler's write, then run
+    // against the fresh ledger rather than overwrite it.
+    let releaseGet!: (v: unknown) => void;
+    const getGate = new Promise<unknown>((resolve) => { releaseGet = resolve; });
+    h.ctx.issues.get.mockImplementationOnce(() => getGate);
+    const evented = h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.ctx.issues.get).toHaveBeenCalledTimes(1);
+    const ticked = h.runtime.poll();
+    releaseGet({ ...card(), workProducts: [{ type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 } }] });
+    await evented;
+    await ticked;
+    // One settled wake only: the event's stale snapshot never overwrote
+    // the tick's receipt, so there is no duplicate custody wake.
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "woken" })]);
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
   });
 });
