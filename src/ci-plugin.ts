@@ -5,6 +5,7 @@ import { GatesStatusRuntime } from "./gates-runtime.js";
 import { registrationTool } from "./manifest.js";
 import { CustodyRuntime } from "./custody-runtime.js";
 import { validateCustodyConfig } from "./custody-config.js";
+import { DependencyWakeRuntime, parseDependencyWakeConfig, validateDependencyWakeConfig } from "./dependency-wake.js";
 
 let runtime: CiWakeRuntime | null = null;
 let gates: GatesStatusRuntime | null = null;
@@ -12,6 +13,8 @@ let custodyRuntime: CustodyRuntime | null = null;
 // Last validated capture, retained across setup re-runs and applied to each
 // fresh runtime so a capture is never lost when the runtime is recreated.
 let capturedCustodyCompanyId: string | null = null;
+let dependencyRuntime: DependencyWakeRuntime | null = null;
+let capturedDependencyCompanyId: string | null = null;
 function ready(): CiWakeRuntime {
   if (!runtime) throw new Error("ci-wake_not_initialized");
   return runtime;
@@ -31,6 +34,8 @@ export default definePlugin({
     gates = new GatesStatusRuntime(ctx);
     custodyRuntime = new CustodyRuntime(ctx);
     custodyRuntime.setCustodyCompanyId(capturedCustodyCompanyId);
+    dependencyRuntime = new DependencyWakeRuntime(ctx);
+    dependencyRuntime.setCompanyId(capturedDependencyCompanyId);
     // Dereference the module-level runtime at fire time so a setup re-run
     // retargets the already-registered job instead of splitting it from the
     // runtime that onConfigChanged mutates.
@@ -46,6 +51,7 @@ export default definePlugin({
     ctx.events.on("issue.relations.updated", custodyEvent);
     ctx.tools.register(registrationTool.name, registrationTool, (params, run) => ready().register(params, run));
     ctx.jobs.register("ci-wake-poll", async () => ready().poll());
+    ctx.jobs.register("dependency-wake", async () => dependencyRuntime?.poll());
     ctx.jobs.register("gates-status-sweep", async () => readyGates().drain());
     ctx.events.on("issue.updated", async (event) => readyGates().handleIssueUpdated(event));
     ctx.logger.info("ci-wake ready; explicit registration only; gates publisher registered (disabled by default)");
@@ -65,6 +71,15 @@ export default definePlugin({
       ? context.companyId.toLowerCase()
       : null;
     if (!delivered) return;
+    // Dependency wake uses the same delivery-bound capture rule as custody.
+    const dependency = parseDependencyWakeConfig(newConfig);
+    if (dependency.enabled && dependency.companyId === delivered) {
+      capturedDependencyCompanyId = delivered;
+      dependencyRuntime?.setCompanyId(delivered);
+    } else if (capturedDependencyCompanyId !== null && delivered === capturedDependencyCompanyId) {
+      capturedDependencyCompanyId = null;
+      dependencyRuntime?.setCompanyId(null);
+    }
     const field = newConfig.custodyEnabled === true && typeof newConfig.custodyCompanyId === "string" && UUID.test(newConfig.custodyCompanyId)
       ? newConfig.custodyCompanyId.toLowerCase()
       : null;
@@ -79,7 +94,7 @@ export default definePlugin({
     }
   },
   async onValidateConfig(config) {
-    const errors = [...validateCiConfig(config), ...validateCustodyConfig(config)];
+    const errors = [...validateCiConfig(config), ...validateCustodyConfig(config), ...validateDependencyWakeConfig(config)];
     return errors.length ? { ok: false, errors } : { ok: true };
   },
   async onWebhook(input) { await ready().webhook(input); },

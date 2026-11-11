@@ -41,7 +41,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "execution.workspaces.read", "agent.tools.register", "plugin.state.read", "plugin.state.write",
     "http.outbound", "secrets.read-ref", "issues.create", "issue.documents.read", "issue.documents.write",
 "issue.relations.read", "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
-    "events.subscribe", "issue.interactions.read",
+    "events.subscribe", "issue.interactions.read", "issues.orchestration.read",
   ],
   database: { namespaceSlug: "pr_custody", migrationsDir: "custody-migrations", coreReadTables: ["issues", "issue_comments", "issue_documents"] },
   entrypoints: { worker: "./dist/worker.js" },
@@ -50,6 +50,7 @@ const manifest: PaperclipPluginManifestV1 = {
     { jobKey: "ci-wake-poll", displayName: "CI wait poll", description: "Backstop recheck of registered open waits without an LLM; webhooks are the primary trigger. Retires moved heads and expired waits.", schedule: "*/15 * * * *" },
     { jobKey: "gates-status-sweep", displayName: "Gates status sweep", description: "Publish paperclip/gates commit statuses from RM merge confirmations. Ships disabled; shadow mode logs only.", schedule: "*/4 * * * *" },
     { jobKey: "pr-custody", displayName: "PR custody", description: "Inventory organization PRs and request a disposition once per trigger. Separate opt-in and dry-run; incomplete evidence is UNKNOWN.", schedule: "17 * * * *" },
+    { jobKey: "dependency-wake", displayName: "Dependency wake", description: "Wake in_review/in_progress dependents once per (dependent, blocker) after every blocker is done for 10 minutes, the dependent has not run since, and no run is live. Ships disabled and shadow-only.", schedule: "*/5 * * * *" },
   ],
   webhooks: [{ endpointKey: "github-ci", displayName: "GitHub CI hint", description: "Phase two (push mode): signed check_suite, check_run, workflow_run and pull_request events only. Disabled until explicitly configured; payloads never authorize a wake, they trigger a fresh GitHub recheck of an already-registered wait." }],
   instanceConfigSchema: {
@@ -57,6 +58,7 @@ const manifest: PaperclipPluginManifestV1 = {
     allOf: [
       { if: { anyOf: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"].map((key) => ({ required: [key] })) }, then: { required: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"], not: { required: ["githubTokenSecretRef"] } } },
       { if: { anyOf: [{ required: ["enabled"], properties: { enabled: { const: true } } }, { required: ["gatesStatusEnabled"], properties: { gatesStatusEnabled: { const: true } } }, { required: ["prHeadWakeEnabled"], properties: { prHeadWakeEnabled: { const: true } } }] }, then: { anyOf: [{ required: ["githubTokenSecretRef"] }, { required: ["githubAppId", "githubInstallationId", "githubAppPrivateKeySecretRef"] }] } },
+      { if: { required: ["dependencyWakeEnabled"], properties: { dependencyWakeEnabled: { const: true } } }, then: { required: ["dependencyWakeCompanyId"] } },
     ],
     properties: {
       enabled: { type: "boolean", default: false },
@@ -77,6 +79,9 @@ const manifest: PaperclipPluginManifestV1 = {
       gatesStatusEnabled: { type: "boolean", default: false, description: "Publish paperclip/gates commit statuses from RM merge confirmations. Stays off until the App gains statuses: write; without it the publisher logs missing_permission and never greens a SHA." },
       gatesStatusShadow: { type: "boolean", default: true, description: "Shadow mode: compute and log decisions without POSTing any GitHub status. Set false only after shadow evidence matches RM decisions." },
       releaseManagerAgentId: { type: "string", format: "uuid", description: "The one agent addressed by and resolving merge-authorization confirmations (title Merge <owner/repo>#<n>?, prompt identical, bare-PR-URL details) that publish paperclip/gates. Required when gatesStatusEnabled is true." },
+      dependencyWakeEnabled: { type: "boolean", default: false, description: "Wake in_review/in_progress dependents whose blockers are all done (core re-wakes only blocked dependents after a gated finalize). Ships disabled; needs no GitHub credential." },
+      dependencyWakeShadow: { type: "boolean", default: true, description: "Shadow mode: record and log intended dependency wakes without firing any. Set false only after shadow evidence is accepted." },
+      dependencyWakeCompanyId: { type: "string", format: "uuid", description: "The one company whose cards dependency wake may read and wake. Required when dependencyWakeEnabled is true." },
       webhooksEnabled: { type: "boolean", default: false },
       webhookSecretRef: { ...secretRef, description: "Phase two only: webhook HMAC secret stored by the owner in Paperclip." },
       repoMedianMs: { type: "object", maxProperties: 200, additionalProperties: { type: "integer", minimum: 60000, maximum: 86400000 }, description: "Optional measured per-repo cold-start CI medians in milliseconds; absent entries start at 30 minutes. Replaced by a rolling median of settled registered heads." },
