@@ -13,11 +13,18 @@ import { retryableBeforeQueue } from "./native-wake.js";
  */
 export const DEPENDENCY_WAKE_LIMITS = {
   graceMs: 600_000, lookbackMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000,
-  maxPerStatus: 1_000, hostReads: 800, wakesPerTick: 10, tickMs: 120_000, receipts: 5_000, audits: 500,
+  maxPerStatus: 1_000, hostReads: 800, wakesPerTick: 10, tickMs: 120_000, audits: 500,
+  // Storage bound, not a dedupe horizon. It is below the worst-case live rate over
+  // the lookback (10 wakes per 5-minute tick), but eviction drops the oldest key
+  // first, and an evicted key re-fires only if the dependent still has not started
+  // a run since its blocker finished (the run watermark below), which a queued
+  // wake makes unlikely; the host idempotency key is also stable per blocker set.
+  receipts: 5_000,
 } as const;
 const L = DEPENDENCY_WAKE_LIMITS;
 const STATUSES = ["in_review", "in_progress"] as const;
 const LIVE = new Set(["queued", "running"]);
+const STOPS = ["tick_budget", "wake_budget", "wake_intent_write_failed", "configuration_changed"];
 
 export interface DependencyWakeConfig { enabled: boolean; shadow: boolean; companyId: string | null }
 export function parseDependencyWakeConfig(raw: Record<string, unknown>): DependencyWakeConfig {
@@ -35,6 +42,8 @@ export interface DependencyWakeLedger {
   /** Keyed `${dependentId}:${blockerId}`; at most one effect per key within retention. */
   receipts: Record<string, Receipt>;
   audits: Array<{ at: number; outcome: string; issueId?: string }>;
+  /** Id of the first candidate (in id order) the next tick examines; absent = start of the list. */
+  cursor?: string;
   lastTick?: { at: number; complete: boolean; examined: number; eligible: number; wakes: number };
 }
 interface Tick {
@@ -88,21 +97,35 @@ export class DependencyWakeRuntime {
     };
     try {
       let capped = false;
+      const candidates: Array<{ issue: Issue; status: (typeof STATUSES)[number] }> = [];
       for (const status of STATUSES) {
         // One bounded page per status: the installed host applies `offset` twice
         // (SQL, then the plugin window), so any offset > 0 reads an empty page.
         const page = await tick.read(() => this.ctx.issues.list({ companyId, status, limit: L.maxPerStatus }));
         if (page.length >= L.maxPerStatus) { capped = true; tick.audit("candidate_cap"); }
-        for (const issue of page) {
-          try { await this.consider(tick, issue, status); } catch (error) {
-            if (error instanceof Error && ["tick_budget", "wake_intent_write_failed", "configuration_changed"].includes(error.message)) throw error;
-            tick.audit("candidate_error", issue.id);
+        for (const issue of page) candidates.push({ issue, status });
+      }
+      // Stable id order plus a persisted cursor: a tick that runs out of budget
+      // resumes where it stopped, so every candidate in both statuses is reached.
+      candidates.sort((a, b) => (a.issue.id < b.issue.id ? -1 : a.issue.id > b.issue.id ? 1 : 0));
+      const cursor = ledger.cursor;
+      const start = Math.max(0, cursor ? candidates.findIndex((c) => c.issue.id >= cursor) : 0);
+      for (let i = start; i < candidates.length; i += 1) {
+        const { issue, status } = candidates[i]!;
+        try { await this.consider(tick, issue, status); } catch (error) {
+          if (error instanceof Error && STOPS.includes(error.message)) {
+            // Retry this candidate next tick, unless it alone exhausted a fresh read budget.
+            const next = error.message === "tick_budget" && i === start ? candidates[i + 1]?.issue.id : issue.id;
+            if (next) ledger.cursor = next; else delete ledger.cursor;
+            throw error;
           }
+          tick.audit("candidate_error", issue.id);
         }
       }
-      tick.report.complete = !capped;
+      delete ledger.cursor;
+      tick.report.complete = !capped && start === 0;
     } catch (error) {
-      tick.audit(error instanceof Error && ["tick_budget", "configuration_changed"].includes(error.message) ? error.message : "tick_error");
+      tick.audit(error instanceof Error && ["tick_budget", "wake_budget", "configuration_changed"].includes(error.message) ? error.message : "tick_error");
     } finally {
       const cutoff = this.now() - L.retentionMs;
       ledger.receipts = Object.fromEntries(Object.entries(ledger.receipts).filter(([, r]) => r.at >= cutoff).sort((a, b) => b[1].at - a[1].at).slice(0, L.receipts));
@@ -141,7 +164,8 @@ export class DependencyWakeRuntime {
     if (!fresh.length) return;
     const dependent = await this.liveRun(tick, issue.id);
     if (dependent.live || dependent.budgetBlocked) return;
-    const lastRun = Math.max(-Infinity, ...dependent.runs.map((run) => time(run.finishedAt ?? run.startedAt ?? run.createdAt)).filter(Number.isFinite));
+    // A run that never started (e.g. queued, then cancelled on reassignment) saw nothing: no watermark.
+    const lastRun = Math.max(-Infinity, ...dependent.runs.filter((run) => run.startedAt != null).map((run) => time(run.finishedAt ?? run.startedAt)).filter(Number.isFinite));
     // Only blockers that finished after the dependent last ran; an earlier one was already seen by that run.
     const triggers = fresh.filter((b) => doneAt.get(b.id)! > lastRun);
     if (!triggers.length) return;
@@ -158,7 +182,8 @@ export class DependencyWakeRuntime {
       this.ctx.logger.info("dependency-wake: would wake", { issueId: issue.id, status, blockerIds: triggers.map((b) => b.id) });
       return;
     }
-    if (report.wakes >= L.wakesPerTick) { tick.audit("wake_budget", issue.id); return; }
+    // Out of wakes: stop here and resume at this candidate next tick (the tick reports incomplete).
+    if (report.wakes >= L.wakesPerTick) throw new Error("wake_budget");
     // Re-read config right before the effect: a rollback (disable or shadow) made mid-tick wins.
     const current = parseDependencyWakeConfig(await tick.read(() => this.ctx.config.get(companyId)));
     if (!current.enabled || current.shadow || current.companyId !== companyId) throw new Error("configuration_changed");

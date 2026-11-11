@@ -11,6 +11,10 @@ const AGENT = "33333333-3333-4333-8333-333333333333";
 const DEP = "44444444-4444-4444-8444-444444444444";
 const BLK = "55555555-5555-4555-8555-555555555555";
 const BLK2 = "66666666-6666-4666-8666-666666666666";
+const DEP2 = "77777777-7777-4777-8777-777777777777";
+// Ids that sort before DEP, so a bounded traversal reaches them first.
+const filler = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+const wokenIds = (h: { ctx: { issues: { requestWakeup: { mock: { calls: unknown[] } } } } }) => (h.ctx.issues.requestWakeup.mock.calls as Array<[string]>).map(([id]) => id);
 const START = 1_800_000_000_000;
 const MIN = 60_000;
 const iso = (ms: number) => new Date(ms).toISOString();
@@ -32,7 +36,7 @@ function harness() {
     config: { get: vi.fn(async () => config) },
     state: { get: async (key: unknown) => structuredClone(state.get(JSON.stringify(key)) ?? null), set: async (key: unknown, value: unknown) => { state.set(JSON.stringify(key), structuredClone(value)); } },
     issues: {
-      list: vi.fn(async ({ status }: { status: string }) => Object.values(issues).filter((i) => i.status === status)),
+      list: vi.fn(async ({ status, limit }: { status: string; limit?: number }) => Object.values(issues).filter((i) => i.status === status).slice(0, limit)),
       get: vi.fn(async (id: string) => issues[id] ?? null),
       relations: { get: vi.fn(async (id: string) => ({ blockedBy: relations[id] ?? [], blocks: [] })) },
       summaries: { getOrchestration: vi.fn(async ({ issueId }: { issueId: string }) => ({ runs: runs[issueId] ?? [], invocationBlocks: budgetBlocks })) },
@@ -109,6 +113,43 @@ describe("dependency wake", () => {
     await h.runtime.poll();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger()?.receipts ?? {}).toEqual({});
+  });
+
+  it("does not let a never-started run (queued before, cancelled after the blocker finished) suppress the wake", async () => {
+    const h = harness();
+    // Host cancels a queued run on reassignment with startedAt=null; it never saw the blocker's completion.
+    h.runs[DEP]!.push({ id: "r2", issueId: DEP, status: "cancelled", createdAt: iso(START - 40 * MIN), startedAt: null, finishedAt: iso(START - 20 * MIN) });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes a budget-exhausted traversal so later candidates and both statuses are examined", async () => {
+    const h = harness();
+    const dep = h.issues[DEP]!;
+    delete h.issues[DEP];
+    for (let n = 0; n < 900; n += 1) h.issues[filler(n)] = { id: filler(n), companyId: COMPANY, status: "in_review", assigneeAgentId: AGENT, activeRun: null };
+    h.issues[DEP] = dep;
+    h.issues[DEP2] = { id: DEP2, companyId: COMPANY, status: "in_progress", assigneeAgentId: AGENT, activeRun: null };
+    h.relations[DEP2] = [{ id: BLK, identifier: "TWO-1", status: "done" }];
+    for (let n = 0; n < 3; n += 1) await h.runtime.poll();
+    expect(h.ctx.issues.list.mock.calls.map(([query]) => query.status)).toContain("in_progress");
+    expect(wokenIds(h).sort()).toEqual([DEP, DEP2]);
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("tick_budget");
+  });
+
+  it("reports an incomplete tick when the wake budget defers eligible wakes, and wakes the rest next tick", async () => {
+    const h = harness();
+    for (let n = 0; n < 10; n += 1) {
+      h.issues[filler(n)] = { id: filler(n), companyId: COMPANY, status: "in_review", assigneeAgentId: AGENT, activeRun: null };
+      h.relations[filler(n)] = [{ id: BLK, identifier: "TWO-1", status: "done" }];
+    }
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(10);
+    expect(h.ledger()?.lastTick).toMatchObject({ complete: false, wakes: 10 });
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("wake_budget");
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(11);
+    expect(wokenIds(h).at(-1)).toBe(DEP);
   });
 
   it("retries a host-deferred wake next tick but never repeats an unconfirmed or not-queued one", async () => {
