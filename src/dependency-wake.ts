@@ -8,8 +8,9 @@ import { retryableBeforeQueue } from "./native-wake.js";
  * done, but when that wake is gated by the blocker's workspace finalize, the
  * finalize/periodic backstop re-wakes only `blocked` dependents, so an
  * `in_review` or `in_progress` dependent is never woken. This job wakes such a
- * dependent's assignee once per (dependent, blocker). Retire it once core
- * covers non-blocked dependents.
+ * dependent's assignee once per (dependent, blocker, blocker completion epoch):
+ * a reopened blocker loses its completedAt and gets a new one when done again,
+ * which is a distinct event. Retire it once core covers non-blocked dependents.
  */
 export const DEPENDENCY_WAKE_LIMITS = {
   graceMs: 600_000, lookbackMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000,
@@ -31,7 +32,9 @@ const STOPS = ["tick_budget", "wake_budget", "receipt_capacity", "wake_intent_wr
 export interface DependencyWakeConfig { enabled: boolean; shadow: boolean; companyId: string | null }
 export function parseDependencyWakeConfig(raw: Record<string, unknown>): DependencyWakeConfig {
   const id = raw.dependencyWakeCompanyId;
-  return { enabled: raw.dependencyWakeEnabled === true, shadow: raw.dependencyWakeShadow !== false, companyId: typeof id === "string" && UUID.test(id) ? id.toLowerCase() : null };
+  // dryRun (default true) is the global kill switch: effective shadow is dependencyWakeShadow || dryRun.
+  const shadow = raw.dependencyWakeShadow !== false || raw.dryRun !== false;
+  return { enabled: raw.dependencyWakeEnabled === true, shadow, companyId: typeof id === "string" && UUID.test(id) ? id.toLowerCase() : null };
 }
 export function validateDependencyWakeConfig(raw: Record<string, unknown>): string[] {
   return raw.dependencyWakeEnabled === true && !parseDependencyWakeConfig(raw).companyId ? ["dependencyWakeCompanyId must be a UUID when dependencyWakeEnabled is true"] : [];
@@ -41,7 +44,11 @@ type Outcome = "would_wake" | "intent" | "woken" | "not_queued" | "unconfirmed";
 interface Receipt { at: number; outcome: Outcome; blockerDoneAt: number; runId?: string | null }
 export interface DependencyWakeLedger {
   version: 1;
-  /** Keyed `${dependentId}:${blockerId}`; at most one effect per key within retention. */
+  /**
+   * Keyed `${dependentId}:${blockerId}:${blockerDoneAt}` (completedAt epoch ms): at most one effect per
+   * completion epoch. A key is never evicted while its epoch is inside the lookback, and an epoch outside
+   * the lookback is never eligible, so eviction cannot cause a repeat.
+   */
   receipts: Record<string, Receipt>;
   audits: Array<{ at: number; outcome: string; issueId?: string }>;
   /** Id of the first candidate (in id order) the next tick examines; absent = start of the list. */
@@ -58,6 +65,7 @@ type Blocker = { id: string; identifier: string | null; status: string };
 const time = (value: unknown): number => (value == null ? NaN : new Date(value as string).getTime());
 /** A receipt still dedupes while its blocker is inside the lookback; after that the blocker is never fresh again. */
 const relevant = (r: Receipt, now: number) => r.blockerDoneAt >= now - L.lookbackMs;
+const receiptKey = (dependentId: string, blockerId: string, doneAt: number) => `${dependentId}:${blockerId}:${doneAt}`;
 
 export class DependencyWakeRuntime {
   private companyId: string | null = null;
@@ -141,10 +149,16 @@ export class DependencyWakeRuntime {
     }
   }
 
-  private async liveRun(tick: Tick, issueId: string) {
+  /**
+   * The summary lists recent runs of ANY agent on the issue. `live` counts every agent (a live
+   * reviewer or other participant run on the dependent defers the wake to a later tick rather than
+   * stacking a second run on the card); `runs` keeps only `agentId`'s, for the seen-it watermark.
+   */
+  private async liveRun(tick: Tick, issueId: string, agentId?: string) {
     const summary = await tick.read(() => this.ctx.issues.summaries.getOrchestration({ issueId, companyId: tick.companyId }));
-    const runs = summary.runs.filter((run) => run.issueId === issueId);
-    return { runs, live: runs.some((run) => LIVE.has(run.status)), budgetBlocked: summary.invocationBlocks.some((b) => b.issueId === issueId) };
+    const all = summary.runs.filter((run) => run.issueId === issueId);
+    const runs = agentId ? all.filter((run) => run.agentId === agentId) : all;
+    return { runs, live: all.some((run) => LIVE.has(run.status)), budgetBlocked: summary.invocationBlocks.some((b) => b.issueId === issueId) };
   }
 
   private async consider(tick: Tick, issue: Issue, status: (typeof STATUSES)[number]): Promise<void> {
@@ -155,8 +169,6 @@ export class DependencyWakeRuntime {
     const blockers = (await tick.read(() => this.ctx.issues.relations.get(issue.id, companyId))).blockedBy as Blocker[];
     // Any open (or cancelled) blocker: core treats it as unresolved, and so do we.
     if (!blockers.length || blockers.some((b) => b.status !== "done")) return;
-    const seen = (b: Blocker) => Boolean(ledger.receipts[`${issue.id}:${b.id}`]);
-    if (blockers.every(seen)) return;
     const doneAt = new Map<string, number>();
     for (const b of blockers) {
       if (!tick.blockers.has(b.id)) tick.blockers.set(b.id, tick.read(() => this.ctx.issues.get(b.id, companyId)));
@@ -167,11 +179,14 @@ export class DependencyWakeRuntime {
     // Unknown completion time on any blocker: no evidence, no wake. Every blocker must be settled for the grace period.
     const now = this.now();
     if (doneAt.size !== blockers.length || now - Math.max(...doneAt.values()) < L.graceMs) return;
+    const key = (b: Blocker) => receiptKey(issue.id, b.id, doneAt.get(b.id)!);
+    const seen = (b: Blocker) => Boolean(ledger.receipts[key(b)]);
     const fresh = blockers.filter((b) => !seen(b) && doneAt.get(b.id)! >= now - L.lookbackMs);
     if (!fresh.length) return;
-    const dependent = await this.liveRun(tick, issue.id);
+    const dependent = await this.liveRun(tick, issue.id, issue.assigneeAgentId);
     if (dependent.live || dependent.budgetBlocked) return;
-    // Watermark on start only: a run that started before a blocker finished was built without
+    // Watermark on the assignee's runs, on start only: another agent's run (a reviewer) is not the
+    // assignee seeing the blocker; a run that started before a blocker finished was built without
     // that completion, even if it ended after it; a run that never started saw nothing at all.
     const lastRun = Math.max(-Infinity, ...dependent.runs.map((run) => time(run.startedAt)).filter(Number.isFinite));
     // Only blockers that finished after the dependent's last run started; an earlier one was seen by that run.
@@ -183,9 +198,9 @@ export class DependencyWakeRuntime {
     // Fail closed rather than evict a dedupe record: resume at this candidate once old receipts age out.
     if (Object.values(ledger.receipts).filter((r) => relevant(r, now)).length + triggers.length > L.receipts) throw new Error("receipt_capacity");
     const record = (outcome: Outcome, runId?: string | null) => {
-      for (const b of triggers) ledger.receipts[`${issue.id}:${b.id}`] = { at: this.now(), outcome, blockerDoneAt: doneAt.get(b.id)!, ...(runId !== undefined ? { runId } : {}) };
+      for (const b of triggers) ledger.receipts[key(b)] = { at: this.now(), outcome, blockerDoneAt: doneAt.get(b.id)!, ...(runId !== undefined ? { runId } : {}) };
     };
-    const forget = () => { for (const b of triggers) delete ledger.receipts[`${issue.id}:${b.id}`]; };
+    const forget = () => { for (const b of triggers) delete ledger.receipts[key(b)]; };
     if (tick.shadow) {
       record("would_wake");
       tick.audit("would_wake", issue.id);
@@ -201,7 +216,8 @@ export class DependencyWakeRuntime {
     record("intent");
     try { await this.ctx.state.set(tick.key, ledger); } catch { forget(); throw new Error("wake_intent_write_failed"); }
     report.wakes += 1;
-    const ids = triggers.map((b) => b.id).sort();
+    // Epoch-qualified, so a genuine re-completion is not collapsed into the earlier wake by the host.
+    const ids = triggers.map(key).sort();
     const reason = `dependency_blockers_done: ${triggers.map((b) => b.identifier ?? b.id).join(", ")} done; ${status} dependent not run since`;
     try {
       const result = await this.ctx.issues.requestWakeup(issue.id, companyId, {

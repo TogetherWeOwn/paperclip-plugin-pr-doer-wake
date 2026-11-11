@@ -6,7 +6,7 @@ import manifest from "../src/manifest.js";
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000002";
 const OTHER = "bbbbbbbb-0000-4000-8000-000000000002";
-const live: Record<string, unknown> = { dependencyWakeEnabled: true, dependencyWakeShadow: false, dependencyWakeCompanyId: COMPANY };
+const live: Record<string, unknown> = { dryRun: false, dependencyWakeEnabled: true, dependencyWakeShadow: false, dependencyWakeCompanyId: COMPANY };
 
 type HostCall = { method: string; params: Record<string, unknown> };
 
