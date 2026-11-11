@@ -63,8 +63,11 @@ function fixture(options: { cards?: CustodyCard[]; open?: CustodyPull[]; closed?
   const seedHead = vi.spyOn(CustodyGithub.prototype, "seedHead").mockImplementation(async () => now);
   vi.spyOn(CustodyGithub.prototype, "closureTexts").mockResolvedValue([]);
   const runtime = new CustodyRuntime(ctx as unknown as PluginContext, () => now);
+  // Production captures the company from the host's onConfigChanged delivery;
+  // bind it here the same way so the tick can read config explicitly.
+  runtime.setCustodyCompanyId(COMPANY);
   const ledger = () => [...state.entries()].find(([key]) => key.includes("pr-custody-v1"))?.[1];
-  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => new CustodyRuntime(ctx as unknown as PluginContext, () => now) };
+  return { ctx, config, cards, state, docs, created, runtime, ledger, listing, activity, seedHead, advance: (ms: number) => { now += ms; }, restart: () => { const next = new CustodyRuntime(ctx as unknown as PluginContext, () => now); next.setCustodyCompanyId(COMPANY); return next; } };
 }
 afterEach(() => { vi.restoreAllMocks(); vi.mocked(loadCustodyCards).mockReset(); });
 
@@ -239,6 +242,18 @@ describe("custody native effects", () => {
     await h.runtime.poll();
     expect(h.ctx.issues.create).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it("fails closed when the config read for the captured company names a different company", async () => {
+    const h = fixture();
+    // The stored field was edited to another company between delivery and
+    // tick: operating on config.companyId would pivot custody and its
+    // secret resolution to the wrong tenant, so the tick must do nothing.
+    h.config.custodyCompanyId = "bbbbbbbb-0000-4000-8000-000000000001";
+    await h.runtime.poll();
+    expect(h.ledger()).toBeUndefined();
+    expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
   it("does not dispatch after company configuration is revoked mid-scan", async () => {
     const h = fixture();
