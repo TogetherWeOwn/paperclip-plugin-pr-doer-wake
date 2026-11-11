@@ -649,7 +649,8 @@ export class CiWakeRuntime {
           const suites = relevantSuites(snapshot);
           const starts = suites.map((s) => s.createdAt).filter((n): n is number => n !== null);
           const finishes = suites.map((s) => s.completedAt).filter((n): n is number => n !== null);
-          if (starts.length && finishes.length && finishes.length === suites.length) {
+          // A missing start may be the earliest one; a partial span would understate CI duration.
+          if (suites.length && starts.length === suites.length && finishes.length === suites.length) {
             const duration = Math.max(...finishes) - Math.min(...starts);
             if (duration >= 60_000 && duration <= 86_400_000) {
               ledger.samples[`${wait.companyId}:${wait.repo}`] = [...samples, { sha: wait.headSha, ms: duration }].slice(-31);

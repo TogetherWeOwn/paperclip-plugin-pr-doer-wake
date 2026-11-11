@@ -1055,6 +1055,36 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().samples[`${COMPANY}:${REPO}`]).toBeUndefined();
   });
 
+  it("does not sample when a relevant suite has no start timestamp", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    // The unknown start may be the earliest; the remaining span would understate CI duration.
+    github.snapshot.mockResolvedValue({
+      suites: [
+        { id: 1, appId: 1, status: "completed", latestCheckRunsCount: 1, createdAt: null, completedAt: START },
+        { id: 2, appId: 2, status: "completed", latestCheckRunsCount: 1, createdAt: START - 300_000, completedAt: START },
+      ],
+    });
+    await h.runtime.poll();
+    expect(h.ledger().samples[`${COMPANY}:${REPO}`]).toBeUndefined();
+    expect(h.ledger().waits[0]?.status).toBe("woken");
+  });
+
+  it("samples the full span when every relevant suite has a start and finish", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    github.snapshot.mockResolvedValue({
+      suites: [
+        { id: 1, appId: 1, status: "completed", latestCheckRunsCount: 1, createdAt: START - 600_000, completedAt: START },
+        { id: 2, appId: 2, status: "completed", latestCheckRunsCount: 1, createdAt: START - 300_000, completedAt: START },
+      ],
+    });
+    await h.runtime.poll();
+    expect(h.ledger().samples[`${COMPANY}:${REPO}`]).toEqual([{ sha: HEAD, ms: 600_000 }]);
+  });
+
   it("uses a rolling measured repository median, bounds samples, and samples a SHA only once", async () => {
     const h = setup({ repoMedianMs: { [REPO]: 300_000 } });
     await h.runtime.register(registration, run);
