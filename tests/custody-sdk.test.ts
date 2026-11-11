@@ -1,8 +1,7 @@
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { startWorkerRpcHost } from "@paperclipai/plugin-sdk";
-import { describe, expect, it } from "vitest";
-import plugin from "../src/ci-plugin.js";
+import { describe, expect, it, vi } from "vitest";
 import manifest from "../src/manifest.js";
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -31,6 +30,10 @@ type HostCall = { method: string; params: Record<string, unknown> };
  * job invocations. No SDK mock, no host/core, and no network are involved.
  */
 async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig) {
+  // One worker process per plugin: reset the module so each test gets a
+  // fresh worker with no captured company carried over from the last test.
+  vi.resetModules();
+  const { default: plugin } = await import("../src/ci-plugin.js");
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const lines = createInterface({ input: stdout });
