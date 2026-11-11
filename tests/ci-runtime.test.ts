@@ -512,6 +512,7 @@ describe("CI runtime registration authorization", () => {
     const result = await h.runtime.register(registration, run);
     expect(result).toMatchObject({ data: { code: "github_http" } });
     expect(result.content).toContain("HTTP 403");
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "github_http", detail: "status=403" });
     const h2 = setup();
     const shapeResult = await h2.runtime.register({ ...registration, headSha: "abc1234" }, run);
     expect(shapeResult.content).toContain("invalid_registration");

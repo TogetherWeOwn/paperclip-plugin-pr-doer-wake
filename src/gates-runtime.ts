@@ -232,8 +232,6 @@ export class GatesStatusRuntime {
   private async drainLocked(only?: { companyId: string; issueId: string }): Promise<void> {
     const ledger = await this.load();
     this.compact(ledger);
-    this.audit(ledger, "drain", "intent");
-    await this.save(ledger);
     const started = this.now();
     let requests = 0;
     const cycle = new Map<string, CiAppAuth>();
@@ -245,6 +243,11 @@ export class GatesStatusRuntime {
       .filter((entry) => entry.nextAttemptAt <= this.now() && (!only || entry.companyId === only.companyId && entry.issueId === only.issueId))
       .sort((a, b) => a.enqueuedAt - b.enqueuedAt)
       .slice(0, GATES_LIMITS.drainPerTick);
+    // A disabled sweep (gatesStatusEnabled off, queue never fills) must not
+    // write a drain/intent audit every tick: no work, no audit, no save.
+    if (due.length === 0) return;
+    this.audit(ledger, "drain", "intent");
+    await this.save(ledger);
     for (const entry of due) {
       if (requests >= GATES_LIMITS.requestsPerTick || this.now() - started >= GATES_LIMITS.tickMs) break;
       const done = await this.processEntry(ledger, entry, fetch, cycle);

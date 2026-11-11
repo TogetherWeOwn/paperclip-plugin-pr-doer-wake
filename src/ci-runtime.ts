@@ -112,6 +112,11 @@ function refusalDetail(error: unknown): { code: string; reason: string; auditDet
   if (code === "github_http") {
     const status = error instanceof CiGithubError ? error.status : undefined;
     reason = status === undefined ? "GitHub request failed." : `GitHub returned HTTP ${status}.`;
+    // The audit ledger is the durable triage record: when the agent-facing
+    // reason is masked upstream (e.g. a gateway that drops plugin content),
+    // the numeric status here still distinguishes permission (403) from
+    // missing repo access (404) from throttling (429). Numeric only.
+    if (status !== undefined) auditDetail = `status=${status}`;
   }
   if (error instanceof InvalidRegistrationError) {
     const received = error.shape.join(", ");
