@@ -123,10 +123,12 @@ export class CiGithubError extends Error {
 /**
  * Refusal diagnostics for 403/429 only: a fixed allowlist of endpoint
  * templates (never the raw URL, which can carry a repository or branch name),
- * a fixed kind (permission evidence vs throttle vs unclassified), and the
- * permissions GitHub itself reported as accepted on a 403, re-emitted only
+ * a fixed kind (permission evidence vs throttle vs unclassified), the
+ * permissions GitHub itself reported as accepted on a 403, and the
+ * rate-limit header values (remaining / retry-after), each re-emitted only
  * when it matches a strict shape. Bounded and secret-free: no bodies, no
- * headers beyond the one accepted-permissions value, no tokens.
+ * other headers, no tokens. The rate-limit values separate a refused token
+ * exchange from an installation rate limit when both answer 403.
  * This is the ci-wake twin of the custody diagnostic in PR #19 (TWO-5961):
  * the same templates and shape so registration/poll 403s name their source
  * (token_exchange vs repo_pulls/rules/protection/checks/statuses/actions)
@@ -152,16 +154,39 @@ function endpointTemplate(path: string): string {
 // GitHub's accepted-permission list, e.g. "metadata=read,issues=read". Up to
 // four entries; anything else is dropped rather than echoed.
 const NEEDS_PATTERN = /^[a-z_]+=(read|write|admin)(,[a-z_]+=(read|write|admin)){0,3}$/;
+// Rate-limit evidence distinguishes a refused token exchange (quota left,
+// no retry-after) from an installation rate limit (remaining 0 and/or
+// retry-after) when both answer 403. Only strict shapes are re-emitted.
+const REMAINING_PATTERN = /^\d{1,10}$/;
+const RETRY_SECONDS_PATTERN = /^\d{1,6}$/;
+const HTTP_DATE = /^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+function rateLimitDetail(headers: Record<string, string> | Headers): string[] {
+  const parts: string[] = [];
+  const remaining = header(headers, "x-ratelimit-remaining")?.trim();
+  if (remaining !== undefined && REMAINING_PATTERN.test(remaining)) parts.push(`rl-remaining=${remaining}`);
+  const retry = header(headers, "retry-after")?.trim();
+  if (retry !== undefined && RETRY_SECONDS_PATTERN.test(retry)) {
+    parts.push(`retry-after=${retry}`);
+  } else if (retry !== undefined && HTTP_DATE.test(retry)) {
+    const parsed = Date.parse(retry);
+    if (Number.isFinite(parsed)) parts.push(`retry-after=${Math.floor(parsed / 1000)}`);
+  }
+  return parts;
+}
 function refusalDetail(status: number, permissionDenied: boolean, path: string, headers: Record<string, string> | Headers): string {
   const kind = status === 429 ? "throttle" : permissionDenied ? "permission" : "unclassified";
   const base = `${kind} ${endpointTemplate(path)}`;
-  if (status !== 403) return base;
-  const raw = header(headers, "x-accepted-github-permissions");
-  if (raw === undefined) return base;
-  // The header may carry trailing guidance after ';'; only the list before it is ours.
-  const needs = raw.split(";")[0]!.replace(/\s+/g, "");
-  if (needs.length > 128 || !NEEDS_PATTERN.test(needs)) return base;
-  return `${base} needs=${needs}`;
+  const suffix: string[] = [];
+  if (status === 403) {
+    const raw = header(headers, "x-accepted-github-permissions");
+    if (raw !== undefined) {
+      // The header may carry trailing guidance after ';'; only the list before it is ours.
+      const needs = raw.split(";")[0]!.replace(/\s+/g, "");
+      if (needs.length <= 128 && NEEDS_PATTERN.test(needs)) suffix.push(`needs=${needs}`);
+    }
+  }
+  suffix.push(...rateLimitDetail(headers));
+  return suffix.length ? `${base} ${suffix.join(" ")}` : base;
 }
 
 const ORIGIN = "https://api.github.com";

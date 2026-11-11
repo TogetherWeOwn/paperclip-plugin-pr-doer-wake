@@ -524,11 +524,12 @@ describe("CI runtime registration authorization", () => {
   it("names the endpoint class in the github_http reason and audit when the diagnostic is present", async () => {
     const { CiGithubError } = await import("../src/ci-github.js");
     const h = setup();
-    github.pull.mockRejectedValue(new CiGithubError("http", 403, undefined, "permission token_exchange needs=metadata=read"));
+    github.pull.mockRejectedValue(new CiGithubError("http", 403, undefined, "permission token_exchange needs=metadata=read rl-remaining=0 retry-after=60"));
     const result = await h.runtime.register(registration, run);
     expect(result).toMatchObject({ data: { code: "github_http" } });
     expect(result.content).toContain("HTTP 403 (permission token_exchange");
-    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "github_http", detail: "status=403 permission token_exchange needs=metadata=read" });
+    expect(result.content).toContain("rl-remaining=0");
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "github_http", detail: "status=403 permission token_exchange needs=metadata=read rl-remaining=0 retry-after=60" });
     expect(JSON.stringify(result)).not.toContain(TOKEN);
   });
 

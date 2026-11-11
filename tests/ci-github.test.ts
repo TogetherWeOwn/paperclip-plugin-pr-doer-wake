@@ -956,6 +956,11 @@ describe("CiGithub caching, backoff, and caps", () => {
     // A malformed accepted-permissions value is dropped, never echoed into the message.
     ["permission", "Resource not accessible by integration", { "x-accepted-github-permissions": "../../etc/passwd" }, "permission repo_pulls"],
     ["permission", "Resource not accessible by integration", { "x-accepted-github-permissions": "issues=read,metadata=read; secondary rate limit applies" }, "permission repo_pulls needs=issues=read,metadata=read"],
+    ["unclassified", "You have exceeded a secondary rate limit.", { "x-ratelimit-remaining": "0", "retry-after": "60" }, "unclassified repo_pulls rl-remaining=0 retry-after=60"],
+    ["permission", "Resource not accessible by integration", { "x-ratelimit-remaining": "4999" }, "permission repo_pulls rl-remaining=4999"],
+    ["permission", "Resource not accessible by integration", { "x-accepted-github-permissions": "issues=read", "x-ratelimit-remaining": "0" }, "permission repo_pulls needs=issues=read rl-remaining=0"],
+    // Malformed rate-limit values are dropped, never echoed into the message.
+    ["permission", "Resource not accessible by integration", { "x-ratelimit-remaining": "../../etc/passwd", "retry-after": "../../etc/passwd" }, "permission repo_pulls"],
   ] as const)("names the refused endpoint template and permission kind for 403 (%s)", async (_kind, message, headers, detail) => {
     const cache = new CiGithubCache();
     const fetch = vi.fn(async () => response({ message }, 403, headers));
@@ -973,6 +978,13 @@ describe("CiGithub caching, backoff, and caps", () => {
     const fetch429 = vi.fn(async () => response({ message: "rate limited" }, 429));
     const error429 = await new CiGithub(fetch429, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
     expect((error429 as CiGithubError).message).toBe("GitHub CI http (429) throttle repo_pulls");
+    const fetch429Limit = vi.fn(async () => response({ message: "rate limited" }, 429, { "x-ratelimit-remaining": "0", "retry-after": "120" }));
+    const error429Limit = await new CiGithub(fetch429Limit, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect((error429Limit as CiGithubError).detail).toBe("throttle repo_pulls rl-remaining=0 retry-after=120");
+    // An HTTP-date retry-after is normalized to epoch seconds, never echoed raw.
+    const fetch429Date = vi.fn(async () => response({ message: "rate limited" }, 429, { "retry-after": "Wed, 21 Oct 2015 07:28:00 GMT" }));
+    const error429Date = await new CiGithub(fetch429Date, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
+    expect((error429Date as CiGithubError).detail).toBe("throttle repo_pulls retry-after=1445412480");
     const fetch500 = vi.fn(async () => response({ message: "server error" }, 500));
     const error500 = await new CiGithub(fetch500, TOKEN, { now: () => 10_000 }).pull(REPO, 1).catch((value: unknown) => value);
     expect((error500 as CiGithubError).detail).toBeUndefined();
