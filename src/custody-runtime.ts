@@ -45,6 +45,9 @@ export class CustodyRuntime {
     this.chain = task.then(() => undefined, () => undefined);
     return task;
   }
+  // Overlapping ticks coalesce onto the in-flight/queued one (a manual run
+  // during a scheduled tick shares it); only tick-vs-event order serializes.
+  private pendingTick: Promise<void> | null = null;
   private caches = new Map<string, CiGithubCache>();
   // Scheduled jobs run with no invocation company scope, so the company-less
   // ctx.config.get() the host gate rejects is unusable here. The host delivers
@@ -58,7 +61,13 @@ export class CustodyRuntime {
   }
 
   async poll(): Promise<void> {
-    return this.enqueue(() => this.tick());
+    if (!this.pendingTick) {
+      const task = this.enqueue(() => this.tick());
+      this.pendingTick = task;
+      const clear = () => { if (this.pendingTick === task) this.pendingTick = null; };
+      void task.then(clear, clear);
+    }
+    return this.pendingTick;
   }
 
   /**

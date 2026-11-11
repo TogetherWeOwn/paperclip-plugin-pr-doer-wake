@@ -881,10 +881,11 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().report.failure).toBe("archive reply failed");
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
-  it("coalesces overlapping scheduled callbacks", async () => {
+  it("coalesces overlapping scheduled callbacks into one tick", async () => {
     const h = fixture();
     await Promise.all([h.runtime.poll(), h.runtime.poll()]);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(loadCustodyCards).toHaveBeenCalledTimes(1);
   });
 
   it("seeds first-observed heads so already-idle PRs trigger without a fresh seven-day warmup", async () => {
