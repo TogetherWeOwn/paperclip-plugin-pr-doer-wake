@@ -4,7 +4,7 @@ import { CiAppAuth, APP_PERMISSIONS } from "../src/ci-auth.js";
 import { PassThrough } from "node:stream";
 import { definePlugin, startWorkerRpcHost, type PluginContext } from "@paperclipai/plugin-sdk";
 import { describe, expect, it } from "vitest";
-import { CiGithub, CiGithubCache } from "../src/ci-github.js";
+import { CiGithub, CiGithubCache, GITHUB_USER_AGENT } from "../src/ci-github.js";
 import manifest from "../src/manifest.js";
 
 const REPO = "acme/widget";
@@ -79,6 +79,8 @@ describe("installed SDK HTTP RPC compatibility", () => {
     const key = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     const auth = new CiAppAuth({ appId: "123", installationId: "456", repo: REPO, resolvePrivateKey: async () => key });
     const h = await sdkHttp((call, index) => {
+      // GitHub 403s UA-less requests: the exchange and every read carry the User-Agent through the real SDK serialization.
+      expect(call.init?.headers?.["User-Agent"]).toBe(GITHUB_USER_AGENT);
       if (index === 1) {
         expect(call.url).toBe("https://api.github.com/app/installations/456/access_tokens");
         expect(call.init?.method).toBe("POST");
