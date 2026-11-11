@@ -1,6 +1,6 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
-import { DependencyWakeRuntime, validateDependencyWakeConfig, type DependencyWakeLedger } from "../src/dependency-wake.js";
+import { DEPENDENCY_WAKE_LIMITS, DependencyWakeRuntime, validateDependencyWakeConfig, type DependencyWakeLedger } from "../src/dependency-wake.js";
 import { validateCiConfig } from "../src/ci-config.js";
 import manifest from "../src/manifest.js";
 import { validateInstanceConfig } from "./fixtures/host-config-validator.js";
@@ -111,22 +111,54 @@ describe("dependency wake", () => {
     expect(h.ledger()?.receipts ?? {}).toEqual({});
   });
 
-  it("retries a host-deferred wake next tick but never repeats an unconfirmed or not-queued one", async () => {
-    const deferred = harness();
-    deferred.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("worker RPC host is not running"));
-    await deferred.runtime.poll();
-    expect(deferred.ledger()?.receipts).toEqual({});
-    await deferred.runtime.poll();
-    expect(deferred.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
-    expect(deferred.ledger()?.receipts[`${DEP}:${BLK}`]?.outcome).toBe("woken");
-    for (const [outcome, impl] of [["unconfirmed", async () => { throw new Error("boom"); }], ["not_queued", async () => ({ queued: false, runId: null })]] as const) {
-      const h = harness();
-      h.ctx.issues.requestWakeup.mockImplementationOnce(impl);
-      await h.runtime.poll();
-      await h.runtime.poll();
-      expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
-      expect(h.ledger()?.receipts[`${DEP}:${BLK}`]?.outcome).toBe(outcome);
+  it("retries a host-deferred wake next tick but never repeats an unconfirmed one", async () => {
+    for (const impl of [
+      async () => { throw new Error("worker RPC host is not running"); },
+      async () => ({ queued: false, runId: null }),
+    ] as const) {
+      const deferred = harness();
+      deferred.ctx.issues.requestWakeup.mockImplementationOnce(impl);
+      await deferred.runtime.poll();
+      expect(deferred.ledger()?.receipts).toEqual({});
+      expect(deferred.ledger()?.audits.map((a) => a.outcome)).toEqual(["host_deferred"]);
+      await deferred.runtime.poll();
+      expect(deferred.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+      expect(deferred.ledger()?.receipts[`${DEP}:${BLK}`]?.outcome).toBe("woken");
     }
+    const h = harness();
+    h.ctx.issues.requestWakeup.mockImplementationOnce(async () => { throw new Error("boom"); });
+    await h.runtime.poll();
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger()?.receipts[`${DEP}:${BLK}`]?.outcome).toBe("unconfirmed");
+  });
+
+  it("wakes again for a blocker that reopens and completes a second time", async () => {
+    const h = harness();
+    await h.runtime.poll();
+    h.runs[DEP]!.push({ id: "r2", issueId: DEP, status: "succeeded", createdAt: iso(START - 13 * MIN), startedAt: iso(START - 13 * MIN), finishedAt: iso(START - 13 * MIN) });
+    h.issues[BLK]!.completedAt = iso(START - 11 * MIN);
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(h.ledger()?.receipts[`${DEP}:${BLK}`]).toMatchObject({ outcome: "woken", blockerDoneAt: START - 11 * MIN });
+  });
+
+  it("rotates candidates across statuses when the read budget aborts a tick", async () => {
+    const h = harness();
+    const L = DEPENDENCY_WAKE_LIMITS as { -readonly [K in keyof typeof DEPENDENCY_WAKE_LIMITS]: number };
+    const DEP2 = "77777777-7777-4777-8777-777777777777";
+    h.issues[DEP2] = { id: DEP2, companyId: COMPANY, status: "in_progress", assigneeAgentId: AGENT, activeRun: null };
+    h.relations[DEP2] = [{ id: BLK, identifier: "TWO-1", status: "done" }];
+    h.runs[DEP2] = [];
+    try {
+      L.hostReads = 9;
+      await h.runtime.poll();
+      expect(h.ledger()?.lastTick?.complete).toBe(false);
+      await h.runtime.poll();
+    } finally {
+      L.hostReads = DEPENDENCY_WAKE_LIMITS.hostReads;
+    }
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
   });
 
   it("aborts before the effect when a rollback lands mid-tick", async () => {

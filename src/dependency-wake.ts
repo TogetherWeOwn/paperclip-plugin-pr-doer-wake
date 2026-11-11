@@ -28,12 +28,14 @@ export function validateDependencyWakeConfig(raw: Record<string, unknown>): stri
   return raw.dependencyWakeEnabled === true && !parseDependencyWakeConfig(raw).companyId ? ["dependencyWakeCompanyId must be a UUID when dependencyWakeEnabled is true"] : [];
 }
 
-type Outcome = "would_wake" | "intent" | "woken" | "not_queued" | "unconfirmed";
+type Outcome = "would_wake" | "intent" | "woken" | "unconfirmed";
 interface Receipt { at: number; outcome: Outcome; blockerDoneAt: number; runId?: string | null }
 export interface DependencyWakeLedger {
   version: 1;
   /** Keyed `${dependentId}:${blockerId}`; at most one effect per key within retention. */
   receipts: Record<string, Receipt>;
+  /** Last considered candidate id (merged, id-sorted list); resumes rotation next tick. */
+  cursor?: string;
   audits: Array<{ at: number; outcome: string; issueId?: string }>;
   lastTick?: { at: number; complete: boolean; examined: number; eligible: number; wakes: number };
 }
@@ -87,19 +89,25 @@ export class DependencyWakeRuntime {
       },
     };
     try {
-      let capped = false;
-      for (const status of STATUSES) {
-        // One bounded page per status: the installed host applies `offset` twice
-        // (SQL, then the plugin window), so any offset > 0 reads an empty page.
-        const page = await tick.read(() => this.ctx.issues.list({ companyId, status, limit: L.maxPerStatus }));
-        if (page.length >= L.maxPerStatus) { capped = true; tick.audit("candidate_cap"); }
-        for (const issue of page) {
-          try { await this.consider(tick, issue, status); } catch (error) {
-            if (error instanceof Error && ["tick_budget", "wake_intent_write_failed", "configuration_changed"].includes(error.message)) throw error;
-            tick.audit("candidate_error", issue.id);
-          }
+      // One bounded page per status: the installed host applies `offset` twice
+      // (SQL, then the plugin window), so any offset > 0 reads an empty page.
+      const pages = await Promise.all(STATUSES.map((status) => tick.read(() => this.ctx.issues.list({ companyId, status, limit: L.maxPerStatus }))));
+      // Merge both statuses into one id-sorted candidate list: a per-status
+      // serial order lets one status's page consume the tick budget forever.
+      // The persisted cursor resumes mid-list so a budgeted tick never
+      // restarts at the same head and starves the tail.
+      const candidates = pages.flat().sort((a, b) => (a.id < b.id ? -1 : 1));
+      const capped = pages.some((page) => page.length >= L.maxPerStatus);
+      if (capped) tick.audit("candidate_cap");
+      for (const issue of candidates) {
+        if (ledger.cursor && issue.id <= ledger.cursor) continue;
+        try { await this.consider(tick, issue); } catch (error) {
+          if (error instanceof Error && ["tick_budget", "wake_intent_write_failed", "configuration_changed"].includes(error.message)) throw error;
+          tick.audit("candidate_error", issue.id);
         }
+        ledger.cursor = issue.id;
       }
+      ledger.cursor = undefined;
       tick.report.complete = !capped;
     } catch (error) {
       tick.audit(error instanceof Error && ["tick_budget", "configuration_changed"].includes(error.message) ? error.message : "tick_error");
@@ -117,16 +125,15 @@ export class DependencyWakeRuntime {
     return { runs, live: runs.some((run) => LIVE.has(run.status)), budgetBlocked: summary.invocationBlocks.some((b) => b.issueId === issueId) };
   }
 
-  private async consider(tick: Tick, issue: Issue, status: (typeof STATUSES)[number]): Promise<void> {
+  private async consider(tick: Tick, issue: Issue): Promise<void> {
     const { companyId, ledger, report } = tick;
+    const status = issue.status;
     const extra = issue as unknown as { activeRun?: unknown; conversationAgentId?: unknown };
-    if (issue.status !== status || !issue.assigneeAgentId || extra.activeRun || extra.conversationAgentId) return;
+    if (!issue.assigneeAgentId || extra.activeRun || extra.conversationAgentId) return;
     report.examined += 1;
     const blockers = (await tick.read(() => this.ctx.issues.relations.get(issue.id, companyId))).blockedBy as Blocker[];
     // Any open (or cancelled) blocker: core treats it as unresolved, and so do we.
     if (!blockers.length || blockers.some((b) => b.status !== "done")) return;
-    const seen = (b: Blocker) => Boolean(ledger.receipts[`${issue.id}:${b.id}`]);
-    if (blockers.every(seen)) return;
     const doneAt = new Map<string, number>();
     for (const b of blockers) {
       if (!tick.blockers.has(b.id)) tick.blockers.set(b.id, tick.read(() => this.ctx.issues.get(b.id, companyId)));
@@ -134,6 +141,13 @@ export class DependencyWakeRuntime {
       const at = time(full?.completedAt);
       if (full?.status === "done" && Number.isFinite(at)) doneAt.set(b.id, at);
     }
+    // A receipt older than the blocker's current completion is a different
+    // completion epoch: a reopened-then-redone blocker must not be suppressed.
+    const seen = (b: Blocker) => {
+      const r = ledger.receipts[`${issue.id}:${b.id}`];
+      return r !== undefined && r.blockerDoneAt >= (doneAt.get(b.id) ?? Infinity);
+    };
+    if (blockers.every(seen)) return;
     // Unknown completion time on any blocker: no evidence, no wake. Every blocker must be settled for the grace period.
     const now = this.now();
     if (doneAt.size !== blockers.length || now - Math.max(...doneAt.values()) < L.graceMs) return;
@@ -173,8 +187,11 @@ export class DependencyWakeRuntime {
         reason, contextSource: "plugin.dependency-wake",
         idempotencyKey: `dependency-wake:${issue.id}:${createHash("sha256").update(ids.join(",")).digest("hex").slice(0, 32)}`,
       });
-      record(result.queued ? "woken" : "not_queued", result.runId);
-      tick.audit(result.queued ? "woken" : "not_queued", issue.id);
+      // queued:false means the host refused before queuing (like custody's
+      // "pending" receipt): release intent so a later tick retries; only a
+      // queued effect or an ambiguous failure stays recorded.
+      if (result.queued) { record("woken", result.runId); tick.audit("woken", issue.id); }
+      else { forget(); tick.audit("host_deferred", issue.id); }
     } catch (error) {
       if (retryableBeforeQueue(error)) { forget(); tick.audit("host_deferred", issue.id); } else {
         record("unconfirmed");
