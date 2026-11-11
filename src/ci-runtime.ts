@@ -11,7 +11,7 @@ function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
 }
 
-export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 600_000, secretResolveMs: 15_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
+export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 600_000, secretResolveMs: 15_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
 export interface CiWakeRuntimeOptions {
   /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
   secretResolveTimeoutMs?: number;
@@ -51,7 +51,10 @@ interface Audit { at: number; operation: string; runId?: string; companyId?: str
  * Persisted so an unsettled head observed in one tick is rechecked (and
  * woken) on a later tick even after every wait for the old head retired.
  * `oldSha` is the head the reviewer last saw; `newSha` is the head now
- * awaiting settlement. `shadowLogged` suppresses repeat shadow logs.
+ * awaiting settlement. `shadowLogged` records the candidate cards already
+ * shadow-logged for this entry, so a candidate that becomes eligible later
+ * is still logged once. A legacy `true` (pre-per-candidate ledger) is
+ * migrated to `["*"]` — no candidate is re-logged for that old entry.
  */
 export interface PrHeadPending {
   companyId: string;
@@ -60,7 +63,7 @@ export interface PrHeadPending {
   oldSha: string;
   newSha: string;
   observedAt: number;
-  shadowLogged?: boolean;
+  shadowLogged?: string[];
 }
 interface Ledger {
   version: 1;
@@ -275,10 +278,23 @@ export class CiWakeRuntime {
     for (const [id, at] of Object.entries(ledger.deliveries)) if (now - at >= LIMITS.replayMs) delete ledger.deliveries[id];
     for (const [id, at] of Object.entries(ledger.hints)) if (now - at >= 60_000) delete ledger.hints[id];
     for (const [key, entry] of Object.entries(ledger.prHeadPending)) {
+      // Migrate the pre-per-candidate boolean flag (see PrHeadPending).
+      if (entry && (entry as { shadowLogged?: unknown }).shadowLogged === true) entry.shadowLogged = ["*"];
+      else if (entry && (entry as { shadowLogged?: unknown }).shadowLogged !== undefined && !Array.isArray((entry as { shadowLogged?: unknown }).shadowLogged)) entry.shadowLogged = [];
       if (!entry || typeof entry.companyId !== "string" || typeof entry.repo !== "string" || !Number.isSafeInteger(entry.prNumber) || !SHA.test(entry.newSha) || !SHA.test(entry.oldSha)) delete ledger.prHeadPending[key];
       else if (now - entry.observedAt >= LIMITS.waitMs) delete ledger.prHeadPending[key];
     }
     for (const [key, at] of Object.entries(ledger.reviewerWakes)) if (now - at >= LIMITS.retentionMs) delete ledger.reviewerWakes[key];
+    // Explicit count caps (mirroring deliveries), evicting oldest first so a
+    // busy company cannot grow these maps without bound between TTL expiries.
+    if (Object.keys(ledger.prHeadPending).length > LIMITS.prHeadPending) {
+      const oldest = Object.entries(ledger.prHeadPending).sort((a, b) => a[1].observedAt - b[1].observedAt).slice(0, Object.keys(ledger.prHeadPending).length - LIMITS.prHeadPending);
+      for (const [key] of oldest) delete ledger.prHeadPending[key];
+    }
+    if (Object.keys(ledger.reviewerWakes).length > LIMITS.reviewerWakes) {
+      const oldest = Object.entries(ledger.reviewerWakes).sort((a, b) => a[1] - b[1]).slice(0, Object.keys(ledger.reviewerWakes).length - LIMITS.reviewerWakes);
+      for (const [key] of oldest) delete ledger.reviewerWakes[key];
+    }
   }
 
   private async config(companyId: string, requireEnabled = true): Promise<CiConfig> {
@@ -487,7 +503,11 @@ export class CiWakeRuntime {
     }
     const returnAgent = issue?.executionState?.returnAssignee?.agentId;
     if (typeof returnAgent === "string" && UUID.test(returnAgent)) authors.add(returnAgent.toLowerCase());
-    if (typeof issue?.assigneeAgentId === "string" && UUID.test(issue.assigneeAgentId)) authors.add(issue.assigneeAgentId.toLowerCase());
+    // Deliberately NOT the card's assigneeAgentId: on a real in_review card
+    // Paperclip reassigns the card to the pending participant, so the
+    // assignee IS the participant in essentially every production shape.
+    // Treating it as authorship excluded every reviewer and the feature
+    // never fired. See the production-shape regression test.
     return authors.has(agent);
   }
 
@@ -658,7 +678,7 @@ export class CiWakeRuntime {
           if (current.headSha !== entry.newSha) {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
-            entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = false;
+            entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
             await this.save(ledger); continue;
           }
           const snapshot = await github.snapshot(entry.repo, entry.newSha, current.baseBranch);
@@ -669,7 +689,11 @@ export class CiWakeRuntime {
           // Unsettled heads do not wake yet; the entry stays for a later tick.
           if (verdict.kind === "pending") continue;
           const revalidated = await this.config(entry.companyId);
-          if (!revalidated.prHeadWakeEnabled || !revalidated.allowedRepos.includes(entry.repo) || revalidated.prHeadWakeShadow !== config.prHeadWakeShadow || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
+          if (!revalidated.prHeadWakeEnabled || !revalidated.allowedRepos.includes(entry.repo) || revalidated.prHeadWakeShadow !== config.prHeadWakeShadow || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
+          // dryRun is the global rollback kill-switch: it forces no-fire
+          // (effective shadow) exactly like prHeadWakeShadow, so an operator
+          // rollback via dryRun: true silences this path too.
+          const shadow = config.prHeadWakeShadow || config.dryRun;
           const candidates = [...new Set(ledger.waits.filter((w) => w.companyId === entry.companyId && w.repo === entry.repo && w.prNumber === entry.prNumber).map((w) => w.issueId))];
           let outstanding = false;
           for (const issueId of candidates) {
@@ -685,9 +709,10 @@ export class CiWakeRuntime {
             if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
-            if (config.prHeadWakeShadow) {
-              if (!entry.shadowLogged) {
-                entry.shadowLogged = true;
+            if (shadow) {
+              entry.shadowLogged ??= [];
+              if (!entry.shadowLogged.includes(issueId) && !entry.shadowLogged.includes("*")) {
+                entry.shadowLogged.push(issueId);
                 this.audit(ledger, "pr_head_wake", "would_wake");
                 await this.save(ledger);
                 this.ctx.logger.info("pr-head-wake: would wake", { companyId: entry.companyId, issueId, repo: entry.repo, prNumber: entry.prNumber, oldSha: entry.oldSha, newSha: entry.newSha });
@@ -729,7 +754,7 @@ export class CiWakeRuntime {
             await this.save(ledger);
           }
           // Clear only when every candidate is woken/deduped/ineligible/excluded.
-          if (!outstanding && !config.prHeadWakeShadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
+          if (!outstanding && !shadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
         } catch (error) {
           this.audit(ledger, "pr_head_wake", "retryable");
           await this.save(ledger);

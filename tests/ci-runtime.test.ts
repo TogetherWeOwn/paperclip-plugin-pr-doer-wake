@@ -59,7 +59,7 @@ type Ledger = {
   deliveries: Record<string, number>;
   hints: Record<string, number>;
   samples: Record<string, Array<{ sha: string; ms: number }>>;
-  prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: boolean }>;
+  prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: string[] }>;
   reviewerWakes?: Record<string, number>;
 };
 const clone = <T>(value: T): T => structuredClone(value);
@@ -697,12 +697,39 @@ describe("CI runtime polling and durable wake outcomes", () => {
 
     it("excludes the pending participant when it is the pusher/author agent", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
-      inReviewIssue(h, AGENT); // AGENT registered the wait and is the assignee.
+      inReviewIssue(h, AGENT); // AGENT registered the wait.
       await movedHead(h);
       github.readiness.mockReturnValue(verdict("pass"));
       await h.runtime.poll();
       expect(h.requestWakeup).not.toHaveBeenCalled();
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("wakes a reviewer whose card assignee IS the participant (production shape)", async () => {
+      // On a real in_review card Paperclip reassigns the card to the pending
+      // participant, so assignee == participant. Excluding on assignee would
+      // silently exclude every reviewer (the pre-fix dead-on-arrival bug).
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      h.issue.assigneeAgentId = OTHER;
+      await movedHead(h); // AGENT registered the wait; OTHER is not an author agent.
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("treats dryRun as forcing no-fire even when prHeadWakeShadow is false", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, dryRun: true });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1);
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1); // retained for a later live tick
+      await h.runtime.poll();
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1); // no repeat shadow log
     });
 
     it("does not wake while the new head is still settling", async () => {
