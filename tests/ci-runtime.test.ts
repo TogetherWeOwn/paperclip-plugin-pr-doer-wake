@@ -387,9 +387,18 @@ describe("CI runtime registration authorization", () => {
     expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
+  it("records branchVerified binding proof when the workspace branch equals the PR head branch", async () => {
+    const h = setup();
+    const result = await h.runtime.register(registration, run);
+    expect(result).not.toHaveProperty("error");
+    expect(h.ledger().waits).toHaveLength(1);
+    expect(h.ledger().waits[0]).toMatchObject({ branchVerified: true });
+  });
+
   it("registers when the workspace branch differs from the PR head branch", async () => {
     // Real agents push HEAD:<pr-branch> from work/<uuid> checkouts; binding
-    // is PR number + exact head SHA, never branch-name equality.
+    // is PR number + exact head SHA, never branch-name equality. Such
+    // repo-only registrations are recorded unverified for custody.
     const h = setup();
     h.workspace.branchName = "work/11111111-2222-3333-4444-555555555555";
     github.pull.mockResolvedValue(pull({ headBranch: "fix/actual-pr-branch" }));
@@ -397,6 +406,7 @@ describe("CI runtime registration authorization", () => {
     expect(result).not.toHaveProperty("error");
     expect(result).toMatchObject({ content: "CI wait registered", data: { status: "open" } });
     expect(h.ledger().waits).toHaveLength(1);
+    expect(h.ledger().waits[0]).toMatchObject({ branchVerified: false });
   });
 
   it("rechecks checkout ownership and workspace after the GitHub read", async () => {
@@ -412,6 +422,8 @@ describe("CI runtime registration authorization", () => {
     github.pull.mockImplementationOnce(async () => { h.workspace.branchName = "feature/moved"; return pull(); });
     expect(await h.runtime.register(registration, run)).toMatchObject({ content: "CI wait registered", data: { status: "open" } });
     expect(h.ledger().waits).toHaveLength(1);
+    // The branch moved mid-read so the proof cannot hold: fail closed.
+    expect(h.ledger().waits[0]).toMatchObject({ branchVerified: false });
   });
 
   it.each([
@@ -474,6 +486,15 @@ describe("CI runtime registration authorization", () => {
     expect(result).toMatchObject({ error: "CI registration refused: registration_refused", data: { code: "registration_refused" } });
     expect(JSON.stringify(result)).not.toContain(TOKEN);
     expect(JSON.stringify(result)).not.toContain("unexpected host detail");
+  });
+
+  it("returns invalid_ledger without saving over a malformed persisted ledger", async () => {
+    const h = setup();
+    h.seed({ version: 1, waits: [], audits: [] } as unknown as Ledger);
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ error: "CI registration refused: invalid_ledger", data: { code: "invalid_ledger" } });
+    expect(h.set).not.toHaveBeenCalled();
+    expect(h.assertCheckoutOwner).not.toHaveBeenCalled();
   });
 });
 

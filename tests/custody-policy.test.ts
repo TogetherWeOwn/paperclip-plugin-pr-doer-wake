@@ -23,13 +23,28 @@ const directive = (action: string, revisit: string, at: number) => ({ body: `PR 
 describe("custody ownership is conservative and ordered", () => {
   it("uses registration before branch/text, deduplicating repeated waits", () => {
     const other = card({ id: PROJECT });
-    const registration = { companyId: COMPANY, issueId: other.id, repo: "example/project", prNumber: 42 };
+    const registration = { companyId: COMPANY, issueId: other.id, repo: "example/project", prNumber: 42, branchVerified: true };
     expect(map(pull(), [card(), other], [registration, registration])).toMatchObject({ source: "registration", card: other });
   });
   it("does not infer a primary owner from two registrations", () => {
     const other = card({ id: PROJECT });
-    const registrations = [card(), other].map((c) => ({ companyId: COMPANY, issueId: c.id, repo: "example/project", prNumber: 42 }));
+    const registrations = [card(), other].map((c) => ({ companyId: COMPANY, issueId: c.id, repo: "example/project", prNumber: 42, branchVerified: true }));
     expect(map(pull(), [card(), other], registrations)).toMatchObject({ card: null, source: "registration", candidates: [ISSUE, PROJECT].sort() });
+  });
+  it("skips an unverified repo-only registration and maps the true workspace owner", () => {
+    const attacker = card({ id: PROJECT });
+    const unverified = { companyId: COMPANY, issueId: attacker.id, repo: "example/project", prNumber: 42, branchVerified: false };
+    expect(map(pull(), [card(), attacker], [unverified])).toMatchObject({ source: "workspace", card: card() });
+  });
+  it("skips a legacy registration without binding proof and does not suppress the true owner", () => {
+    const attacker = card({ id: PROJECT });
+    const legacy = { companyId: COMPANY, issueId: attacker.id, repo: "example/project", prNumber: 42 };
+    expect(map(pull(), [card(), attacker], [legacy])).toMatchObject({ source: "workspace", card: card() });
+  });
+  it("leaves a PR unmapped when only an unverified registration claims it", () => {
+    const attacker = card({ id: PROJECT });
+    const unverified = { companyId: COMPANY, issueId: attacker.id, repo: "example/project", prNumber: 42, branchVerified: false };
+    expect(map(pull({ headBranch: "feat/change" }), [attacker], [unverified])).toMatchObject({ card: null, source: "unmapped", candidates: [] });
   });
   it("requires company, project/repo and same-repo branch identity", () => {
     expect(map(pull(), [card()]).source).toBe("workspace");

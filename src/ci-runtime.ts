@@ -22,6 +22,12 @@ export interface Wait extends Registration {
   projectId: string;
   workspaceId: string;
   branch: string;
+  /**
+   * Binding proof for custody: true only when the workspace branch observed
+   * before and after the GitHub read equals the live PR head branch. Repo-only
+   * registrations (false) must not be trusted by custody; see custody-policy.
+   */
+  branchVerified: boolean;
   runId: string;
   aliases: string[];
   registeredAt: number;
@@ -245,10 +251,16 @@ export class CiWakeRuntime {
 
   async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
     return this.serialized(async () => {
-      const ledger = await this.load();
-      this.compact(ledger);
+      // The ledger load lives inside the refusal boundary: a malformed
+      // persisted ledger (invalid_ledger) or a host state-read failure must
+      // return { code } instead of escaping as a rejection that could leak
+      // raw host detail. When the ledger could not be read, return without
+      // saving: the unreadable ledger cannot be audited in place.
+      let ledger: Ledger | undefined;
       let waitId: string | undefined;
       try {
+        ledger = await this.load();
+        this.compact(ledger);
         const registration = parseRegistration(params);
         if (![run.companyId, run.agentId, run.runId, run.projectId].every((s) => UUID.test(s))) throw new Error("invalid_run_context");
         const config = await this.config(run.companyId);
@@ -286,9 +298,13 @@ export class CiWakeRuntime {
         await this.checkoutOwner(registration.issueId, run);
         const current = await this.binding(registration, run.companyId, run.projectId);
         if (current.workspaceId !== binding.workspaceId) throw new Error("binding_changed");
+        // Custody binding proof, not a ci-wake gate: ci-wake still registers
+        // repo-only registrations, but only a verified workspace-to-PR branch
+        // link is recorded for custody to trust. Both observations must match.
+        const branchVerified = binding.branch === pr.headBranch && current.branch === pr.headBranch;
         const now = this.now();
         for (const old of ledger.waits) if (old.companyId === run.companyId && old.repo === registration.repo && old.prNumber === registration.prNumber && old.issueId === registration.issueId && old.status === "open") { old.status = "retired"; old.finishedAt = now; old.reason = "superseded"; }
-        ledger.waits.push({ ...registration, ...binding, waitId, companyId: run.companyId, runId: run.runId, aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
+        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
         return { content: "CI wait registered", data: { waitId, status: "open", expiresAt: now + LIMITS.waitMs, dryRun: config.dryRun } };
@@ -297,6 +313,7 @@ export class CiWakeRuntime {
         // agent output. Only the enumerated code crosses the boundary;
         // the audit row records the same code for operator triage.
         const code = refusalCode(error);
+        if (ledger === undefined) return { error: `CI registration refused: ${code}`, data: { code } };
         this.audit(ledger, "register", code, run, waitId);
         await this.save(ledger);
         return { error: `CI registration refused: ${code}`, data: { code } };
