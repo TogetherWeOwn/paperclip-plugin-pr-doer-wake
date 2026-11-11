@@ -370,6 +370,15 @@ export class CustodyRuntime {
               continue;
             }
             if (mapping.card.oversizeDocuments?.length) {
+              if (pr.state === "open") {
+                const ref = prReference(pr);
+                const head = ledger.heads[ref];
+                if (!head || head.sha !== pr.headSha) {
+                  if (!head && Object.keys(ledger.heads).length >= CUSTODY_LIMITS.prs) throw new Error("head_capacity");
+                  // Preserve observed head transitions while disposition evidence is incomplete.
+                  ledger.heads[ref] = { sha: pr.headSha, at: this.now(), provenance: "warmup" };
+                }
+              }
               if (pr.state === "closed") complete = false;
               row.unknown = true;
               for (const documentId of mapping.card.oversizeDocuments) unknown(`oversize_document:${documentId}`);

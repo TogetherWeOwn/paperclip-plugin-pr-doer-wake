@@ -118,6 +118,25 @@ describe("custody native effects", () => {
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
   });
+  it("preserves head warmup when oversized evidence hides a force-push revert", async () => {
+    const open = [pull()];
+    const h = fixture({ open });
+    h.activity.mockImplementation(async (_pr, at) => at);
+    h.seedHead.mockResolvedValue(NOW - 8 * DAY);
+    await h.runtime.poll();
+    h.ctx.issues.requestWakeup.mockClear();
+    h.cards[0].oversizeDocuments = [CHILD];
+    open[0] = pull({ headSha: "b".repeat(40) });
+    h.advance(DAY);
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    h.cards[0].oversizeDocuments = [];
+    open[0] = pull();
+    h.advance(DAY);
+    await h.runtime.poll();
+    expect(h.ledger().heads["example/project#42"]).toMatchObject({ sha: "a".repeat(40), at: NOW + 2 * DAY, provenance: "warmup" });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
   it("keeps dry run entirely free of card/document/wake effects and live keys separate", async () => {
     const h = fixture({ dryRun: true });
     await h.runtime.poll();
