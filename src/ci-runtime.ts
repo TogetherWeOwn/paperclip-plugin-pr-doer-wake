@@ -103,9 +103,13 @@ function refusalCode(error: unknown): string {
 
 /**
  * Safe, closed reason per refusal code. Reasons are fixed strings (plus the
- * numeric HTTP status on github_http and the shape-only field summary on
- * invalid_registration): no upstream bodies, host detail, or argument
- * values ever cross into agent output.
+ * numeric HTTP status on github_http, the 403/429 endpoint-class diagnostic,
+ * and the shape-only field summary on invalid_registration): no upstream
+ * bodies, host detail, or argument values ever cross into agent output.
+ * The one exception is the token_exchange 403 diagnostic, whose bounded
+ * GitHub-refusal-message token (one word-class plus a sanitized, truncated
+ * underscore-joined message; credential shapes refused) crosses into both
+ * the reason and the audit detail — the only body-derived text allowed out.
  */
 const REFUSAL_REASONS: Record<string, string> = {
   invalid_registration: "Send exactly issueId (Paperclip issue UUID, not the TWO-#### identifier), repo (owner/repo), prNumber (integer), and headSha (full 40-character commit SHA, e.g. from `git rev-parse HEAD`).",
@@ -148,7 +152,8 @@ function refusalDetail(error: unknown): { code: string; reason: string; auditDet
     // the numeric status here still distinguishes permission (403) from
     // missing repo access (404) from throttling (429). When the 403/429
     // diagnostic is present it also names the allowlisted endpoint class
-    // (and, for 403, the required permissions) so the failing call is
+    // (and, for 403, the required permissions, plus — for a token-exchange
+    // 403 — the classified GitHub refusal message) so the failing call is
     // identifiable without raw URLs/repos/branches in the ledger.
     if (status !== undefined) auditDetail = detail === undefined ? `status=${status}` : `status=${status} ${detail}`;
   }
