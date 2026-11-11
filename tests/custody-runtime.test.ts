@@ -1070,6 +1070,55 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
     expect(h.ledger().report.complete).toBe(true);
   });
+  it("enriches and maps a projectless work-product-only card", async () => {
+    // The work-product tier has no project gate, so projectless cards must
+    // be enriched too or they map unmapped while the tick reports complete.
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: "example/project#42", status: "ready_for_review" };
+    const h = fixture({ cards: [card({ projectId: null, workProducts: [binding] })], open: [pull({ headBranch: "feat/change" })] });
+    await h.runtime.poll();
+    expect(h.ctx.issues.get).toHaveBeenCalledWith(ISSUE, COMPANY);
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: "example/project#42", mapping: "work_product", cardId: ISSUE })]);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
+    expect(h.ledger().report.complete).toBe(true);
+  });
+  it("defers all effects when a work-product enrichment read fails", async () => {
+    // A failed enrichment could hide the true work-product owner, so a
+    // lower-tier (title URL) match must not receive the wake this tick.
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const h = fixture({ cards: [urlCard] });
+    h.ctx.issues.get.mockRejectedValueOnce(new Error("read failed"));
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain(`work_product:${ISSUE}`);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.rows).toHaveLength(1);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+  it("does not stamp a Phase B-starved repo in Phase A, so it rotates first next tick", async () => {
+    const h = fixture({ open: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [
+      { projectId, repoUrl: "https://github.com/example/project" },
+      { projectId, repoUrl: "https://github.com/example/tail" },
+    ]);
+    h.listing.mockImplementation(async (repo, status) => status === "open"
+      ? (repo === "example/tail" ? [pull({ repo: "example/tail", headRepo: "example/tail" })] : [pull()])
+      : []);
+    // Phase B on the first repo advances time past the inventory budget,
+    // starving the second repo's evidence pass inside this tick.
+    h.activity.mockImplementation(async (pr) => {
+      if (pr.repo === "example/project") h.advance(210_000);
+      return NOW - 8 * DAY;
+    });
+    await h.runtime.poll();
+    expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_000);
+    expect(h.ledger().attempted["example/tail"]).toBeUndefined();
+    expect(h.ledger().report.unknown).toContain("example/tail#42");
+    // Next tick the starved repo sorts first and is inventoried first.
+    h.listing.mockClear();
+    await h.restart().poll();
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+  });
   it("treats a missing workProducts field as UNKNOWN, never as proven-absent", async () => {
     const h = fixture({ open: [pull({ headBranch: "feat/change" })] });
     h.ctx.issues.get.mockImplementation(async () => ({ id: ISSUE, companyId: COMPANY, projectId: PROJECT, identifier: "TASK-42", title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null }));
@@ -1120,34 +1169,53 @@ describe("onCustodyEvent index freshness", () => {
     expect(h.ctx.state.set).not.toHaveBeenCalled();
     expect(h.ledger().prToCards).toEqual({});
   });
-  it("does nothing while a tick is running", async () => {
+  it("queues an event behind a running tick instead of racing its writes", async () => {
     const h = fixture();
     seedLedger(h, {});
-    eventIssue(h, "https://github.com/example/project/pull/42");
-    (h.runtime as unknown as { running: boolean }).running = true;
-    await h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" });
-    expect(h.ctx.issues.get).not.toHaveBeenCalled();
-    expect(h.ctx.state.set).not.toHaveBeenCalled();
-  });
-  it("cannot overwrite a concurrent tick's ledger write", async () => {
-    const h = fixture();
     let release!: (v: CustodyCard[]) => void;
     const gate = new Promise<CustodyCard[]>((resolve) => { release = resolve; });
     vi.mocked(loadCustodyCards).mockImplementationOnce(() => gate);
     const ticking = h.runtime.poll();
-    // Let the tick reach the gated card load; the event must observe the
-    // running tick and return without any host read or ledger write.
+    // Let the tick reach the gated card load; the event must serialize
+    // behind the tick through the shared mutex — it cannot read or write
+    // the ledger while the tick is mid-flight, and it is not dropped now.
     await new Promise((resolve) => setImmediate(resolve));
     eventIssue(h, "https://github.com/example/project/pull/42");
-    await h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" });
+    let eventDone = false;
+    const evented = h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" }).then(() => { eventDone = true; });
+    await new Promise((resolve) => setImmediate(resolve));
     expect(h.ctx.issues.get).not.toHaveBeenCalled();
-    const setCountDuringTick = h.ctx.state.set.mock.calls.length;
+    expect(eventDone).toBe(false);
     release(h.cards);
     await ticking;
-    // The event added no issue reads; the tick's own enrichment/dispatch
-    // reads proceeded and its save is intact (complete inventory).
-    expect(h.ctx.issues.get.mock.calls.length).toBeGreaterThanOrEqual(1);
-    expect(h.ctx.state.set.mock.calls.length).toBeGreaterThan(setCountDuringTick);
+    await evented;
+    expect(eventDone).toBe(true);
+    // The tick's full cycle ran and persisted; the queued event then ran.
     expect(h.ledger().report.complete).toBe(true);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it("does not let a tick starting mid event-handler lose its settled receipt", async () => {
+    const h = fixture();
+    seedLedger(h, {});
+    // Gate the event handler's issue read so the tick starts after the
+    // handler has begun — the exact interleaving a boolean-flag check
+    // cannot close. The tick must wait for the handler's write, then run
+    // against the fresh ledger rather than overwrite it.
+    let releaseGet!: (v: unknown) => void;
+    const getGate = new Promise<unknown>((resolve) => { releaseGet = resolve; });
+    h.ctx.issues.get.mockImplementationOnce(() => getGate);
+    const evented = h.runtime.onCustodyEvent({ entityId: ISSUE, eventType: "issue.updated" });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(h.ctx.issues.get).toHaveBeenCalledTimes(1);
+    const ticked = h.runtime.poll();
+    releaseGet({ ...card(), workProducts: [{ type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 } }] });
+    await evented;
+    await ticked;
+    // One settled wake only: the event's stale snapshot never overwrote
+    // the tick's receipt, so there is no duplicate custody wake.
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "woken" })]);
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
   });
 });

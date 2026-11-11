@@ -35,7 +35,16 @@ const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {},
 
 /** One host-managed worker; coalesce overlapping hourly/manual runs. No registration or LLM tool surface. */
 export class CustodyRuntime {
-  private running = false;
+  // One promise-chain mutex shared by the tick and the event handler: the
+  // whole read-modify-write of a tick and of an event never interleave, so
+  // neither side can persist a stale whole-ledger snapshot over the other's
+  // fresh receipts (the TOCTOU a re-check of a boolean flag cannot close).
+  private chain: Promise<void> = Promise.resolve();
+  private enqueue<T>(work: () => Promise<T>): Promise<T> {
+    const task = this.chain.then(work);
+    this.chain = task.then(() => undefined, () => undefined);
+    return task;
+  }
   private caches = new Map<string, CiGithubCache>();
   // Scheduled jobs run with no invocation company scope, so the company-less
   // ctx.config.get() the host gate rejects is unusable here. The host delivers
@@ -49,21 +58,19 @@ export class CustodyRuntime {
   }
 
   async poll(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    try { await this.tick(); }
-    finally { this.running = false; }
+    return this.enqueue(() => this.tick());
   }
 
   /**
    * Keep the bounded PR->card index fresh between scheduled ticks from
    * native issue events. Best-effort and self-healing: the next tick
    * rebuilds prToCards from explicit tiers for every inventoried PR, so a
-   * lost event update can only stale the index, never corrupt it. A tick
-   * in progress owns the ledger — events arriving during one are skipped
-   * (the tick rebuilds the index anyway), so an event can never read a
-   * pre-tick ledger and write it back over fresh receipts/heads/report.
-   * Only issue-level events proceed: work products change with the issue,
+   * lost event update can only stale the index, never corrupt it. The
+   * handler runs through the same promise-chain mutex as the tick, so a
+   * whole-ledger write from either side can never overwrite the other's
+   * fresh receipts/heads/report — a check of a boolean flag is racy here
+   * because the tick can start after the check yet finish first. Only
+   * issue-level events proceed: work products change with the issue,
    * never with a comment or document write, so comment/document events
    * cannot add a binding and are ignored without reads. The ledger is
    * written back only when the index actually changes. Events for other
@@ -71,38 +78,39 @@ export class CustodyRuntime {
    * dispatches wakes.
    */
   async onCustodyEvent(event: { companyId?: string; entityId?: string; eventType?: string }): Promise<void> {
-    if (this.running) return;
-    const companyId = this.custodyCompanyId;
-    const cardId = event.entityId;
-    if (!companyId || !cardId || !UUID.test(cardId)) return;
-    if (event.eventType !== undefined && !["issue.created", "issue.updated", "issue.relations.updated"].includes(event.eventType)) return;
-    if (event.companyId && event.companyId.toLowerCase() !== companyId.toLowerCase()) return;
-    try {
-      const raw = await this.ctx.config.get(companyId);
-      const config = parseCustodyConfig(raw);
-      if (!config || config.companyId.toLowerCase() !== companyId.toLowerCase()) return;
-      const key = { scopeKind: "company" as const, scopeId: config.companyId, namespace: "pr-custody-v1", stateKey: `${config.org}:${config.dryRun ? "dry" : "live"}` };
-      const stored = await this.ctx.state.get(key) as Ledger | null;
-      if (!stored || stored.version !== 1) return;
-      const fresh = await this.ctx.issues.get(cardId, config.companyId);
-      if (!fresh || fresh.companyId !== config.companyId) return;
-      const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
-      // Absent field: the tick treats this as UNKNOWN; a best-effort event
-      // simply cannot add anything and must not write.
-      if (!bindings) return;
-      stored.prToCards ??= {};
-      let changed = false;
-      for (const binding of bindings) {
-        if (!binding.url) continue;
-        const ref = prRefFromUrl(binding.url);
-        if (!ref) continue;
-        if (stored.prToCards[ref] !== cardId) {
-          stored.prToCards[ref] = cardId;
-          changed = true;
+    return this.enqueue(async () => {
+      const companyId = this.custodyCompanyId;
+      const cardId = event.entityId;
+      if (!companyId || !cardId || !UUID.test(cardId)) return;
+      if (event.eventType !== undefined && !["issue.created", "issue.updated", "issue.relations.updated"].includes(event.eventType)) return;
+      if (event.companyId && event.companyId.toLowerCase() !== companyId.toLowerCase()) return;
+      try {
+        const raw = await this.ctx.config.get(companyId);
+        const config = parseCustodyConfig(raw);
+        if (!config || config.companyId.toLowerCase() !== companyId.toLowerCase()) return;
+        const key = { scopeKind: "company" as const, scopeId: config.companyId, namespace: "pr-custody-v1", stateKey: `${config.org}:${config.dryRun ? "dry" : "live"}` };
+        const stored = await this.ctx.state.get(key) as Ledger | null;
+        if (!stored || stored.version !== 1) return;
+        const fresh = await this.ctx.issues.get(cardId, config.companyId);
+        if (!fresh || fresh.companyId !== config.companyId) return;
+        const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
+        // Absent field: the tick treats this as UNKNOWN; a best-effort event
+        // simply cannot add anything and must not write.
+        if (!bindings) return;
+        stored.prToCards ??= {};
+        let changed = false;
+        for (const binding of bindings) {
+          if (!binding.url) continue;
+          const ref = prRefFromUrl(binding.url);
+          if (!ref) continue;
+          if (stored.prToCards[ref] !== cardId) {
+            stored.prToCards[ref] = cardId;
+            changed = true;
+          }
         }
-      }
-      if (changed) await this.ctx.state.set(key, stored);
-    } catch { /* Best-effort freshness only; the scheduled tick reconciles. */ }
+        if (changed) await this.ctx.state.set(key, stored);
+      } catch { /* Best-effort freshness only; the scheduled tick reconciles. */ }
+    });
   }
 
   private async tick(): Promise<void> {
@@ -264,7 +272,6 @@ export class CustodyRuntime {
       for (const repo of sortedRepos) {
         try {
           if (!inventoryAvailable()) throw new Error("inventory_budget");
-          ledger.attempted[repo] = this.now();
           // GitHub REST timestamps have second precision; retain inclusive same-second overlap.
           const until = Math.floor(this.now() / 1000) * 1000;
           const open = await github.pulls(repo, "open");
@@ -288,22 +295,30 @@ export class CustodyRuntime {
       // budgets (guard throws fail closed as a surfaced inventory
       // failure); event subscriptions only accelerate discovery between
       // ticks. A missing/unreadable workProducts field is UNKNOWN, never
-      // treated as proven-absent (see parseWorkProductBindings).
+      // treated as proven-absent (see parseWorkProductBindings). Projectless
+      // cards are enriched too: the work-product tier itself has no project
+      // gate, so skipping them would leave projectless work-product-only
+      // cards unmapped while the tick reports complete=true.
       const enrichIds = new Set<string>(Object.values(ledger.prToCards));
       for (const card of cards) {
-        if (card.projectId !== null && [...(reposByProject.get(card.projectId) ?? [])].some((repo) => monitored.has(repo))) enrichIds.add(card.id);
+        if (card.projectId === null) enrichIds.add(card.id);
+        else if ([...(reposByProject.get(card.projectId) ?? [])].some((repo) => monitored.has(repo))) enrichIds.add(card.id);
       }
+      // A failed/absent enrichment read could hide the true work-product
+      // owner, so any such UNKNOWN bars ownership effects this tick (fail
+      // closed): mapping and discovery persist, dispatch is deferred.
+      let enrichmentUnknown = false;
       for (const cardId of enrichIds) {
         const card = cardsById.get(cardId);
         if (!card) continue;
         try {
           guard();
           const fresh = await this.ctx.issues.get(cardId, config.companyId);
-          if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`); continue; }
+          if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
           const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
-          if (bindings === null) { unknown(`work_product:${cardId}`); continue; }
+          if (bindings === null) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
           card.workProducts = bindings;
-        } catch { unknown(`work_product:${cardId}`); }
+        } catch { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
       }
       const candidates = new Map<string, CustodyCard>();
       const seenPrs = new Set<string>();
@@ -330,6 +345,7 @@ export class CustodyRuntime {
           const active = new Set(open.map(prReference));
           for (const ref of Object.keys(ledger.heads)) if (ref.startsWith(`${repo}#`) && !active.has(ref)) delete ledger.heads[ref];
           let complete = true;
+          let budgetDenied = false;
           // Rotate expensive evidence reads independently of REST's stable updated-descending order.
           const ordered = [...open, ...closed].sort((a, b) => a.number - b.number);
           const next = ordered.findIndex((pr) => pr.number > (ledger.activityAfter[repo] ?? 0));
@@ -419,17 +435,36 @@ export class CustodyRuntime {
                   activity = await github.activity(pr, head.at);
                 }
               } else if (!pr.merged) closure = await github.closureTexts(pr);
-            } catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); }
+            } catch (error) {
+              if (error instanceof Error && error.message === "inventory_budget") budgetDenied = true;
+              if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr));
+            }
             // Missing activity cannot erase an independently established terminal-card trigger.
             const triggers = custodyTriggers(pr, owner, activity, closure, this.now());
             row.triggers = triggers.map((t) => t.key);
             for (const trigger of triggers) pending.push({ pr, card: owner, trigger, repo });
           }
           if (complete) scanned.set(repo, until);
+          // Stamp only when the repo's evidence pass actually ran — never
+          // in Phase A, and not when the inventory budget denied it here:
+          // stamping a Phase B-starved repo would freshen its stamp so it
+          // sorts last again next tick and never advances.
+          if (!budgetDenied) ledger.attempted[repo] = this.now();
         } catch { unknown(repo); }
       }
       // Persist discovery clocks/removals as one batch before any effect can depend on them.
       await save();
+      // Fail closed on any enrichment UNKNOWN: a missing work-product
+      // binding could change ownership, so no effects this tick. Discovery
+      // (rows, heads, cursors, index) is already persisted above; the next
+      // tick re-derives triggers. Report stays incomplete via unknown().
+      if (enrichmentUnknown) {
+        ledger.report.complete = false;
+        audit("inventory", "unknown");
+        await save();
+        this.ctx.logger.info("pr-custody: inventory", { complete: ledger.report.complete, prs: ledger.report.rows.length, unknown: ledger.report.unknown.length, effects: ledger.report.effects, dryRun: config.dryRun });
+        return;
+      }
       dispatching = true;
       const dailyKey = `pr-custody-summary|${new Date(this.now()).toISOString().slice(0, 10)}`;
       let summaryReceipt = ledger.receipts[dailyKey] ?? null;
