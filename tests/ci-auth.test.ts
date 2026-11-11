@@ -90,6 +90,16 @@ describe("App installation authentication", () => {
     expect(fresh.calls).toHaveLength(2);
   });
 
+  it("reports cycle expiry so a longer tick can mint a fresh source", () => {
+    let now = START;
+    const auth = new CiAppAuth({ appId: "123", installationId: "456", repo: "example/project", resolvePrivateKey: async () => KEY, now: () => now });
+    expect(auth.expired()).toBe(false);
+    now += 179_999;
+    expect(auth.expired()).toBe(false);
+    now += 1;
+    expect(auth.expired()).toBe(true);
+  });
+
   it("uses a renewed token only after validating the new response", async () => {
     let now = START;
     let count = 0;

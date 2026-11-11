@@ -33,6 +33,9 @@ export class CiAppAuth implements CiTokenSource {
 
   invalidate(): void { this.#token = null; this.#failed = true; }
 
+  /** True once this source's bounded cycle has elapsed; it must not be reused. */
+  expired(): boolean { return this.#now() >= this.#deadline; }
+
   async token(path: string, exchange: CiTokenExchange): Promise<string> {
     if (!path.startsWith(`/repos/${this.#options.repo}/`)) throw new CiGithubError("input");
     if (this.#now() >= this.#deadline) { this.invalidate(); throw new CiGithubError("timeout"); }

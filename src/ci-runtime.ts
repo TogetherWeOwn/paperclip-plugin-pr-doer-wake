@@ -91,6 +91,7 @@ export class CiWakeRuntime {
   private pollInFlight = false;
   private targetedPoll = false;
   private fullPollRequested = false;
+  private readonly pendingTargets = new Map<string, { companyId: string; repo: string; sha: string }>();
   private pendingWebhooks = 0;
   private webhookAdmissions = { since: 0, used: 0 };
   private readonly caches = new Map<string, CiGithubCache>();
@@ -199,7 +200,10 @@ export class CiWakeRuntime {
     let credential: string | CiAppAuth;
     if (app) {
       const scope = `${companyId}:${authIdentity(config)}:${repo}`;
-      if (!cycle.has(scope)) cycle.set(scope, new CiAppAuth({
+      // A 600s tick outlives one 180s auth cycle: mint a fresh source rather
+      // than reusing an expired one (which would fail every later wait).
+      const existing = cycle.get(scope);
+      if (!existing || existing.expired()) cycle.set(scope, new CiAppAuth({
         appId: app.appId, installationId: app.installationId, repo, now: this.now,
         resolvePrivateKey: () => this.resolveSecret(app.privateKeySecretRef, companyId, "githubAppPrivateKeySecretRef"),
       }));
@@ -289,21 +293,35 @@ export class CiWakeRuntime {
   async poll(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
     if (this.pollInFlight) {
       if (!only && this.targetedPoll) this.fullPollRequested = true;
+      // Queue targeted hints instead of dropping them: a completed head whose
+      // hint arrives mid-poll must not wait for the next backstop tick.
+      else if (only) this.pendingTargets.set(`${only.companyId}:${only.repo}:${only.sha}`, only);
       return;
     }
     this.pollInFlight = true;
     this.targetedPoll = only !== undefined;
     try {
       await this.serialized(() => this.pollLocked(only));
-      if (this.fullPollRequested) {
-        this.targetedPoll = false;
-        this.fullPollRequested = false;
-        await this.serialized(() => this.pollLocked());
+      // Drain requests that arrived while this poll ran (targets may arrive
+      // during the drain too; loop until nothing is left).
+      while (this.fullPollRequested || this.pendingTargets.size > 0) {
+        if (this.fullPollRequested) {
+          this.targetedPoll = false;
+          this.fullPollRequested = false;
+          await this.serialized(() => this.pollLocked());
+        } else {
+          const targets = [...this.pendingTargets.values()];
+          this.pendingTargets.clear();
+          this.targetedPoll = true;
+          for (const target of targets) await this.serialized(() => this.pollLocked(target));
+          this.targetedPoll = false;
+        }
       }
     } finally {
       this.pollInFlight = false;
       this.targetedPoll = false;
       this.fullPollRequested = false;
+      this.pendingTargets.clear();
     }
   }
 
@@ -421,10 +439,16 @@ export class CiWakeRuntime {
   async webhook(input: PluginWebhookInput): Promise<void> {
     if (input.endpointKey !== "github-ci") throw new Error("unknown_webhook");
     const event = header(input, "x-github-event");
-    const sha = webhookHeadSha(event, input.rawBody);
-    // Unsupported events and non-terminal actions are ignored without ledger reads.
-    if (sha === null) return;
+    // Unsupported events are ignored without parsing, even when malformed or oversized.
+    if (!["check_suite", "check_run", "workflow_run", "pull_request"].includes(event ?? "")) return;
+    // Supported events: enforce the size cap before any JSON parsing, so an
+    // unauthenticated sender cannot force an oversized parse. An oversized
+    // non-terminal action is therefore rejected rather than ignored — its
+    // action cannot be known without parsing. Within-cap non-terminal
+    // actions are still ignored below without ledger reads.
     if (Buffer.byteLength(input.rawBody, "utf8") > 65_536) throw new Error("webhook_too_large");
+    const sha = webhookHeadSha(event, input.rawBody);
+    if (sha === null) return;
     const signature = header(input, "x-hub-signature-256");
     const delivery = header(input, "x-github-delivery");
     if (!signature || !/^sha256=[0-9a-f]{64}$/.test(signature) || !delivery || !UUID.test(delivery)) throw new Error("invalid_webhook_headers");

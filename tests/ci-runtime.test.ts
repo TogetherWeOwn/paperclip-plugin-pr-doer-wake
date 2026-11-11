@@ -1220,6 +1220,42 @@ describe("signed check_suite hints", () => {
     expect(h.get).not.toHaveBeenCalled();
     expect(h.resolveSecret).not.toHaveBeenCalled();
     expect(h.requestWakeup).not.toHaveBeenCalled();
+    // Oversized unsupported events are also ignored without parsing.
+    await h.runtime.webhook(webhook({ event, rawBody: " ".repeat(65_537), signature: null }));
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("rejects an oversized supported-event body before parsing it", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.pull.mockClear();
+    // Malformed JSON over the cap must fail with webhook_too_large, proving
+    // the size check runs before any parse (a parse would say invalid payload).
+    await expect(h.runtime.webhook(webhook({ rawBody: "{".padEnd(65_537, " ") }))).rejects.toThrow("webhook_too_large");
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("queues a targeted poll that arrives while a poll is in flight instead of dropping it", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    // The in-flight poll sees pending and wakes nothing; only the drained
+    // targeted recheck (pass) may wake — proving the target was queued, not dropped.
+    github.readiness.mockReturnValue(verdict("pass"));
+    github.readiness.mockReturnValueOnce(verdict("pending"));
+    const poll = h.runtime.poll();
+    await entered.promise;
+    const targeted = h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+    release.resolve();
+    await Promise.all([poll, targeted]);
+    expect(github.snapshot).toHaveBeenCalledTimes(2);
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
   it.each([
