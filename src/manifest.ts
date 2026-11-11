@@ -15,7 +15,7 @@ const secretRef = {
 export const registrationTool = {
   name: "ci_wait_register",
   displayName: "Register CI completion wait",
-  description: "After pushing an owned PR, register its exact issue, repository, PR number and head SHA. The caller must own the checkout, and the PR branch/repository must match the issue execution workspace. Repeated calls in one run are idempotent; after a manual rerun, register from a new run. Never guesses ownership from text or branches.",
+  description: "After pushing an owned PR, register its exact issue, repository, PR number and head SHA. The caller must own the checkout; binding is the execution workspace identity plus the live PR number and head SHA — the PR head branch need not equal the workspace branch name. Repeated calls in one run are idempotent; after a manual rerun, register from a new run. Refusals return an enumerated secret-free code. Never guesses ownership from text or branches.",
   parametersSchema: {
     type: "object", additionalProperties: false,
     required: ["issueId", "repo", "prNumber", "headSha"],

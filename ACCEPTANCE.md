@@ -17,7 +17,7 @@ The CI-specific sections below preserve prior source-review evidence. They do no
 
 | Boundary | Fixture file / coverage |
 | --- | --- |
-| Schema / identity / authorization | `tests/ci-runtime.test.ts`: unknown keys, invalid values, checkout assertion, foreign company/project, exact execution-workspace repo/branch, spoofed head |
+| Schema / identity / authorization | `tests/ci-runtime.test.ts`: unknown keys, invalid values, checkout assertion, foreign company/project, execution-workspace repo, PR number + head SHA binding (workspace branch need not equal PR head branch), spoofed head, enumerated secret-free refusal codes |
 | No guessed mapping | `tests/ci-runtime.test.ts`: unregistered branch/body hints cannot wake; registration requires host ownership and matching current PR |
 | Required readiness | `tests/ci-github.test.ts`: pending/green/fail/missing, unknown conclusions, rerun, app-bound requirements, no-required suite gates; same-attempt optional jobs, exact Actions run/attempt/job/check binding, generation changes, missing/partial targets, unavailable Actions and status deferral |
 | Completeness / bounds | `tests/ci-github.test.ts`: more than 100 runs, rules/suite/status pagination, page/request/body/cache bounds, partial/denied errors |

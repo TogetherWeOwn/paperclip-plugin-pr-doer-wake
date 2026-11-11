@@ -4,7 +4,16 @@ import type { CustodyPull } from "./custody-github.js";
 
 export const DAY = 86_400_000;
 export const CUSTODY_ORIGIN = "plugin:togetherweown.pr-doer-wake:pr-custody" as const;
-export interface CustodyRegistration { companyId: string; issueId: string; repo: string; prNumber: number }
+export interface CustodyRegistration {
+  companyId: string; issueId: string; repo: string; prNumber: number;
+  /**
+   * Binding proof recorded by ci-wake: true only when the workspace branch
+   * (before and after the GitHub read) equals the live PR head branch.
+   * Missing/false (including legacy waits without the field) is repo-only
+   * evidence and is skipped below — never trusted at the registration tier.
+   */
+  branchVerified?: boolean;
+}
 export interface Mapping { card: CustodyCard | null; source: "registration" | "workspace" | "url" | "identifier" | "unmapped"; candidates: string[] }
 export interface Disposition { at: number; action: string; revisit: number | null }
 export interface Trigger { key: string; kind: "idle" | "terminal" | "closed"; epoch: string; at: number }
@@ -22,14 +31,19 @@ function isSourceReference(body: string, pr: Pick<CustodyPull, "repo" | "number"
   return new RegExp(`^(?:${escape(prReference(pr))}|${url}|<${url}>|\\[[^\\]#:/]*\\]\\(${url}\\))$`, "i").test(body);
 }
 
-/** The first nonempty tier wins; multiple matches at that tier are UNMAPPED, never a primary-owner guess. */
+/** The first nonempty tier wins; multiple matches at that tier are UNMAPPED, never a primary-owner guess.
+ * Only branch-verified registrations are trusted at the registration tier:
+ * a repo-only registration (checkout ownership of the caller's own card plus
+ * public PR number/SHA) does not link the checkout to the PR, so unverified
+ * or legacy registrations are skipped entirely and cannot poison or suppress
+ * the workspace/URL/identifier tiers. */
 export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrations: CustodyRegistration[], projectRepos: Map<string, Set<string>>, companyId: string): Mapping {
   const eligible = cards.filter((c) => c.companyId === companyId);
   const pick = (source: Mapping["source"], matches: CustodyCard[]): Mapping | null => {
     const unique = [...new Map(matches.map((c) => [c.id, c])).values()];
     return unique.length ? { source, card: unique.length === 1 ? unique[0]! : null, candidates: unique.map((c) => c.id).sort() } : null;
   };
-  const registered = new Set(registrations.filter((r) => r.companyId === companyId && r.repo === pr.repo && r.prNumber === pr.number).map((r) => r.issueId));
+  const registered = new Set(registrations.filter((r) => r.branchVerified === true && r.companyId === companyId && r.repo === pr.repo && r.prNumber === pr.number).map((r) => r.issueId));
   const explicit = pick("registration", eligible.filter((c) => registered.has(c.id)));
   if (explicit) return explicit;
   const sameRepo = pr.headRepo === pr.repo;

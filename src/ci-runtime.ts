@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
 import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, type CiConfig, type Registration } from "./ci-config.js";
-import { CiGithub, CiGithubCache, evaluateReadiness } from "./ci-github.js";
+import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness } from "./ci-github.js";
 import { CiAppAuth } from "./ci-auth.js";
 import { retryableBeforeQueue } from "./native-wake.js";
 
@@ -22,6 +22,12 @@ export interface Wait extends Registration {
   projectId: string;
   workspaceId: string;
   branch: string;
+  /**
+   * Binding proof for custody: true only when the workspace branch observed
+   * before and after the GitHub read equals the live PR head branch. Repo-only
+   * registrations (false) must not be trusted by custody; see custody-policy.
+   */
+  branchVerified: boolean;
   runId: string;
   aliases: string[];
   registeredAt: number;
@@ -42,6 +48,28 @@ interface Ledger {
 }
 const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} });
 class BindingChanged extends Error {}
+
+/**
+ * Enumerated, secret-free refusal codes for ci_wait_register.
+ * A closed allowlist: known internal failures map to their code and
+ * any other error folds to registration_refused. Error messages,
+ * upstream bodies and host detail are never included.
+ */
+const REFUSAL_CODES = new Set([
+  "invalid_registration", "invalid_run_context", "invalid_configuration",
+  "plugin_disabled", "repo_refused", "checkout_refused",
+  "issue_binding_refused", "workspace_binding_refused", "pr_binding_refused",
+  "binding_changed", "registration_requires_new_run", "wait_alias_capacity",
+  "wait_capacity", "github_backoff", "github_backoff_capacity",
+  "secret_resolution_timeout", "credential_unavailable",
+  "invalid_ledger", "registration_refused",
+]);
+
+function refusalCode(error: unknown): string {
+  if (error instanceof CiGithubError) return `github_${error.code}`;
+  if (error instanceof Error && REFUSAL_CODES.has(error.message)) return error.message;
+  return "registration_refused";
+}
 
 export function verifyCiSignature(secret: string, rawBody: string, signature: string | undefined): boolean {
   if (!secret || !signature || !/^sha256=[0-9a-f]{64}$/.test(signature)) return false;
@@ -208,7 +236,16 @@ export class CiWakeRuntime {
         resolvePrivateKey: () => this.resolveSecret(app.privateKeySecretRef, companyId, "githubAppPrivateKeySecretRef"),
       }));
       credential = cycle.get(scope)!;
-    } else credential = await this.resolveSecret(config.githubTokenSecretRef!, companyId, "githubTokenSecretRef");
+    } else {
+      try {
+        credential = await this.resolveSecret(config.githubTokenSecretRef!, companyId, "githubTokenSecretRef");
+      } catch (error) {
+        // Preserve the deadline code; any other host failure folds to a
+        // secret-free credential code without leaking host detail.
+        if (error instanceof Error && error.message === "secret_resolution_timeout") throw error;
+        throw new Error("credential_unavailable");
+      }
+    }
     return new CiGithub(fetch, credential, { now: this.now, cache, backoff });
   }
 
@@ -216,8 +253,12 @@ export class CiWakeRuntime {
     const issue = await this.ctx.issues.get(wait.issueId, companyId);
     if (!issue || issue.companyId !== companyId || !issue.projectId || (projectId && issue.projectId !== projectId) || !issue.executionWorkspaceId) throw new Error("issue_binding_refused");
     const workspace = await this.ctx.executionWorkspaces.get(issue.executionWorkspaceId, companyId);
-    if (!workspace || workspace.companyId !== companyId || workspace.projectId !== issue.projectId || workspaceRepo(workspace.repoUrl) !== wait.repo || !workspace.branchName) throw new Error("workspace_binding_refused");
-    return { workspaceId: workspace.id, projectId: issue.projectId, branch: workspace.branchName };
+    if (!workspace || workspace.companyId !== companyId || workspace.projectId !== issue.projectId || workspaceRepo(workspace.repoUrl) !== wait.repo) throw new Error("workspace_binding_refused");
+    // Branch is recorded for ledger context only. Binding is the checked-out
+    // workspace identity plus live PR number and head SHA; agents push from
+    // work/<uuid> checkouts to the PR head branch, so branch-name equality
+    // must never be a binding criterion.
+    return { workspaceId: workspace.id, projectId: issue.projectId, branch: workspace.branchName ?? "" };
   }
 
   private async checkBinding(wait: Wait): Promise<void> {
@@ -226,28 +267,43 @@ export class CiWakeRuntime {
     if (!issue || issue.id !== wait.issueId || issue.companyId !== wait.companyId || !issue.projectId || !issue.executionWorkspaceId) throw new Error("issue_binding_refused");
     if (issue.projectId !== wait.projectId || issue.executionWorkspaceId !== wait.workspaceId) throw new BindingChanged();
     const workspace = await this.ctx.executionWorkspaces.get(issue.executionWorkspaceId, wait.companyId);
-    if (!workspace || workspace.id !== wait.workspaceId || workspace.companyId !== wait.companyId || !workspace.projectId || !workspace.branchName) throw new Error("workspace_binding_refused");
+    if (!workspace || workspace.id !== wait.workspaceId || workspace.companyId !== wait.companyId || !workspace.projectId) throw new Error("workspace_binding_refused");
     const repo = workspaceRepo(workspace.repoUrl);
     if (!repo) throw new Error("workspace_binding_refused");
-    if (workspace.projectId !== wait.projectId || repo !== wait.repo || workspace.branchName !== wait.branch) throw new BindingChanged();
+    if (workspace.projectId !== wait.projectId || repo !== wait.repo) throw new BindingChanged();
+  }
+
+  private async checkoutOwner(issueId: string, run: ToolRunContext): Promise<void> {
+    try {
+      await this.ctx.issues.assertCheckoutOwner({ issueId, companyId: run.companyId, actorAgentId: run.agentId, actorRunId: run.runId });
+    } catch {
+      // Host detail in the denial is never propagated to agent output.
+      throw new Error("checkout_refused");
+    }
   }
 
   async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
     return this.serialized(async () => {
-      const ledger = await this.load();
-      this.compact(ledger);
+      // The ledger load lives inside the refusal boundary: a malformed
+      // persisted ledger (invalid_ledger) or a host state-read failure must
+      // return { code } instead of escaping as a rejection that could leak
+      // raw host detail. When the ledger could not be read, return without
+      // saving: the unreadable ledger cannot be audited in place.
+      let ledger: Ledger | undefined;
       let waitId: string | undefined;
       try {
+        ledger = await this.load();
+        this.compact(ledger);
         const registration = parseRegistration(params);
         if (![run.companyId, run.agentId, run.runId, run.projectId].every((s) => UUID.test(s))) throw new Error("invalid_run_context");
         const config = await this.config(run.companyId);
         if (!config.allowedRepos.includes(registration.repo)) throw new Error("repo_refused");
-        await this.ctx.issues.assertCheckoutOwner({ issueId: registration.issueId, companyId: run.companyId, actorAgentId: run.agentId, actorRunId: run.runId });
+        await this.checkoutOwner(registration.issueId, run);
         const binding = await this.binding(registration, run.companyId, run.projectId);
         waitId = createHash("sha256").update(JSON.stringify([run.companyId, run.runId, registration.issueId, registration.repo, registration.prNumber, registration.headSha])).digest("hex");
         const existing = ledger.waits.find((w) => w.waitId === waitId || w.aliases.includes(waitId!));
         if (existing) {
-          if (existing.status === "open" && (existing.projectId !== binding.projectId || existing.workspaceId !== binding.workspaceId || existing.branch !== binding.branch)) {
+          if (existing.status === "open" && (existing.projectId !== binding.projectId || existing.workspaceId !== binding.workspaceId)) {
             existing.status = "retired"; existing.finishedAt = this.now(); existing.reason = "binding_changed";
             throw new Error("registration_requires_new_run");
           }
@@ -255,7 +311,7 @@ export class CiWakeRuntime {
           await this.save(ledger);
           return { content: "CI wait already registered", data: { waitId: existing.waitId, status: existing.status, expiresAt: existing.expiresAt } };
         }
-        const active = ledger.waits.find((w) => w.companyId === run.companyId && w.issueId === registration.issueId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.headSha === registration.headSha && w.status === "open" && w.projectId === binding.projectId && w.workspaceId === binding.workspaceId && w.branch === binding.branch);
+        const active = ledger.waits.find((w) => w.companyId === run.companyId && w.issueId === registration.issueId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.headSha === registration.headSha && w.status === "open" && w.projectId === binding.projectId && w.workspaceId === binding.workspaceId);
         if (active) {
           if (active.aliases.length >= 100) throw new Error("wait_alias_capacity");
           active.aliases.push(waitId);
@@ -270,22 +326,30 @@ export class CiWakeRuntime {
         await this.save(ledger);
         const github = await this.client(run.companyId, config, registration.repo);
         const pr = await github.pull(registration.repo, registration.prNumber);
-        if (pr.state !== "open" || pr.merged || pr.headSha !== registration.headSha || pr.headRepo?.toLowerCase() !== registration.repo || pr.headBranch !== binding.branch) throw new Error("pr_binding_refused");
+        if (pr.number !== registration.prNumber || pr.state !== "open" || pr.merged || pr.headSha !== registration.headSha || pr.headRepo?.toLowerCase() !== registration.repo) throw new Error("pr_binding_refused");
         // Checkout ownership may have changed while GitHub answered.
-        await this.ctx.issues.assertCheckoutOwner({ issueId: registration.issueId, companyId: run.companyId, actorAgentId: run.agentId, actorRunId: run.runId });
+        await this.checkoutOwner(registration.issueId, run);
         const current = await this.binding(registration, run.companyId, run.projectId);
-        if (current.workspaceId !== binding.workspaceId || current.branch !== binding.branch) throw new Error("binding_changed");
+        if (current.workspaceId !== binding.workspaceId) throw new Error("binding_changed");
+        // Custody binding proof, not a ci-wake gate: ci-wake still registers
+        // repo-only registrations, but only a verified workspace-to-PR branch
+        // link is recorded for custody to trust. Both observations must match.
+        const branchVerified = binding.branch === pr.headBranch && current.branch === pr.headBranch;
         const now = this.now();
         for (const old of ledger.waits) if (old.companyId === run.companyId && old.repo === registration.repo && old.prNumber === registration.prNumber && old.issueId === registration.issueId && old.status === "open") { old.status = "retired"; old.finishedAt = now; old.reason = "superseded"; }
-        ledger.waits.push({ ...registration, ...binding, waitId, companyId: run.companyId, runId: run.runId, aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
+        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
         return { content: "CI wait registered", data: { waitId, status: "open", expiresAt: now + LIMITS.waitMs, dryRun: config.dryRun } };
-      } catch {
-        // Neither host exceptions nor upstream response bodies are safe agent output.
-        this.audit(ledger, "register", "refused", run, waitId);
+      } catch (error) {
+        // Neither host exceptions nor upstream response bodies are safe
+        // agent output. Only the enumerated code crosses the boundary;
+        // the audit row records the same code for operator triage.
+        const code = refusalCode(error);
+        if (ledger === undefined) return { error: `CI registration refused: ${code}`, data: { code } };
+        this.audit(ledger, "register", code, run, waitId);
         await this.save(ledger);
-        return { error: "CI registration refused; verify checkout, repository/workspace binding, configuration and capacity." };
+        return { error: `CI registration refused: ${code}`, data: { code } };
       }
     });
   }
@@ -353,7 +417,7 @@ export class CiWakeRuntime {
         await this.save(ledger);
         const github = await this.client(wait.companyId, config, wait.repo, fetch, cycle);
         const pr = await github.pull(wait.repo, wait.prNumber);
-        if (pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo || pr.headBranch !== wait.branch) {
+        if (pr.number !== wait.prNumber || pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo) {
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
         const snapshot = await github.snapshot(wait.repo, wait.headSha, pr.baseBranch);
@@ -375,7 +439,7 @@ export class CiWakeRuntime {
         await this.checkBinding(wait);
         const revalidated = await this.config(wait.companyId);
         if (!revalidated.allowedRepos.includes(wait.repo) || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
-        if (current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo || current.headBranch !== wait.branch) {
+        if (current.number !== wait.prNumber || current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo) {
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
         if (!verdict.missing.length && !samples.some((s) => s.sha === wait.headSha)) {

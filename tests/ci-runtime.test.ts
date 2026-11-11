@@ -13,16 +13,20 @@ const github = vi.hoisted(() => ({
   readiness: vi.fn(),
 }));
 
-vi.mock("../src/ci-github.js", () => ({
-  CiGithub: class {
-    constructor(...args: unknown[]) { github.construct(...args); }
-    pull(...args: unknown[]) { return github.pull(...args); }
-    snapshot(...args: unknown[]) { return github.snapshot(...args); }
-  },
-  // The runtime may retain a token-free cache, but never a token-bearing client.
-  CiGithubCache: class {},
-  evaluateReadiness: github.readiness,
-}));
+vi.mock("../src/ci-github.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/ci-github.js")>();
+  return {
+    ...actual,
+    CiGithub: class {
+      constructor(...args: unknown[]) { github.construct(...args); }
+      pull(...args: unknown[]) { return github.pull(...args); }
+      snapshot(...args: unknown[]) { return github.snapshot(...args); }
+    },
+    // The runtime may retain a token-free cache, but never a token-bearing client.
+    CiGithubCache: class {},
+    evaluateReadiness: github.readiness,
+  };
+});
 
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const AGENT = "22222222-2222-4222-8222-222222222222";
@@ -364,7 +368,6 @@ describe("CI runtime registration authorization", () => {
     ["workspace project", (h: ReturnType<typeof setup>) => { h.workspace.projectId = OTHER; }],
     ["workspace repository", (h: ReturnType<typeof setup>) => { h.workspace.repoUrl = "https://github.com/acme/other.git"; }],
     ["workspace repository alias", (h: ReturnType<typeof setup>) => { h.workspace.repoUrl = "https://github.com.evil/acme/widget"; }],
-    ["missing workspace branch", (h: ReturnType<typeof setup>) => { h.workspace.branchName = ""; }],
   ] as const)("refuses a mismatched %s before credential access", async (_name, mutate) => {
     const h = setup();
     mutate(h);
@@ -374,7 +377,7 @@ describe("CI runtime registration authorization", () => {
   });
 
   it.each([
-    { headSha: NEXT_HEAD }, { headBranch: "feature/another-branch" }, { headRepo: "attacker/widget" },
+    { headSha: NEXT_HEAD }, { headRepo: "attacker/widget" }, { number: 18 },
     { state: "closed" }, { merged: true }, { headRepo: null },
   ])("refuses a PR that does not match the registered live head and workspace (%j)", async (overrides) => {
     const h = setup();
@@ -382,6 +385,28 @@ describe("CI runtime registration authorization", () => {
     expect(await h.runtime.register(registration, run)).toHaveProperty("error");
     expect(h.ledger().waits).toEqual([]);
     expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("records branchVerified binding proof when the workspace branch equals the PR head branch", async () => {
+    const h = setup();
+    const result = await h.runtime.register(registration, run);
+    expect(result).not.toHaveProperty("error");
+    expect(h.ledger().waits).toHaveLength(1);
+    expect(h.ledger().waits[0]).toMatchObject({ branchVerified: true });
+  });
+
+  it("registers when the workspace branch differs from the PR head branch", async () => {
+    // Real agents push HEAD:<pr-branch> from work/<uuid> checkouts; binding
+    // is PR number + exact head SHA, never branch-name equality. Such
+    // repo-only registrations are recorded unverified for custody.
+    const h = setup();
+    h.workspace.branchName = "work/11111111-2222-3333-4444-555555555555";
+    github.pull.mockResolvedValue(pull({ headBranch: "fix/actual-pr-branch" }));
+    const result = await h.runtime.register(registration, run);
+    expect(result).not.toHaveProperty("error");
+    expect(result).toMatchObject({ content: "CI wait registered", data: { status: "open" } });
+    expect(h.ledger().waits).toHaveLength(1);
+    expect(h.ledger().waits[0]).toMatchObject({ branchVerified: false });
   });
 
   it("rechecks checkout ownership and workspace after the GitHub read", async () => {
@@ -392,11 +417,13 @@ describe("CI runtime registration authorization", () => {
     expect(h.ledger().waits).toEqual([]);
   });
 
-  it("refuses a workspace branch changed while GitHub answered", async () => {
+  it("registers when the workspace branch changes while GitHub answered", async () => {
     const h = setup();
     github.pull.mockImplementationOnce(async () => { h.workspace.branchName = "feature/moved"; return pull(); });
-    expect(await h.runtime.register(registration, run)).toHaveProperty("error");
-    expect(h.ledger().waits).toEqual([]);
+    expect(await h.runtime.register(registration, run)).toMatchObject({ content: "CI wait registered", data: { status: "open" } });
+    expect(h.ledger().waits).toHaveLength(1);
+    // The branch moved mid-read so the proof cannot hold: fail closed.
+    expect(h.ledger().waits[0]).toMatchObject({ branchVerified: false });
   });
 
   it.each([
@@ -423,6 +450,51 @@ describe("CI runtime registration authorization", () => {
     expect(h.resolveSecret).not.toHaveBeenCalled();
     expect(github.pull).not.toHaveBeenCalled();
     expect(h.ledger().waits).toEqual([]);
+  });
+
+  it.each([
+    ["checkout denial", (h: ReturnType<typeof setup>) => { h.ownership.runId = OTHER; }, "checkout_refused"],
+    ["disallowed repository", (h: ReturnType<typeof setup>) => { h.rawConfig.allowedRepos = ["acme/other"]; }, "repo_refused"],
+    ["disabled plugin", (h: ReturnType<typeof setup>) => { h.rawConfig.enabled = false; }, "plugin_disabled"],
+    ["PR head mismatch", (h: ReturnType<typeof setup>) => { github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD })); }, "pr_binding_refused"],
+    ["malformed registration", (h: ReturnType<typeof setup>) => { void h; }, "invalid_registration"],
+  ] as const)("returns the enumerated secret-free refusal code for %s", async (_name, arrange, code) => {
+    const h = setup();
+    arrange(h);
+    const params = code === "invalid_registration" ? { ...registration, extra: true } : registration;
+    const result = await h.runtime.register(params, run);
+    expect(result).toMatchObject({ error: `CI registration refused: ${code}`, data: { code } });
+    expect(JSON.stringify(result)).not.toContain(TOKEN);
+    expect(JSON.stringify(result)).not.toContain("private host detail");
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: code });
+    expect(h.ledger().waits).toEqual([]);
+  });
+
+  it("maps GitHub client failures to github_<code> without leaking upstream detail", async () => {
+    const { CiGithubError } = await import("../src/ci-github.js");
+    const h = setup();
+    github.pull.mockRejectedValue(new CiGithubError("auth"));
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ error: "CI registration refused: github_auth", data: { code: "github_auth" } });
+    expect(h.ledger().waits).toEqual([]);
+  });
+
+  it("folds unknown host failures into registration_refused without leaking detail", async () => {
+    const h = setup();
+    github.pull.mockRejectedValue(new Error(`unexpected host detail ${TOKEN}`));
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ error: "CI registration refused: registration_refused", data: { code: "registration_refused" } });
+    expect(JSON.stringify(result)).not.toContain(TOKEN);
+    expect(JSON.stringify(result)).not.toContain("unexpected host detail");
+  });
+
+  it("returns invalid_ledger without saving over a malformed persisted ledger", async () => {
+    const h = setup();
+    h.seed({ version: 1, waits: [], audits: [] } as unknown as Ledger);
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ error: "CI registration refused: invalid_ledger", data: { code: "invalid_ledger" } });
+    expect(h.set).not.toHaveBeenCalled();
+    expect(h.assertCheckoutOwner).not.toHaveBeenCalled();
   });
 });
 
@@ -483,7 +555,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
   });
 
   it.each([
-    { headSha: NEXT_HEAD }, { headBranch: "feature/moved" }, { headRepo: "fork/widget" },
+    { headSha: NEXT_HEAD }, { headRepo: "fork/widget" },
     { state: "closed" }, { merged: true },
   ])("retires an obsolete registration rather than waking the old head (%j)", async (overrides) => {
     const h = setup();
@@ -496,7 +568,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
-  it.each([{ headSha: NEXT_HEAD }, { baseBranch: "release" }, { headBranch: "feature/moved" }])("rechecks the live PR immediately before wake and refuses changes (%j)", async (overrides) => {
+  it.each([{ headSha: NEXT_HEAD }, { baseBranch: "release" }])("rechecks the live PR immediately before wake and refuses changes (%j)", async (overrides) => {
     const h = setup();
     await h.runtime.register(registration, run);
     github.readiness.mockReturnValue(verdict("pass"));
@@ -506,7 +578,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
-  it.each(["tenant", "project", "repository", "workspace", "branch"] as const)("revalidates the card's %s binding before a wake", async (change) => {
+  it.each(["tenant", "project", "repository", "workspace"] as const)("revalidates the card's %s binding before a wake", async (change) => {
     const h = setup();
     await h.runtime.register(registration, run);
     github.readiness.mockReturnValue(verdict("pass"));
@@ -514,7 +586,6 @@ describe("CI runtime polling and durable wake outcomes", () => {
     if (change === "project") h.issue.projectId = OTHER;
     if (change === "repository") h.workspace.repoUrl = "https://github.com/acme/other";
     if (change === "workspace") { h.issue.executionWorkspaceId = OTHER; h.workspace.id = OTHER; }
-    if (change === "branch") h.workspace.branchName = "feature/moved";
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger().waits[0]?.status).toBe(change === "tenant" ? "open" : "retired");
@@ -542,13 +613,12 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
-  it.each(["project", "repository", "workspace", "branch"] as const)("retires a confirmed %s change while CI is still pending", async (change) => {
+  it.each(["project", "repository", "workspace"] as const)("retires a confirmed %s change while CI is still pending", async (change) => {
     const h = setup();
     await h.runtime.register(registration, run);
     if (change === "project") h.issue.projectId = OTHER;
     if (change === "repository") h.workspace.repoUrl = "https://github.com/acme/other";
     if (change === "workspace") { h.issue.executionWorkspaceId = OTHER; h.workspace.id = OTHER; }
-    if (change === "branch") h.workspace.branchName = "feature/moved";
     await h.runtime.poll();
     expect(h.ledger().waits[0]).toMatchObject({ status: "retired", reason: "binding_changed" });
     expect(h.requestWakeup).not.toHaveBeenCalled();
@@ -570,7 +640,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
   it("rechecks binding after terminal readiness even when the initial binding matched", async () => {
     const h = setup();
     await h.runtime.register(registration, run);
-    github.readiness.mockImplementation(() => { h.workspace.branchName = "feature/moved"; return verdict("pass"); });
+    github.readiness.mockImplementation(() => { h.issue.executionWorkspaceId = OTHER; h.workspace.id = OTHER; return verdict("pass"); });
     await h.runtime.poll();
     expect(h.ledger().waits[0]).toMatchObject({ status: "retired", reason: "binding_changed" });
     expect(h.requestWakeup).not.toHaveBeenCalled();
@@ -1400,7 +1470,6 @@ describe("final-read authorization revalidation", () => {
   it.each([
     ["project rebinding", (h: ReturnType<typeof setup>) => { h.issue.projectId = OTHER; }],
     ["workspace rebinding", (h: ReturnType<typeof setup>) => { h.issue.executionWorkspaceId = OTHER; h.workspace.id = OTHER; }],
-    ["branch rebinding", (h: ReturnType<typeof setup>) => { h.workspace.branchName = "feature/moved"; }],
     ["repository rebinding", (h: ReturnType<typeof setup>) => { h.workspace.repoUrl = "https://github.com/acme/other"; }],
   ] as const)("retires without dispatch on %s during the final PR read", async (_name, mutate) => {
     const h = await pollWithFinalReadMutation(mutate);
@@ -1586,7 +1655,7 @@ describe("CI runtime bounded retention and work quotas", () => {
     h.seed(ledger);
     await h.runtime.register({ ...registration, extra: true }, run);
     expect(h.ledger().audits).toHaveLength(LIMITS.audit);
-    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "refused" });
+    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "register", outcome: "invalid_registration" });
   });
 
   it("refuses new webhook deliveries at replay capacity and reclaims only expired replay entries", async () => {
