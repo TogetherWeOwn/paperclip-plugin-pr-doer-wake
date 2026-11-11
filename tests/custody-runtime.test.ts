@@ -120,17 +120,18 @@ describe("custody native effects", () => {
   });
   it("preserves head warmup when oversized evidence hides a force-push revert", async () => {
     const open = [pull()];
-    const h = fixture({ open });
-    h.activity.mockImplementation(async (_pr, at) => at);
+    const source = card();
+    const h = fixture({ open, cards: [source] });
+    h.activity.mockImplementation(async (_pr, at) => at ?? NOW);
     h.seedHead.mockResolvedValue(NOW - 8 * DAY);
     await h.runtime.poll();
     h.ctx.issues.requestWakeup.mockClear();
-    h.cards[0].oversizeDocuments = [CHILD];
+    source.oversizeDocuments = [CHILD];
     open[0] = pull({ headSha: "b".repeat(40) });
     h.advance(DAY);
     await h.runtime.poll();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
-    h.cards[0].oversizeDocuments = [];
+    source.oversizeDocuments = [];
     open[0] = pull();
     h.advance(DAY);
     await h.runtime.poll();
