@@ -785,6 +785,44 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ idempotencyKey: `pr-head-wake:${REPO}:17:${THIRD_HEAD}:${ISSUE}` });
     });
 
+    it("does not wake when dryRun is flipped during the post-snapshot PR re-read", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [{ companyId: COMPANY, repo: REPO, prNumber: 17, issueId: ISSUE, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" }] as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger as Ledger);
+      // Operator rollback lands during the final (post-snapshot) PR read.
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD }))
+        .mockImplementation(async () => { h.rawConfig.dryRun = true; return pull({ headSha: NEXT_HEAD }); });
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1); // retained, not fired
+    });
+
+    it("keeps the original oldSha on a base-branch-only edit", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [{ companyId: COMPANY, repo: REPO, prNumber: 17, issueId: ISSUE, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" }] as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger as Ledger);
+      // Head stays NEXT_HEAD; only the base changes mid-tick.
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, baseBranch: "main" }))
+        .mockResolvedValue(pull({ headSha: NEXT_HEAD, baseBranch: "release" }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending).toMatchObject({ [`${COMPANY}:${REPO}:17`]: { oldSha: HEAD, newSha: NEXT_HEAD } });
+      // Next tick against the new base wakes with the original old -> new SHA.
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      const reason = (h.requestWakeup.mock.calls[0]![2] as { reason: string }).reason;
+      expect(reason).toContain(HEAD.slice(0, 7));
+      expect(reason).toContain(NEXT_HEAD.slice(0, 7));
+    });
+
     it("caps wakes per tick inside the candidate loop and resumes next tick", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);

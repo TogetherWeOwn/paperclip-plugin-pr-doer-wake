@@ -714,21 +714,34 @@ export class CiWakeRuntime {
           const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
           if (verdict.kind === "pending") continue;
-          const revalidated = await this.config(entry.companyId);
-          if (!revalidated.prHeadWakeEnabled || !revalidated.allowedRepos.includes(entry.repo) || revalidated.prHeadWakeShadow !== config.prHeadWakeShadow || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
           // Mirror the CI path: re-read the live PR after the readiness
           // snapshot and before any wake intent. A push during the snapshot
           // must retarget the entry, never wake for the stale SHA.
           const checked = await github.pull(entry.repo, entry.prNumber);
           if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
-          if (checked.headSha !== entry.newSha || checked.baseBranch !== current.baseBranch) {
+          if (checked.headSha !== entry.newSha) {
+            // Newer push superseded the pending head: re-target, keeping the
+            // oldest oldSha the reviewer last saw.
             entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
             await this.save(ledger); continue;
           }
+          if (checked.baseBranch !== current.baseBranch) {
+            // Base-only edit: the head the reviewer last saw is unchanged, so
+            // keep oldSha/newSha (never collapse them into a meaningless
+            // same-SHA wake) and retry against the new base next tick.
+            entry.observedAt = this.now();
+            await this.save(ledger); continue;
+          }
+          // Revalidate binding, enablement, allowlist, pr-head flags, dry-run
+          // and the credential identity immediately after the final GitHub
+          // read: an operator rollback (dryRun: true, disable, revoke) made
+          // during that await must not be followed by a stale-authority wake.
+          const revalidated = await this.config(entry.companyId);
+          if (!revalidated.enabled || !revalidated.prHeadWakeEnabled || !revalidated.allowedRepos.includes(entry.repo) || revalidated.prHeadWakeShadow !== config.prHeadWakeShadow || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
           // dryRun is the global rollback kill-switch: it forces no-fire
           // (effective shadow) exactly like prHeadWakeShadow, so an operator
           // rollback via dryRun: true silences this path too.
-          const shadow = config.prHeadWakeShadow || config.dryRun;
+          const shadow = revalidated.prHeadWakeShadow || revalidated.dryRun;
           const candidates = [...new Set(ledger.waits.filter((w) => w.companyId === entry.companyId && w.repo === entry.repo && w.prNumber === entry.prNumber).map((w) => w.issueId))];
           let outstanding = false;
           for (const issueId of candidates) {
