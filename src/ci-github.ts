@@ -49,6 +49,8 @@ export interface CiCheckRun {
 export interface CiCheckSuite {
   id: number;
   appId: number | null;
+  /** Unknown counts retain the conservative active-suite behaviour. */
+  latestCheckRunsCount?: number | null;
   status: string;
   conclusion: string | null;
   createdAt: number | null;
@@ -443,8 +445,11 @@ export class CiGithub {
       const suite = object(value);
       if (fullSha(text(suite.head_sha)) !== sha) return invalid();
       const status = text(suite.status);
+      const count = suite.latest_check_runs_count;
+      if (count !== undefined && count !== null && (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0)) return invalid();
       return {
         id: id(suite.id), appId: appId(suite.app), status, conclusion: nullableText(suite.conclusion),
+        latestCheckRunsCount: count ?? null,
         createdAt: timestamp(suite.created_at),
         completedAt: status === "completed" ? timestamp(suite.completed_at ?? suite.updated_at) : null,
       };
@@ -772,9 +777,10 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   const runs = latest(snapshot.runs, (run) => JSON.stringify([run.name, run.appId]));
   const statuses = latest(snapshot.statuses, (status) => status.context);
   // Multiple workflows share the GitHub Actions app ID; app ID is not suite identity.
-  // Without branch requirements every observed suite must finish, including older IDs.
-  const suites = snapshot.suites;
-  const completions = snapshot.suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
+  // Installed Apps can leave empty queued suites forever; only a known zero is absent.
+  // Every other observed suite must finish without branch requirements, including older IDs.
+  const suites = snapshot.suites.filter((suite) => suite.status === "completed" || suite.latestCheckRunsCount !== 0);
+  const completions = suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
   const lastSuiteCompletedAt = completions.length ? Math.max(...completions) : null;
   // A partial set of completions cannot start grace while another suite may still register checks.
   const missingSince = suites.length === 0 ? timing.registeredAt
