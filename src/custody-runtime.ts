@@ -21,7 +21,7 @@ interface Ledger {
   attempted: Record<string, number>;
   activityAfter: Record<string, number>;
   dispatchSequence: number;
-  heads: Record<string, { sha: string; at: number }>;
+  heads: Record<string, { sha: string; at: number | null; provenance?: "seeded" | "warmup"; floor?: number }>;
   dispositions: Record<string, number>;
   audits: Audit[];
   report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number };
@@ -32,7 +32,16 @@ const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {},
 export class CustodyRuntime {
   private running = false;
   private caches = new Map<string, CiGithubCache>();
+  // Scheduled jobs run with no invocation company scope, so the company-less
+  // ctx.config.get() the host gate rejects is unusable here. The host delivers
+  // the stored company config via onConfigChanged; capture custodyCompanyId
+  // from that delivery and read config explicitly with it.
+  private custodyCompanyId: string | null = null;
   constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now) {}
+
+  setCustodyCompanyId(companyId: string | null): void {
+    this.custodyCompanyId = companyId && UUID.test(companyId) ? companyId.toLowerCase() : null;
+  }
 
   async poll(): Promise<void> {
     if (this.running) return;
@@ -42,9 +51,24 @@ export class CustodyRuntime {
   }
 
   private async tick(): Promise<void> {
-    const raw = await this.ctx.config.get();
+    // Fail closed without a captured company: never issue a company-less
+    // config.get, which the installed host rejects during scheduled jobs.
+    if (!this.custodyCompanyId) {
+      this.ctx.logger.info("pr-custody: no company config delivered; skipping tick");
+      return;
+    }
+    const raw = await this.ctx.config.get(this.custodyCompanyId);
     const config = parseCustodyConfig(raw);
     if (!config) return;
+    // Fail closed when the stored config no longer names the company the
+    // tick read it for (e.g. the field was edited to another company between
+    // delivery and tick): every downstream effect keys on config.companyId,
+    // so operating on a different self-declared company would pivot custody
+    // — and its secret resolution — to the wrong tenant.
+    if (config.companyId.toLowerCase() !== this.custodyCompanyId.toLowerCase()) {
+      this.ctx.logger.info("pr-custody: config custodyCompanyId does not match delivered company; skipping tick");
+      return;
+    }
     const key = { scopeKind: "company" as const, scopeId: config.companyId, namespace: "pr-custody-v1", stateKey: `${config.org}:${config.dryRun ? "dry" : "live"}` };
     const stored = await this.ctx.state.get(key) as Ledger | null;
     if (stored && (stored.version !== 1 || !stored.receipts || !stored.cursors || !stored.attempted || !stored.heads || !stored.dispositions || !Array.isArray(stored.audits))) throw new Error("invalid_custody_ledger");
@@ -219,15 +243,66 @@ export class CustodyRuntime {
                 if (!head || head.sha !== pr.headSha) {
                   if (!head && Object.keys(ledger.heads).length >= CUSTODY_LIMITS.prs) throw new Error("head_capacity");
                   // Seed only a first observation from head-bound evidence
-                  // (head suite, review on the head commit). No evidence
-                  // falls back to arrival time, keeping liveness for CI-less
-                  // repos. A changed SHA (e.g. a force-push revert to an
-                  // older head) became current now and must not inherit
-                  // stale evidence as its idle epoch.
-                  const at = head ? this.now() : (await github.seedHead(pr)) ?? this.now();
-                  head = ledger.heads[ref] = { sha: pr.headSha, at };
+                  // (head suite, review on the head commit). No evidence keeps
+                  // the head UNKNOWN for idle purposes instead of fabricating
+                  // an epoch from arrival time; later genuine evidence is
+                  // retried each tick below. A changed SHA (e.g. a force-push
+                  // revert to an older head) became current now and must not
+                  // inherit stale evidence as its idle epoch. Provenance is
+                  // recorded so a trusted numeric epoch (genuine "seeded"
+                  // evidence or an intentional "warmup") is never confused
+                  // with a legacy synthesized epoch below.
+                  const at = head ? this.now() : await github.seedHead(pr);
+                  const provenance = head ? "warmup" as const : at === null ? undefined : "seeded" as const;
+                  head = ledger.heads[ref] = { sha: pr.headSha, at, ...(provenance ? { provenance } : {}) };
+                } else if (head.at === null || !head.provenance) {
+                  // Unproven heads (at=null, or a numeric epoch with no
+                  // provenance from a legacy ledger) are (re)seeded from
+                  // head-bound evidence every tick. A legacy numeric epoch
+                  // may be the old synthesized first-observation fallback
+                  // and cannot be trusted for idle; revalidating it here
+                  // adopts genuine evidence when it exists (including a
+                  // genuine epoch from an older release) and otherwise
+                  // downgrades it to UNKNOWN instead of letting it wake.
+                  // But a legacy numeric epoch may equally be an
+                  // intentional changed-SHA warmup (a force-push revert
+                  // records arrival time): adopting older stale evidence
+                  // from that SHA would shorten the seven-day warmup into
+                  // an early wake, so the legacy timestamp is preserved as
+                  // a lower bound and only newer evidence replaces it.
+                  // When the intervening tick has no evidence, idle
+                  // activity must stay UNKNOWN (at=null) without erasing
+                  // that bound: the legacy timestamp is parked in `floor`
+                  // and only enforced when evidence later arrives. A null
+                  // tick must never discard a live warmup floor, or stale
+                  // evidence on the next tick would bypass it.
+                  const seeded = await github.seedHead(pr);
+                  if (seeded === null) {
+                    if (head.at !== null && !head.provenance) head.floor = head.at;
+                    head.at = null;
+                    delete head.provenance;
+                  } else if (head.at === null && head.floor !== undefined) {
+                    if (seeded >= head.floor) {
+                      head.at = seeded;
+                      head.provenance = "seeded";
+                    } else {
+                      head.at = head.floor;
+                      head.provenance = "warmup";
+                    }
+                    delete head.floor;
+                  } else if (head.at === null || seeded >= head.at) {
+                    head.at = seeded;
+                    head.provenance = "seeded";
+                  } else {
+                    head.provenance = "warmup";
+                  }
                 }
-                activity = await github.activity(pr, head.at);
+                if (head.at === null) {
+                  row.unknown = true;
+                  unknown(prReference(pr));
+                } else {
+                  activity = await github.activity(pr, head.at);
+                }
               } else if (!pr.merged) closure = await github.closureTexts(pr);
             } catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); }
             // Missing activity cannot erase an independently established terminal-card trigger.

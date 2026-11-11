@@ -150,9 +150,10 @@ export class CustodyGithub extends CiGithub {
    * the card disposition line cannot prove this SHA was present at their
    * time, so they never date a head; disposition still feeds the trigger
    * epoch in custodyTriggers. With no head-bound evidence this returns null
-   * so the caller falls back to a conservative now() warmup rather than
-   * staying UNKNOWN forever. Seeded epochs never claim push time; they only
-   * keep already-idle PRs from waiting out a fresh seven-day warmup.
+   * so the caller keeps the head UNKNOWN for idle purposes (no wake) and
+   * retries the seed each tick, rather than fabricating an epoch from
+   * arrival time. Seeded epochs never claim push time; they only keep
+   * already-idle PRs from waiting out a fresh seven-day warmup.
    */
   async seedHead(pr: CustodyPull): Promise<number | null> {
     const { headSha } = identity(pr);
