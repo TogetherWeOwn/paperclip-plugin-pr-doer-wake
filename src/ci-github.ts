@@ -49,6 +49,8 @@ export interface CiCheckRun {
 export interface CiCheckSuite {
   id: number;
   appId: number | null;
+  /** Unknown counts retain the conservative active-suite behaviour. */
+  latestCheckRunsCount?: number | null;
   status: string;
   conclusion: string | null;
   createdAt: number | null;
@@ -443,8 +445,11 @@ export class CiGithub {
       const suite = object(value);
       if (fullSha(text(suite.head_sha)) !== sha) return invalid();
       const status = text(suite.status);
+      const count = suite.latest_check_runs_count;
+      if (count !== undefined && count !== null && (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0)) return invalid();
       return {
         id: id(suite.id), appId: appId(suite.app), status, conclusion: nullableText(suite.conclusion),
+        latestCheckRunsCount: count ?? null,
         createdAt: timestamp(suite.created_at),
         completedAt: status === "completed" ? timestamp(suite.completed_at ?? suite.updated_at) : null,
       };
@@ -764,6 +769,13 @@ function label(check: CiRequiredContext): string {
   return check.appId === null ? check.context : `${check.context} [app ${check.appId}]`;
 }
 
+/** Suites that can still contribute checks or represent observed work. */
+export function relevantSuites(snapshot: CiSnapshot): CiSnapshot["suites"] {
+  return snapshot.suites.filter((suite) => suite.latestCheckRunsCount !== 0
+    || !["queued", "in_progress"].includes(suite.status)
+    || snapshot.runs.some((run) => run.suiteId === suite.id && run.appId === suite.appId));
+}
+
 /** Pure, conservative readiness: no network, wall clock, branch fallback, or PR body policy. */
 export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTiming): CiReadiness {
   if (![timing.now, timing.registeredAt, timing.medianMs].every(Number.isFinite) || timing.medianMs <= 0) {
@@ -772,9 +784,10 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   const runs = latest(snapshot.runs, (run) => JSON.stringify([run.name, run.appId]));
   const statuses = latest(snapshot.statuses, (status) => status.context);
   // Multiple workflows share the GitHub Actions app ID; app ID is not suite identity.
-  // Without branch requirements every observed suite must finish, including older IDs.
-  const suites = snapshot.suites;
-  const completions = snapshot.suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
+  // Installed Apps can leave empty queued suites forever. Unknown states and suites
+  // referenced by observed runs retain generation safety, even if a later count is zero.
+  const suites = relevantSuites(snapshot);
+  const completions = suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
   const lastSuiteCompletedAt = completions.length ? Math.max(...completions) : null;
   // A partial set of completions cannot start grace while another suite may still register checks.
   const missingSince = suites.length === 0 ? timing.registeredAt

@@ -1018,6 +1018,73 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(JSON.stringify(h.ledger())).not.toContain("rotated-token");
   });
 
+  it("samples completed CI despite an unreferenced empty queued suite", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.snapshot.mockResolvedValue({
+      repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START, required: [], statuses: [], runs: [],
+      suites: [
+        { id: 1, appId: 1, status: "completed", conclusion: "success", latestCheckRunsCount: 1, createdAt: START - 300_000, completedAt: START },
+        { id: 2, appId: 2, status: "queued", conclusion: null, latestCheckRunsCount: 0, createdAt: START - 400_000, completedAt: null },
+      ],
+    });
+    await h.runtime.poll();
+    expect(h.ledger().samples[`${COMPANY}:${REPO}`]).toEqual([{ sha: HEAD, ms: 300_000 }]);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
+  });
+
+  it.each([
+    { status: "queued", count: null, referenced: false },
+    { status: "queued", count: 1, referenced: false },
+    { status: "waiting", count: 0, referenced: false },
+    { status: "queued", count: 0, referenced: true },
+  ])("does not sample an incomplete relevant suite: $status $count $referenced", async ({ status, count, referenced }) => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    github.snapshot.mockResolvedValue({
+      runs: referenced ? [{ id: 7, suiteId: 2, appId: 2 }] : [],
+      suites: [
+        { id: 1, appId: 1, status: "completed", latestCheckRunsCount: 1, createdAt: START - 300_000, completedAt: START },
+        { id: 2, appId: 2, status, latestCheckRunsCount: count, createdAt: START - 400_000, completedAt: null },
+      ],
+    });
+    await h.runtime.poll();
+    expect(h.ledger().samples[`${COMPANY}:${REPO}`]).toBeUndefined();
+  });
+
+  it("does not sample when a relevant suite has no start timestamp", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    // The unknown start may be the earliest; the remaining span would understate CI duration.
+    github.snapshot.mockResolvedValue({
+      suites: [
+        { id: 1, appId: 1, status: "completed", latestCheckRunsCount: 1, createdAt: null, completedAt: START },
+        { id: 2, appId: 2, status: "completed", latestCheckRunsCount: 1, createdAt: START - 300_000, completedAt: START },
+      ],
+    });
+    await h.runtime.poll();
+    expect(h.ledger().samples[`${COMPANY}:${REPO}`]).toBeUndefined();
+    expect(h.ledger().waits[0]?.status).toBe("woken");
+  });
+
+  it("samples the full span when every relevant suite has a start and finish", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    github.snapshot.mockResolvedValue({
+      suites: [
+        { id: 1, appId: 1, status: "completed", latestCheckRunsCount: 1, createdAt: START - 600_000, completedAt: START },
+        { id: 2, appId: 2, status: "completed", latestCheckRunsCount: 1, createdAt: START - 300_000, completedAt: START },
+      ],
+    });
+    await h.runtime.poll();
+    expect(h.ledger().samples[`${COMPANY}:${REPO}`]).toEqual([{ sha: HEAD, ms: 600_000 }]);
+  });
+
   it("uses a rolling measured repository median, bounds samples, and samples a SHA only once", async () => {
     const h = setup({ repoMedianMs: { [REPO]: 300_000 } });
     await h.runtime.register(registration, run);

@@ -68,6 +68,57 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(snapshot({ suites: [suite()], statuses: [{ id: 1, context: "legacy", state: "error" }] }), timing).kind).toBe("fail");
   });
 
+  it.each(["queued", "in_progress"])("ignores empty %s suites without treating zero checks as success", (status) => {
+    const suites = [suite(2, { status, conclusion: null, completedAt: null, latestCheckRunsCount: 0 })];
+    expect(evaluateReadiness(snapshot({ runs: [run()], suites }), timing).kind).toBe("pass");
+    expect(evaluateReadiness(snapshot({ suites }), timing)).toMatchObject({ kind: "pending", pending: ["checks not registered"] });
+    suites[0]!.status = "completed";
+    suites[0]!.conclusion = "failure";
+    expect(evaluateReadiness(snapshot({ runs: [run()], suites }), timing).kind).toBe("fail");
+  });
+
+  it.each([0, 1, null, undefined])("preserves required-run and legacy-status verdicts with suite count %s", (latestCheckRunsCount) => {
+    const suites = [suite(2, { status: "queued", conclusion: null, completedAt: null, latestCheckRunsCount })];
+    for (const result of ["success", "failure"]) {
+      for (const input of [
+        snapshot({ required: [{ context: "build", appId: 7 }], runs: [run(1, { suiteId: null, conclusion: result })], suites }),
+        snapshot({ required: [{ context: "legacy", appId: null }], statuses: [{ id: 1, context: "legacy", state: result }], suites }),
+        snapshot({ runs: [run(1, { conclusion: result })], suites }),
+      ]) {
+        expect(evaluateReadiness(input, timing).kind).toBe(latestCheckRunsCount === 0 ? result === "success" ? "pass" : "fail" : "pending");
+      }
+    }
+  });
+
+  it.each(["queued", "in_progress"])("retains zero-count %s suites referenced by observed runs", (status) => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }], runs: [run()],
+      suites: [suite(1, { status, conclusion: null, completedAt: null, latestCheckRunsCount: 0 })],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"] });
+    input.required = [];
+    expect(evaluateReadiness(input, timing).kind).toBe("pending");
+    input.required = [{ context: "legacy", appId: null }];
+    input.statuses = [{ id: 1, context: "legacy", state: "success" }];
+    expect(evaluateReadiness(input, timing).kind).toBe("pending");
+  });
+
+  it.each(["unknown", "pending", "waiting"])("retains zero-count suites with unrecognized status %s", (status) => {
+    const suites = [suite(2, { status, conclusion: null, completedAt: null, latestCheckRunsCount: 0 })];
+    expect(evaluateReadiness(snapshot({ runs: [run()], suites }), timing).kind).toBe("pending");
+    expect(evaluateReadiness(snapshot({ required: [{ context: "build", appId: 7 }], runs: [run(1, { suiteId: null })], suites }), timing).kind).toBe("pending");
+  });
+
+  it("does not let an empty suite satisfy missing required checks or suppress their grace", () => {
+    const phantom = suite(2, { status: "queued", conclusion: null, completedAt: null, latestCheckRunsCount: 0 });
+    const input = snapshot({ required: [{ context: "build", appId: 7 }], suites: [phantom] });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["build [app 7]"], missingSince: 1_000 });
+    input.suites.push(suite());
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["build [app 7]"], missingSince: 5_000 });
+    input.runs = [run(1, { status: "queued", conclusion: null })];
+    expect(evaluateReadiness(input, timing).kind).toBe("pending");
+  });
+
   it.each(["success", "neutral", "skipped"])("accepts completed %s", (conclusion) => {
     expect(evaluateReadiness(snapshot({ runs: [run(1, { conclusion })] }), timing).kind).toBe("pass");
   });
@@ -304,6 +355,24 @@ describe("CiGithub REST reads", () => {
     expect(calls[0]!.url.pathname).toContain("/rules/branches/release%2Fone");
     expect(calls[1]!.url.pathname).toContain("/branches/release%2Fone/protection/required_status_checks");
     expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("all");
+  });
+
+  it.each([undefined, null, 0, 1])("carries suite run count %s from REST into readiness", async (latest_check_runs_count) => {
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("check-runs")) return response({ total_count: 1, check_runs: [rawRun()] });
+      if (url.pathname.endsWith("check-suites")) return response({ total_count: 2, check_suites: [rawSuite(), {
+        ...rawSuite(2), app: { id: 8 }, status: "queued", conclusion: null, latest_check_runs_count,
+      }] });
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(actual.suites[1]!.latestCheckRunsCount).toBe(latest_check_runs_count ?? null);
+    expect(evaluateReadiness(actual, timing).kind).toBe(latest_check_runs_count === 0 ? "pass" : "pending");
+  });
+
+  it.each([-1, 0.5, "0", false, {}, Number.MAX_SAFE_INTEGER + 1])("rejects malformed suite run count %j", async (latest_check_runs_count) => {
+    const { fetch } = fixtures((url) => url.pathname.endsWith("check-suites")
+      ? response({ total_count: 1, check_suites: [{ ...rawSuite(), latest_check_runs_count }] }) : undefined);
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "response" });
   });
 
   it.each([
