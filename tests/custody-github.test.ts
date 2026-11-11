@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CiGithubCache, type CiFetch, type CiGithubOptions, type CiHttpResponse } from "../src/ci-github.js";
+import { CiGithubCache, CiGithubError, type CiFetch, type CiGithubOptions, type CiHttpResponse } from "../src/ci-github.js";
 import { CustodyGithub, type CustodyPull } from "../src/custody-github.js";
 
 const REPO = "acme/widgets";
@@ -83,6 +83,16 @@ describe("CustodyGithub REST enumeration", () => {
     expect(repos).not.toContain("acme/repo-1");
     expect(calls).toHaveLength(2);
     expect(calls[0]!.url.searchParams.get("type")).toBe("all");
+  });
+
+  it("reports a refused org listing with the endpoint template, never the org name", async () => {
+    const { client } = fixtures((url) => url.pathname === "/orgs/acme/repos"
+      ? response({ message: "Resource not accessible by integration" }, 403, { "x-accepted-github-permissions": "metadata=read" })
+      : undefined);
+    const error = await client.repositories("acme").catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(CiGithubError);
+    expect((error as CiGithubError).message).toBe("GitHub CI http (403) permission org_repos needs=metadata=read");
+    expect((error as CiGithubError).message).not.toContain(TOKEN);
   });
 
   it("lists more than 100 open PRs without search or requiring total_count", async () => {
