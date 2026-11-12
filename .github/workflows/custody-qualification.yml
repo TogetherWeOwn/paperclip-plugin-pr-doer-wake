@@ -33,7 +33,7 @@ jobs:
           node --input-type=module <<'JS'
           import { readFileSync } from 'node:fs';
           const report = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/base-results.json`, 'utf8'));
-          const cases = report.testResults.flatMap(file => file.assertionResults).filter(test => test.status !== 'pending');
+          const cases = report.testResults.flatMap(file => file.assertionResults).filter(test => test.status === 'failed' || test.status === 'passed');
           const names = [
             'rejects a disposition with a blank actor',
             'ignores disposition examples inside ``` fences',
