@@ -316,6 +316,8 @@ interface Page { data: unknown; link: string }
 /** Bounded ETags and rate-limit state only: retain this, not a token-bearing CiGithub. */
 export class CiGithubCache {
   backoffUntil = 0;
+  /** Throttle seen by optional reads only (the ready_for_review timeline); never blocks required reads. */
+  optionalBackoffUntil = 0;
   private bytes = 0;
   private readonly entries = new Map<string, CachedPage>();
   private readonly maxEntries: number;
@@ -412,7 +414,8 @@ export class CiGithub {
     repo = repoName(repo);
     if (!Number.isSafeInteger(prNumber) || prNumber <= 0) throw new CiGithubError("input");
     let since: number | undefined;
-    for (const value of await this.pages(`/repos/${repo}/issues/${prNumber}/timeline`)) {
+    // Optional lane: a throttled timeline must not arm the backoff every required read shares.
+    for (const value of await this.pages(`/repos/${repo}/issues/${prNumber}/timeline`, undefined, false, true)) {
       const event = object(value);
       if (event.event !== "ready_for_review") continue;
       const at = timestamp(event.created_at) ?? invalid();
@@ -587,12 +590,12 @@ export class CiGithub {
     return corroborated;
   }
 
-  private async pages(path: string, field?: string, strict = false): Promise<unknown[]> {
+  private async pages(path: string, field?: string, strict = false, optional = false): Promise<unknown[]> {
     const values: unknown[] = [];
     let expectedTotal = 0;
     const complete = () => strict && values.length !== expectedTotal ? invalid() : values;
     for (let page = 1; page <= this.maxPages; page++) {
-      const result = await this.request(`${path}${path.includes("?") ? "&" : "?"}per_page=${PAGE_SIZE}&page=${page}`);
+      const result = await this.request(`${path}${path.includes("?") ? "&" : "?"}per_page=${PAGE_SIZE}&page=${page}`, undefined, undefined, undefined, optional);
       const envelope = field ? object(result.data) : null;
       const batch = array(envelope ? envelope[field!] : result.data);
       if (batch.length > PAGE_SIZE) return invalid();
@@ -630,7 +633,7 @@ export class CiGithub {
     } catch { return { permissionDenied: false, message: undefined }; }
   }
 
-  private rateLimit(status: number, headers: Record<string, string> | Headers, permissionDenied = false): void {
+  private rateLimit(status: number, headers: Record<string, string> | Headers, permissionDenied = false, optional = false): void {
     const now = this.now();
     const retry = header(headers, "retry-after");
     const remaining = header(headers, "x-ratelimit-remaining");
@@ -647,6 +650,7 @@ export class CiGithub {
     }
     if ((status === 429 || (status === 403 && (!permissionDenied || retry !== undefined))) && until <= now) until = now + 60_000;
     if (remaining === "0" && until <= now) until = now + 60_000;
+    if (optional) { this.cache.optionalBackoffUntil = Math.max(this.cache.optionalBackoffUntil, until); return; }
     this.cache.backoffUntil = Math.max(this.cache.backoffUntil, until);
     this.backoff.until = Math.max(this.backoff.until, until);
   }
@@ -665,8 +669,13 @@ export class CiGithub {
     }
   }
 
-  private async attempt(url: string, headers: Record<string, string>, body?: string): Promise<CiHttpResponse | Response> {
+  private admitBackoff(optional: boolean): void {
     if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
+    if (optional && this.now() < this.cache.optionalBackoffUntil) throw new CiGithubError("backoff", undefined, this.cache.optionalBackoffUntil);
+  }
+
+  private async attempt(url: string, headers: Record<string, string>, body?: string, optional = false): Promise<CiHttpResponse | Response> {
+    this.admitBackoff(optional);
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     this.beforeRequest?.();
     this.requests++;
@@ -679,13 +688,13 @@ export class CiGithub {
     }
   }
 
-  protected async request(path: string, graphqlBody?: string, exchange?: { jwt: string; body: string }, statusBody?: string): Promise<Page> {
+  protected async request(path: string, graphqlBody?: string, exchange?: { jwt: string; body: string }, statusBody?: string, optional = false): Promise<Page> {
     // POSTs are reserved for fixed-origin GraphQL, the installation-token exchange and
     // the single gates commit-status create; none of them reuses a URL-only ETag.
     if (!path.startsWith("/") || path.startsWith("//") || (graphqlBody !== undefined && path !== "/graphql") || (exchange !== undefined && !/^\/app\/installations\/[1-9][0-9]{0,15}\/access_tokens$/.test(path)) || (statusBody !== undefined && !/^\/repos\/[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+\/commits\/[a-f0-9]{40}\/statuses$/.test(path))) throw new CiGithubError("input");
     if ([graphqlBody, exchange, statusBody].filter((part) => part !== undefined).length > 1) throw new CiGithubError("input");
     // Backoff/budget apply before secret resolution as well as to every fetch.
-    if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
+    this.admitBackoff(optional);
     if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
     const token = exchange ? exchange.jwt : typeof this.#credential === "string" ? this.#credential
       : await this.deadline(() => (this.#credential as CiTokenSource).token(path, async (installationId, jwt, body) => {
@@ -708,7 +717,7 @@ export class CiGithub {
     if (graphqlBody !== undefined) headers["Content-Type"] = "application/json";
     let response: CiHttpResponse | Response;
     let unconditionalRetry = false;
-    try { response = await this.attempt(url, headers, exchange?.body ?? graphqlBody ?? statusBody); }
+    try { response = await this.attempt(url, headers, exchange?.body ?? graphqlBody ?? statusBody, optional); }
     catch (error) {
       if (!cached || !(error instanceof CiGithubError) || error.code !== "network") throw error;
       // Some stock SDKs construct Response("", {status:304}) and throw. Never assume
@@ -717,7 +726,7 @@ export class CiGithub {
       unconditionalRetry = true;
       const freshHeaders = { ...headers };
       delete freshHeaders["If-None-Match"];
-      response = await this.attempt(url, freshHeaders);
+      response = await this.attempt(url, freshHeaders, undefined, optional);
     }
     if (!response || !Number.isInteger(response.status) || !response.headers) return invalid();
     // Also fail closed if an SDK/host ignores RequestInit.redirect and follows a redirect.
@@ -725,7 +734,7 @@ export class CiGithub {
     if ("url" in response && response.url && response.url !== url) return invalid();
     const parsedError = await this.parseErrorBody(response);
     const denied = parsedError.permissionDenied;
-    this.rateLimit(response.status, response.headers, denied);
+    this.rateLimit(response.status, response.headers, denied, optional);
     if (response.status === 304) {
       if (!cached || unconditionalRetry) return invalid();
       return { data: this.parse(cached.body, token), link: cached.link };
@@ -737,7 +746,8 @@ export class CiGithub {
       const detail = response.status === 403 || response.status === 429
         ? refusalDetail(response.status, denied, path, response.headers, parsedError.message)
         : undefined;
-      throw new CiGithubError("http", response.status, this.cache.backoffUntil > this.now() ? this.cache.backoffUntil : undefined, detail);
+      const until = optional ? this.cache.optionalBackoffUntil : this.cache.backoffUntil;
+      throw new CiGithubError("http", response.status, until > this.now() ? until : undefined, detail);
     }
     let body: string;
     try { body = typeof response.body === "string" ? response.body : await this.deadline(() => (response as Response).text()); }

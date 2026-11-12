@@ -427,6 +427,31 @@ describe("CiGithub REST reads", () => {
     await expect(new CiGithub(fetch, TOKEN).readySince(REPO, 0)).rejects.toMatchObject({ code: "input" });
   });
 
+  it("keeps a timeline throttle off the backoff that required reads share, and still honours theirs", async () => {
+    let now = 1_000_000;
+    let timelineLimited = true;
+    const { fetch, calls } = fixtures((url) => url.pathname.endsWith("/timeline")
+      ? timelineLimited ? response({ message: "slow down" }, 429, { "Retry-After": "3600" }) : response([])
+      : url.pathname.endsWith("/pulls/2") ? response({ message: "slow down" }, 429, { "Retry-After": "60" }) : undefined);
+    const cache = new CiGithubCache();
+    const backoff = { until: 0 };
+    const github = () => new CiGithub(fetch, TOKEN, { cache, backoff, now: () => now });
+    await expect(github().readySince(REPO, 1)).rejects.toMatchObject({ code: "http", status: 429, retryAt: now + 3_600_000 });
+    expect([cache.backoffUntil, backoff.until]).toEqual([0, 0]);
+    // Required reads (here the PR) are not blocked by the timeline throttle...
+    await expect(github().pull(REPO, 1)).resolves.toMatchObject({ number: 1 });
+    // ...while the timeline itself waits out its own throttle without another request.
+    const before = calls.length;
+    await expect(github().readySince(REPO, 1)).rejects.toMatchObject({ code: "backoff", retryAt: now + 3_600_000 });
+    expect(calls).toHaveLength(before);
+    now += 3_600_000;
+    timelineLimited = false;
+    await expect(github().readySince(REPO, 1)).resolves.toBeUndefined();
+    // A throttle on a required read still stops the optional timeline read.
+    await expect(github().pull(REPO, 2)).rejects.toMatchObject({ code: "http", status: 429 });
+    await expect(github().readySince(REPO, 1)).rejects.toMatchObject({ code: "backoff", retryAt: now + 60_000 });
+  });
+
   it("also accepts the installed SDK's standard Response", async () => {
     const fetch = async () => new Response(JSON.stringify(pullData()), { status: 200 });
     expect((await new CiGithub(fetch, TOKEN).pull(REPO, 1)).headSha).toBe(SHA);
