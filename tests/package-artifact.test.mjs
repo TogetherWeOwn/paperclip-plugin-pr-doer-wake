@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import ts from "typescript";
 import { inspectManifest, validatePaths, validateEntrypoints } from "../scripts/retain-package.mjs";
 
 const paths = ["package.json", "LICENSE", "README.md", "THREAT-MODEL.md", "ACCEPTANCE.md",
@@ -15,6 +17,38 @@ const pkg = {
 };
 const manifest = { id: "togetherweown.pr-doer-wake", version: "0.2.0", apiVersion: 1,
   entrypoints: { worker: "./dist/worker.js" } };
+
+test("rejects production imports of the staged reader", () => {
+  const config = ts.readConfigFile("tsconfig.build.json", ts.sys.readFile);
+  assert.equal(config.error, undefined);
+  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, process.cwd());
+  assert.deepEqual(parsed.errors, []);
+  const fixture = resolve("tests/custody-reader-staged.fixture.ts");
+  const program = ts.createProgram(parsed.fileNames, parsed.options);
+  assert.ok(!program.getSourceFiles().some((file) => resolve(file.fileName) === fixture));
+
+  // TypeScript includes excluded imports, so verify rootDir rejects both forms.
+  for (const source of [
+    'import "../tests/custody-reader-staged.fixture.js";',
+    'void import("../tests/custody-reader-staged.fixture.js");',
+  ]) {
+    const probe = resolve("src/__dormant_boundary_probe__.ts");
+    const host = ts.createCompilerHost(parsed.options);
+    const readFile = host.readFile.bind(host);
+    const fileExists = host.fileExists.bind(host);
+    host.readFile = (path) => resolve(path) === probe ? source : readFile(path);
+    host.fileExists = (path) => resolve(path) === probe || fileExists(path);
+    const withImport = ts.createProgram([...parsed.fileNames, probe], parsed.options, host);
+    assert.ok(ts.getPreEmitDiagnostics(withImport).some((diagnostic) => diagnostic.code === 6059), source);
+  }
+});
+
+test("keeps the staged reader out of the built package", () => {
+  const packed = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { encoding: "utf8" }));
+  const files = packed[0].files.map((file) => file.path);
+  assert.ok(files.some((path) => path === "dist/index.js"));
+  assert.ok(!files.some((path) => path.includes("custody-reader-staged")));
+});
 
 test("allows only the intended package payload", () => {
   validatePaths(paths);
