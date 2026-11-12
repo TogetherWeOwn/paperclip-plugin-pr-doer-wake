@@ -1161,6 +1161,9 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().report.unknown.filter((u: string) => u.startsWith("work_product:"))).toEqual([]);
     expect(h.ledger().audits).toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "work_product_tier_unavailable" }));
     expect(h.ledger().report.rows[0]).toMatchObject({ cardId: ISSUE });
+    // Dispatch is not gated: the idle PR's owner card is woken.
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ledger().report.effects).toBeGreaterThan(0);
   });
   it("fails closed on an unreadable card when another read serves the tier", async () => {
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
