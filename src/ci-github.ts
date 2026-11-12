@@ -672,7 +672,8 @@ export class CiGithub {
         if (!/^[1-9][0-9]{0,15}$/.test(installationId)) throw new CiGithubError("input");
         return (await this.request(`/app/installations/${installationId}/access_tokens`, undefined, { jwt, body: JSON.stringify(body) })).data;
       })).catch((error: unknown) => {
-        (this.#credential as CiTokenSource).invalidate();
+        // A path-shape refusal is a caller error, not a credential failure: keep the source.
+        if (!(error instanceof CiGithubError && error.code === "input")) (this.#credential as CiTokenSource).invalidate();
         if (error instanceof CiGithubError) throw error;
         throw new CiGithubError("auth");
       });

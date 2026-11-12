@@ -199,6 +199,24 @@ describe("App installation authentication", () => {
     }
   });
 
+  it("permits only the exact public App metadata path outside the configured repository", async () => {
+    const auth = new CiAppAuth({ appId: "123", installationId: "456", repo: "example/project", resolvePrivateKey: async () => KEY, now: () => START });
+    const exchange = vi.fn(async (_id: string, _jwt: string, _scope: unknown) => ({ token: TOKEN, expires_at: new Date(START + 3_600_000).toISOString(), repositories: [{ full_name: "example/project" }], permissions: EXPECTED_PERMISSIONS }));
+    await expect(auth.token("/apps/devin-ai-integration", exchange)).resolves.toBe(TOKEN);
+    for (const path of ["/apps/devin-ai-integration/installations", "/apps/Devin", "/apps/", "/apps/a/../repos/x", "/apps/-x", "/app/installations/456/access_tokens", `/apps/${"a".repeat(101)}`]) {
+      await expect(auth.token(path, exchange)).rejects.toThrow("input");
+    }
+    // Refusals neither mint nor poison the source.
+    expect(exchange).toHaveBeenCalledTimes(1);
+    await expect(auth.token("/repos/example/project/pulls/1", exchange)).resolves.toBe(TOKEN);
+  });
+
+  it("keeps the credential after a path-shape refusal so later in-scope reads still work", async () => {
+    const h = fixture();
+    await expect(h.github.pull("example/other", 1)).rejects.toThrow("input");
+    await expect(h.github.pull("example/project", 1)).resolves.toBeTruthy();
+  });
+
   it("refuses other repositories before secret resolution and sanitizes key/host errors", async () => {
     const h = fixture();
     await expect(h.github.pull("example/other", 1)).rejects.toThrow("input");

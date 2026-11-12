@@ -19,6 +19,10 @@ interface AppAuthOptions {
 }
 
 /** Operation-local only. Private fields prevent accidental JSON serialization of credentials. */
+// Public, read-only GitHub App metadata (`GET /apps/<slug>`), used only to verify a
+// commit-status creator's numeric app id. No other path outside the configured repo.
+const APP_METADATA = /^\/apps\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
 export class CiAppAuth implements CiTokenSource {
   #options: AppAuthOptions;
   #deadline: number;
@@ -43,7 +47,7 @@ export class CiAppAuth implements CiTokenSource {
   expired(): boolean { return this.#now() >= this.#deadline; }
 
   async token(path: string, exchange: CiTokenExchange): Promise<string> {
-    if (!path.startsWith(`/repos/${this.#options.repo}/`)) throw new CiGithubError("input");
+    if (!path.startsWith(`/repos/${this.#options.repo}/`) && !(path.length <= 106 && APP_METADATA.test(path))) throw new CiGithubError("input");
     if (this.#now() >= this.#deadline) { this.invalidate(); throw new CiGithubError("timeout"); }
     if (this.#failed) throw new CiGithubError("auth");
     if (this.#token && this.#token.expiresAt > this.#now() + MARGIN_MS) return this.#token.value;

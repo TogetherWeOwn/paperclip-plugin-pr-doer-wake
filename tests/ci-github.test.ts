@@ -4,6 +4,8 @@ import {
   type CiCheckRun, type CiCheckSuite, type CiFetch, type CiHttpResponse, type CiSnapshot,
   type CiTokenExchange, type CiTokenSource,
 } from "../src/ci-github.js";
+import { generateKeyPairSync } from "node:crypto";
+import { CiAppAuth, APP_PERMISSIONS } from "../src/ci-auth.js";
 
 const REPO = "acme/widgets";
 const SHA = "a".repeat(40);
@@ -376,6 +378,25 @@ describe("CiGithub REST reads", () => {
     expect(calls[0]!.url.pathname).toContain("/rules/branches/release%2Fone");
     expect(calls[1]!.url.pathname).toContain("/branches/release%2Fone/protection/required_status_checks");
     expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("all");
+  });
+
+  it("verifies a Devin status through real GitHub App auth without poisoning the credential", async () => {
+    const pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const { fetch: base, calls } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "Devin Review", app_id: 811515 }] });
+      if (url.pathname.endsWith("statuses")) return response([{ id: 1, context: "Devin Review", state: "success", creator: { login: "devin-ai-integration[bot]" } }]);
+      if (url.pathname === "/apps/devin-ai-integration") return response({ id: 811515 });
+    });
+    const fetch: CiFetch = async (input, init) => init?.method === "POST"
+      ? response({ token: TOKEN, expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: { ...APP_PERMISSIONS, metadata: "read" }, repositories: [{ full_name: REPO }] }, 201)
+      : base(input, init);
+    const auth = new CiAppAuth({ appId: "123", installationId: "456", repo: REPO, resolvePrivateKey: async () => pem });
+    const github = new CiGithub(fetch, auth);
+    const actual = await github.snapshot(REPO, SHA, "main", new Map());
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", missing: [] });
+    expect(calls.some(({ url }) => url.pathname === "/apps/devin-ai-integration")).toBe(true);
+    // The same cycle credential still serves later repository reads.
+    await expect(github.snapshot(REPO, SHA, "main", new Map())).resolves.toBeTruthy();
   });
 
   it("verifies app status creators and caches slug lookups only for the supplied cycle", async () => {
