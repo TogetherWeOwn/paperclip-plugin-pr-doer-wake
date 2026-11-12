@@ -595,6 +595,7 @@ export class CiWakeRuntime {
     let wakes = 0;
     // Tokens are reusable only within this bounded poll, never a runtime field/state.
     const cycle = new Map<string, CiAppAuth>();
+    const appIdsByIdentity = new Map<string, Map<string, number | null>>();
     const fetch: PluginContext["http"]["fetch"] = async (url, init) => {
       if (++requests > LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
       return this.ctx.http.fetch(url, init);
@@ -620,11 +621,14 @@ export class CiWakeRuntime {
           }
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
-        const snapshot = await github.snapshot(wait.repo, wait.headSha, pr.baseBranch);
+        const identity = `${wait.companyId}:${authIdentity(config)}`;
+        let appIds = appIdsByIdentity.get(identity);
+        if (!appIds) { appIds = new Map(); appIdsByIdentity.set(identity, appIds); }
+        const snapshot = await github.snapshot(wait.repo, wait.headSha, pr.baseBranch, appIds);
         const samples = ledger.samples[`${wait.companyId}:${wait.repo}`] ?? [];
         const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
-        const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs });
+        const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
         if (verdict.kind === "pending") continue;
         await this.checkBinding(wait);
         const freshConfig = await this.config(wait.companyId);
@@ -639,6 +643,7 @@ export class CiWakeRuntime {
         await this.checkBinding(wait);
         const revalidated = await this.config(wait.companyId);
         if (!revalidated.allowedRepos.includes(wait.repo) || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
+        if (current.draft !== pr.draft) continue;
         if (current.number !== wait.prNumber || current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo) {
           if (current.number === wait.prNumber && current.state === "open" && !current.merged && current.headSha !== wait.headSha && current.headRepo?.toLowerCase() === wait.repo) {
             this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, current.headSha);
@@ -727,7 +732,7 @@ export class CiWakeRuntime {
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
           const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
-          const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs });
+          const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
           if (verdict.kind === "pending") continue;
           // Mirror the CI path: re-read the live PR after the readiness
@@ -741,6 +746,7 @@ export class CiWakeRuntime {
             entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
             await this.save(ledger); continue;
           }
+          if (checked.draft !== current.draft) continue;
           if (checked.baseBranch !== current.baseBranch) {
             // Base-only edit: the head the reviewer last saw is unchanged, so
             // keep oldSha/newSha (never collapse them into a meaningless

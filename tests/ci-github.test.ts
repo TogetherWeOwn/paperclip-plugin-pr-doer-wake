@@ -4,6 +4,8 @@ import {
   type CiCheckRun, type CiCheckSuite, type CiFetch, type CiHttpResponse, type CiSnapshot,
   type CiTokenExchange, type CiTokenSource,
 } from "../src/ci-github.js";
+import { generateKeyPairSync } from "node:crypto";
+import { CiAppAuth, APP_PERMISSIONS } from "../src/ci-auth.js";
 
 const REPO = "acme/widgets";
 const SHA = "a".repeat(40);
@@ -226,10 +228,56 @@ describe("evaluateReadiness", () => {
       required: [{ context: "build", appId: 7 }], runs: [run(99, { appId: 8 })],
       statuses: [{ id: 100, context: "build", state: "success" }],
     });
+    // Another source alone is not a report from app 7: the check is still missing.
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"], failed: [] });
+    expect(evaluateReadiness(input, { ...timing, draft: true })).toMatchObject({ kind: "pending", missing: ["build [app 7]"], failed: [] });
+    input.statuses = [];
     expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"] });
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["build [app 7]"], failed: [] });
     input.runs.push(run(1, { status: "queued", conclusion: null }));
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: [] });
+  });
+
+  it("judges only the current status: unverified defers, another source never passes", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }], runs: [run()],
+      statuses: [{ id: 2, context: "build", state: "failure", creatorLogin: "app[bot]", verifiedAppId: null }],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"], failed: [] });
+    input.statuses.push({ id: 3, context: "build", state: "success", creatorLogin: "APP[bot]", verifiedAppId: 7 });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [] });
+    input.statuses.push({ id: 4, context: "build", state: "error", creatorLogin: "other[bot]", verifiedAppId: null });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"] });
+    input.statuses.push({ id: 5, context: "build", state: "success", creatorLogin: "other[bot]", verifiedAppId: 8 });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", pending: [], failed: ["build [app 7]"], missing: [] });
+    input.statuses.push({ id: 6, context: "build", state: "success", creatorLogin: "app[bot]", verifiedAppId: 7 });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [], missing: [] });
+  });
+
+  it.each([
+    ["another app", "failure", { creatorLogin: "other[bot]", verifiedAppId: 999 }],
+    ["another app", "success", { creatorLogin: "other[bot]", verifiedAppId: 999 }],
+    ["a human", "failure", { creatorLogin: "octocat" }],
+    ["a human", "success", { creatorLogin: "octocat" }],
+  ] as const)("never passes an older required-app success under a newer status from %s (%s)", (_source, state, creator) => {
+    const input = snapshot({
+      required: [{ context: "Devin Review", appId: 811515 }],
+      statuses: [
+        { id: 10, context: "Devin Review", state: "success", creatorLogin: "devin-ai-integration[bot]", verifiedAppId: 811515 },
+        { id: 11, context: "Devin Review", state, ...creator },
+      ],
+    });
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "fail", failed: ["Devin Review [app 811515]"], missing: [] });
+  });
+
+  it("never lets a foreign status hide a failed required run while a suite is active", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }],
+      suites: [suite(1, { status: "in_progress", conclusion: null, completedAt: null })],
+      runs: [run(1, { conclusion: "failure" })], currentAttemptRunIds: [1],
+      statuses: [{ id: 2, context: "build", state: "success", creatorLogin: "other[bot]", verifiedAppId: 8 }],
+    });
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "fail", failed: ["build [app 7]"], missing: [], pending: [] });
   });
 
   it("keeps latest runs separately per app, including unbound context collisions", () => {
@@ -237,6 +285,25 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(snapshot({ runs }), timing).kind).toBe("fail");
     expect(evaluateReadiness(snapshot({ runs, required: [{ context: "build", appId: 8 }] }), timing).kind).toBe("pass");
     expect(evaluateReadiness(snapshot({ runs, required: [{ context: "build", appId: null }] }), timing).kind).toBe("fail");
+  });
+
+  it("restarts missing-check grace when a draft is first seen ready", () => {
+    const input = snapshot({ required: [{ context: "build", appId: 7 }] });
+    const stale = { ...timing, registeredAt: 0, now: 10_000 };
+    expect(evaluateReadiness(input, stale)).toMatchObject({ kind: "fail", missing: ["build [app 7]"] });
+    expect(evaluateReadiness(input, { ...stale, readySince: 9_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"], missingSince: 9_000 });
+    expect(evaluateReadiness(input, { ...stale, readySince: 9_000, now: 9_000 + 2 * stale.medianMs })).toMatchObject({ kind: "fail" });
+    input.runs.push(run(1, { conclusion: "failure" }));
+    input.required.push({ context: "lint", appId: 7 });
+    expect(evaluateReadiness(input, { ...stale, readySince: 9_000 })).toMatchObject({ kind: "pending", failed: ["build [app 7]"] });
+    expect(() => evaluateReadiness(input, { ...stale, readySince: Number.NaN })).toThrow();
+  });
+
+  it("keeps missing draft checks pending but reports real failures", () => {
+    const input = snapshot({ required: [{ context: "build", appId: 7 }, { context: "review", appId: 8 }] });
+    expect(evaluateReadiness(input, { ...timing, draft: true })).toMatchObject({ kind: "pending", missing: ["build [app 7]", "review [app 8]"] });
+    input.runs.push(run(1, { conclusion: "failure" }));
+    expect(evaluateReadiness(input, { ...timing, draft: true })).toMatchObject({ kind: "fail", failed: ["build [app 7]"], missing: ["review [app 8]"] });
   });
 
   it("starts missing grace at registration only when there are no suites", () => {
@@ -355,6 +422,78 @@ describe("CiGithub REST reads", () => {
     expect(calls[0]!.url.pathname).toContain("/rules/branches/release%2Fone");
     expect(calls[1]!.url.pathname).toContain("/branches/release%2Fone/protection/required_status_checks");
     expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("all");
+  });
+
+  it("verifies a Devin status through real GitHub App auth without poisoning the credential", async () => {
+    const pem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const { fetch: base, calls } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "Devin Review", app_id: 811515 }] });
+      if (url.pathname.endsWith("statuses")) return response([{ id: 1, context: "Devin Review", state: "success", creator: { login: "devin-ai-integration[bot]" } }]);
+      if (url.pathname === "/apps/devin-ai-integration") return response({ id: 811515 });
+    });
+    const fetch: CiFetch = async (input, init) => init?.method === "POST"
+      ? response({ token: TOKEN, expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: { ...APP_PERMISSIONS, metadata: "read" }, repositories: [{ full_name: REPO }] }, 201)
+      : base(input, init);
+    const auth = new CiAppAuth({ appId: "123", installationId: "456", repo: REPO, resolvePrivateKey: async () => pem });
+    const github = new CiGithub(fetch, auth);
+    const actual = await github.snapshot(REPO, SHA, "main", new Map());
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", missing: [] });
+    expect(calls.some(({ url }) => url.pathname === "/apps/devin-ai-integration")).toBe(true);
+    // The same cycle credential still serves later repository reads.
+    await expect(github.snapshot(REPO, SHA, "main", new Map())).resolves.toBeTruthy();
+  });
+
+  it("verifies app status creators and caches slug lookups only for the supplied cycle", async () => {
+    const { fetch, calls } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "Devin Review", app_id: 811515 }] });
+      if (url.pathname.endsWith("statuses")) return response([
+        { id: 1, context: "Devin Review", state: "success", creator: { login: "other[bot]" } },
+        { id: 2, context: "Devin Review", state: "success", creator: { login: "devin-ai-integration[bot]" } },
+      ]);
+      if (url.pathname === "/apps/devin-ai-integration") return response({ id: 811515 });
+      if (url.pathname === "/apps/other") return response({ id: 123 });
+    });
+    const github = new CiGithub(fetch, TOKEN);
+    const cycle = new Map<string, number | null>();
+    const actual = await github.snapshot(REPO, SHA, "main", cycle);
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", missing: [] });
+    expect(evaluateReadiness({ ...actual, statuses: actual.statuses.filter((status) => status.verifiedAppId !== 811515) }, timing))
+      .toMatchObject({ kind: "fail", missing: ["Devin Review [app 811515]"], failed: [] });
+    await github.snapshot(REPO, SHA, "main", cycle);
+    expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(2);
+    await github.snapshot(REPO, SHA, "main");
+    expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(4);
+  });
+
+  it.each([403, 404])("keeps HTTP %i app identity unknown even with verified evidence", async (status) => {
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "review", app_id: 7 }] });
+      if (url.pathname.endsWith("statuses")) return response([
+        { id: 1, context: "review", state: "success", creator: { login: "verified[bot]" } },
+        { id: 2, context: "review", state: "success", creator: { login: "wrong[bot]" } },
+        { id: 3, context: "review", state: "success", creator: { login: "unknown[bot]" } },
+      ]);
+      if (url.pathname === "/apps/unknown") return response({ message: "Resource not accessible by integration" }, status);
+      if (url.pathname === "/apps/verified") return response({ id: 7 });
+      if (url.pathname === "/apps/wrong") return response({ id: 8 });
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pending", pending: ["review [app 7]"], missing: [] });
+    const unknown = actual.statuses.filter((item) => item.creatorLogin === "unknown[bot]");
+    expect(evaluateReadiness({ ...actual, statuses: unknown }, timing))
+      .toMatchObject({ kind: "pending", pending: ["review [app 7]"], missing: [] });
+    const wrong = actual.statuses.filter((item) => item.creatorLogin === "wrong[bot]");
+    expect(evaluateReadiness({ ...actual, statuses: wrong }, timing))
+      .toMatchObject({ kind: "fail", missing: ["review [app 7]"], failed: [] });
+  });
+
+  it.each([401, 429, 500])("does not turn app lookup HTTP %i into a missing check", async (status) => {
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "review", app_id: 7 }] });
+      if (url.pathname.endsWith("statuses")) return response([{ id: 1, context: "review", state: "success", creator: { login: "reviewer[bot]" } }]);
+      if (url.pathname === "/apps/reviewer") return response({}, status);
+    });
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "http", status });
   });
 
   it.each([undefined, null, 0, 1])("carries suite run count %s from REST into readiness", async (latest_check_runs_count) => {

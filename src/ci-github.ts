@@ -61,6 +61,8 @@ export interface CiCommitStatus {
   id: number;
   context: string;
   state: string;
+  creatorLogin?: string | null;
+  verifiedAppId?: number | null;
 }
 export interface CiSnapshot {
   repo: string;
@@ -98,6 +100,9 @@ export interface CiReadinessTiming {
   now: number;
   registeredAt: number;
   medianMs: number;
+  draft?: boolean;
+  /** When the PR was first seen ready after being seen as a draft. */
+  readySince?: number;
 }
 export interface CiReadiness {
   kind: "pending" | "pass" | "fail";
@@ -398,7 +403,7 @@ export class CiGithub {
     };
   }
 
-  async snapshot(repo: string, sha: string, baseBranch: string): Promise<CiSnapshot> {
+  async snapshot(repo: string, sha: string, baseBranch: string, appIds = new Map<string, number | null>()): Promise<CiSnapshot> {
     repo = repoName(repo);
     sha = fullSha(sha);
     baseBranch = branchName(baseBranch);
@@ -457,8 +462,25 @@ export class CiGithub {
     // /status is a combined, truncated summary. /statuses is the paginated history we need.
     const statuses = (await this.pages(`${root}/commits/${sha}/statuses`)).map((value): CiCommitStatus => {
       const status = object(value);
-      return { id: id(status.id), context: text(status.context), state: text(status.state) };
+      const result: CiCommitStatus = { id: id(status.id), context: text(status.context), state: text(status.state) };
+      if (status.creator != null) result.creatorLogin = text(object(status.creator).login);
+      return result;
     });
+    for (const status of statuses) {
+      if (!required.some((check) => check.appId !== null && check.context === status.context)) continue;
+      const match = /^([a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*)\[bot\]$/.exec(status.creatorLogin ?? "");
+      if (!match || match[1]!.length > 100) continue;
+      const slug = match[1]!.toLowerCase();
+      if (!appIds.has(slug)) {
+        try {
+          appIds.set(slug, id(object((await this.request(`/apps/${slug}`)).data).id));
+        } catch (error) {
+          if (!(error instanceof CiGithubError && error.code === "http" && !error.retryAt && (error.status === 403 || error.status === 404))) throw error;
+          appIds.set(slug, null);
+        }
+      }
+      status.verifiedAppId = appIds.get(slug) ?? null;
+    }
     const unique = new Map(required.map((check) => [JSON.stringify([check.context, check.appId]), check]));
     const relevant = latest(runs, (run) => JSON.stringify([run.name, run.appId])).filter((run) =>
       [...unique.values()].some((check) => check.context === run.name && (check.appId === null || check.appId === run.appId)));
@@ -652,7 +674,8 @@ export class CiGithub {
         if (!/^[1-9][0-9]{0,15}$/.test(installationId)) throw new CiGithubError("input");
         return (await this.request(`/app/installations/${installationId}/access_tokens`, undefined, { jwt, body: JSON.stringify(body) })).data;
       })).catch((error: unknown) => {
-        (this.#credential as CiTokenSource).invalidate();
+        // A path-shape refusal is a caller error, not a credential failure: keep the source.
+        if (!(error instanceof CiGithubError && error.code === "input")) (this.#credential as CiTokenSource).invalidate();
         if (error instanceof CiGithubError) throw error;
         throw new CiGithubError("auth");
       });
@@ -778,7 +801,7 @@ export function relevantSuites(snapshot: CiSnapshot): CiSnapshot["suites"] {
 
 /** Pure, conservative readiness: no network, wall clock, branch fallback, or PR body policy. */
 export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTiming): CiReadiness {
-  if (![timing.now, timing.registeredAt, timing.medianMs].every(Number.isFinite) || timing.medianMs <= 0) {
+  if (![timing.now, timing.registeredAt, timing.medianMs, timing.readySince ?? 0].every(Number.isFinite) || timing.medianMs <= 0) {
     throw new CiGithubError("input");
   }
   const runs = latest(snapshot.runs, (run) => JSON.stringify([run.name, run.appId]));
@@ -790,8 +813,11 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   const completions = suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
   const lastSuiteCompletedAt = completions.length ? Math.max(...completions) : null;
   // A partial set of completions cannot start grace while another suite may still register checks.
-  const missingSince = suites.length === 0 ? timing.registeredAt
+  const settledSince = suites.length === 0 ? timing.registeredAt
     : completions.length === suites.length ? lastSuiteCompletedAt : null;
+  // Checks that only run on ready PRs register after the draft flips, so
+  // missing-check grace restarts when the PR was last seen leaving draft.
+  const missingSince = settledSince === null ? null : Math.max(settledSince, timing.readySince ?? settledSince);
   const missingFailAt = missingSince === null ? null : missingSince + 2 * timing.medianMs;
   const failed: string[] = [];
   const missing: string[] = [];
@@ -806,9 +832,23 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   if (snapshot.required.length) {
     for (const required of snapshot.required) {
       const matchingRuns = runs.filter((run) => run.name === required.context && (required.appId === null || run.appId === required.appId));
-      // Legacy statuses have no authenticated app ID: never infer one from creator.id.
-      const matchingStatuses = required.appId === null ? statuses.filter((status) => status.context === required.context) : [];
-      if (!matchingRuns.length && !matchingStatuses.length) missing.push(label(required));
+      // A context's state is its latest status, whoever set it. An app-bound
+      // requirement counts only that status, and only when a verified app
+      // lookup proves the required app set it: an older success from the
+      // required app never outlives a newer status from anyone else.
+      const current = statuses.find((status) => status.context === required.context);
+      const matchingStatuses = current && (required.appId === null || current.verifiedAppId === required.appId) ? [current] : [];
+      // A failed lookup is not proof of a different app, even when a matching run exists.
+      const unverified = required.appId !== null && current?.verifiedAppId === null;
+      // GitHub refuses the merge while another source holds the current status.
+      // Once the required app has reported for this head, that is a definite
+      // failure, so it never waits on grace or hides a failed run. Before the
+      // app reports, it only means the check is still missing.
+      const foreign = required.appId !== null && current !== undefined && !unverified && !matchingStatuses.length;
+      const appReported = matchingRuns.length > 0 || snapshot.statuses.some((status) => status.context === required.context && status.verifiedAppId === required.appId);
+      if (unverified) pending.push(label(required));
+      if (foreign && appReported) record(label(required), "fail");
+      else if (foreign || !matchingRuns.length && !matchingStatuses.length && !unverified) missing.push(label(required));
       for (const run of matchingRuns) {
         // An active suite can hide a required rerun not yet materialized. Only
         // positive current-attempt job evidence permits same-suite optional work.
@@ -826,9 +866,9 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
     for (const suite of suites) record(`suite [app ${suite.appId ?? "unknown"}]`, conclusion(suite.status, suite.conclusion));
     if (!runs.length && !statuses.length && !suites.length) pending.push("checks not registered");
   }
-  const missingExpired = missing.length > 0 && pending.length === 0 && missingFailAt !== null && timing.now >= missingFailAt;
+  const missingExpired = !timing.draft && missing.length > 0 && pending.length === 0 && missingFailAt !== null && timing.now >= missingFailAt;
   return {
-    kind: pending.length || (missing.length && !missingExpired) ? "pending" : failed.length || missingExpired ? "fail" : "pass",
+    kind: pending.length || (missing.length && !missingExpired && !(timing.draft && failed.length)) ? "pending" : failed.length || missingExpired ? "fail" : "pass",
     failed: [...new Set(failed)], missing: [...new Set(missing)], pending: [...new Set(pending)],
     lastSuiteCompletedAt, missingSince, missingFailAt,
   };

@@ -592,9 +592,50 @@ describe("CI runtime polling and durable wake outcomes", () => {
     await h.runtime.poll();
     expect(h.ledger().waits[0]?.status).toBe("open");
     expect(h.requestWakeup).not.toHaveBeenCalled();
-    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main");
-    expect(github.readiness).toHaveBeenCalledWith(expect.anything(), { registeredAt: START, now: START + 60_000, medianMs: 120_000 });
+    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main", expect.any(Map));
+    expect(github.readiness).toHaveBeenCalledWith(expect.anything(), { registeredAt: START, now: START + 60_000, medianMs: 120_000, draft: false });
     expect(h.ledger().audits.filter((entry) => entry.operation === "wake")).toEqual([]);
+  });
+
+  it.each([false, true])("keeps missing draft checks pending and wakes on real failures (failure=%s)", async (failure) => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    h.advance(180_000);
+    github.pull.mockResolvedValue(pull({ draft: true }));
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 8 }, { context: "build", appId: 7 }], statuses: [], suites: [],
+      runs: failure ? [{ id: 1, name: "build", appId: 7, suiteId: null, status: "completed", conclusion: "failure" }] : [],
+    });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(failure ? 1 : 0);
+    expect(h.ledger().waits[0]?.status).toBe(failure ? "woken" : "open");
+  });
+
+  it("does not wake a ready PR when required status identity is unverified", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    h.advance(180_000);
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 7 }], runs: [], suites: [],
+      statuses: [{ id: 1, context: "review", state: "success", creatorLogin: "unknown[bot]", verifiedAppId: null }],
+    });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+  });
+
+  it("does not wake when draft state changes during the final read", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.pull.mockResolvedValueOnce(pull({ draft: false })).mockResolvedValueOnce(pull({ draft: true }));
+    github.readiness.mockReturnValue(verdict("fail"));
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
   });
 
   it.each(["pass", "fail"] as const)("wakes once for CI %s with stable per-wait idempotency and survives restart", async (kind) => {
@@ -1469,7 +1510,7 @@ describe("signed check_suite hints", () => {
     // and the authoritative fresh snapshot says failure. Only the last determines readiness.
     await h.runtime.webhook(webhook({ parsedBody: { action: "completed", check_suite: { head_sha: NEXT_HEAD }, repository: { full_name: "evil/repo" } } }));
     expect(h.resolveSecret).toHaveBeenCalledWith(WEBHOOK_REF, { companyId: COMPANY, configPath: "webhookSecretRef" });
-    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main");
+    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main", expect.any(Map));
     expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ reason: expect.stringContaining("CI fail") }));
     expect(h.ledger().deliveries[`${COMPANY}:${DELIVERY}`]).toBe(START);
   });
@@ -1503,7 +1544,7 @@ describe("signed check_suite hints", () => {
     github.readiness.mockReturnValue(verdict("pass"));
     await h.runtime.webhook(webhook({ payload: { organization: undefined } }));
     expect(h.resolveSecret).toHaveBeenCalledWith(WEBHOOK_REF, { companyId: COMPANY, configPath: "webhookSecretRef" });
-    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main");
+    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main", expect.any(Map));
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
   });
 
@@ -1607,7 +1648,7 @@ describe("signed check_suite hints", () => {
     github.readiness.mockReturnValue(verdict("pass"));
     await h.runtime.webhook(webhook({ event, payload }));
     expect(h.resolveSecret).toHaveBeenCalledWith(WEBHOOK_REF, { companyId: COMPANY, configPath: "webhookSecretRef" });
-    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main");
+    expect(github.snapshot).toHaveBeenCalledWith(REPO, HEAD, "main", expect.any(Map));
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
   });
 
