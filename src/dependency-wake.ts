@@ -14,7 +14,7 @@ import { retryableBeforeQueue } from "./native-wake.js";
  */
 export const DEPENDENCY_WAKE_LIMITS = {
   graceMs: 600_000, lookbackMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000,
-  // hostReads 805 is the 800 cap plus the five reads a full-fan-in candidate needs now that every blocker summary is read for the barrier.
+  // hostReads 805 is the 800 cap plus the five reads a full-fan-in candidate needs once every blocker summary is read for the barrier.
   maxPerStatus: 1_000, hostReads: 805, wakesPerTick: 10, tickMs: 120_000, audits: 500,
   // Supported fan-in: more than 400 blockers per candidate cannot be verified in one
   // tick's read budget, so it is audited, deferred and reported incomplete.
@@ -189,8 +189,8 @@ export class DependencyWakeRuntime {
     const blockers = (await tick.read(() => this.ctx.issues.relations.get(issue.id, companyId))).blockedBy as Blocker[];
     // Any open (or cancelled) blocker: core treats it as unresolved, and so do we.
     if (!blockers.length || blockers.some((b) => b.status !== "done")) return;
-    // Fan-in beyond the supported bound cannot be verified in one tick's read
-    // budget: audit and defer (tick reported incomplete), never a quiet pass.
+    // Fan-in beyond the supported bound cannot be verified in one tick's read budget:
+    // audit and defer (tick reported incomplete), never a quiet pass.
     if (blockers.length > L.maxBlockers) { tick.audit("blocker_fan_in", issue.id); tick.deferred = true; return; }
     const doneAt = new Map<string, number>();
     for (const b of blockers) {

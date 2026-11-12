@@ -368,14 +368,13 @@ describe("dependency wake", () => {
     expect(h.ledger()?.receipts).toEqual({});
   });
 
-  // An excluded blocker is receipted AND out-of-lookback: covers both exclusion classes at once.
-  type H = ReturnType<typeof harness>;
-  const excluded = (h: H) => { h.seed({ version: 1, audits: [], receipts: { [rk(DEP, BLK, DONE)]: { at: START - 25 * MIN, outcome: "woken", blockerDoneAt: DONE } } }); h.issues[BLK]!.completedAt = iso(START - 8 * 1_440 * MIN); }; // receipted + out-of-lookback  const liveRun = (h: H) => { h.runs[BLK]!.push({ id: "rv", issueId: BLK, agentId: REVIEWER, status: "running", createdAt: iso(START - 5 * MIN), startedAt: iso(START - 5 * MIN), finishedAt: null }); };
-  const truncRun = (h: H) => { h.runs[BLK] = Array.from({ length: 100 }, (_, i) => ({ id: `b${i}`, issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 40 * MIN + i * 1_000), startedAt: iso(START - 40 * MIN + i * 1_000), finishedAt: iso(START - 40 * MIN + i * 1_000 + 500) })); }; // a full 100-run window
-  const addTrigger = (h: H) => { h.issues[BLK2] = { id: BLK2, companyId: COMPANY, status: "done", completedAt: iso(START - 15 * MIN) };
+  const excluded = (h: ReturnType<typeof harness>) => { h.seed({ version: 1, audits: [], receipts: { [rk(DEP, BLK, DONE)]: { at: START - 25 * MIN, outcome: "woken", blockerDoneAt: DONE } } }); h.issues[BLK]!.completedAt = iso(START - 8 * 1_440 * MIN); };
+  const liveRun = (h: ReturnType<typeof harness>) => { h.runs[BLK]!.push({ id: "rv", issueId: BLK, agentId: REVIEWER, status: "running", createdAt: iso(START - 5 * MIN), startedAt: iso(START - 5 * MIN), finishedAt: null }); };
+  const truncRun = (h: ReturnType<typeof harness>) => { h.runs[BLK] = Array.from({ length: 100 }, (_, i) => ({ id: `b${i}`, issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 40 * MIN + i * 1_000), startedAt: iso(START - 40 * MIN + i * 1_000), finishedAt: iso(START - 40 * MIN + i * 1_000 + 500) })); };
+  const addTrigger = (h: ReturnType<typeof harness>) => { h.issues[BLK2] = { id: BLK2, companyId: COMPANY, status: "done", completedAt: iso(START - 15 * MIN) };
     h.runs[BLK2] = [{ id: "b2", issueId: BLK2, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN), startedAt: iso(START - 20 * MIN), finishedAt: iso(START - 15 * MIN) }];
     h.relations[DEP]!.push({ id: BLK2, identifier: "TWO-2", status: "done" }); };
-  const settledBlockers = (h: H, depId: string, count: number, first = 0) => {
+  const settledBlockers = (h: ReturnType<typeof harness>, depId: string, count: number, first = 0) => {
     const rels = (h.relations[depId] ??= []);
     for (let n = 0; n < count; n += 1) { // `count` done blockers settled T-30m
       const id = filler(first + n);
@@ -385,12 +384,14 @@ describe("dependency wake", () => {
     }
   };
   it("defers an eligible epoch while an excluded blocker is live or unbounded", async () => {
-    for (const m of [liveRun, truncRun]) { // live run, then an unbounded 100-run window
+    for (const m of [liveRun, truncRun]) { // a live run, then an unbounded 100-run window
       const h = harness();
-      m(h); excluded(h); addTrigger(h); await h.runtime.poll();      expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+      m(h); excluded(h); addTrigger(h); await h.runtime.poll();
+      expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
       expect(h.ledger()?.receipts[rk(DEP, BLK2, START - 15 * MIN)]).toBeUndefined();
-      if (m !== liveRun) continue;      Object.assign(h.runs[BLK]!.at(-1)!, { status: "succeeded", finishedAt: iso(START - 4 * MIN) });
-      await h.runtime.poll(); await h.runtime.poll(); // wakes once, then stays deduped
+      if (m !== liveRun) continue; // excluded live run finishes -> deferred epoch wakes once
+      Object.assign(h.runs[BLK]!.at(-1)!, { status: "succeeded", finishedAt: iso(START - 4 * MIN) });
+      await h.runtime.poll(); await h.runtime.poll(); // woken once, stays deduped
       expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
       expect(h.ledger()?.receipts[rk(DEP, BLK2, START - 15 * MIN)]?.outcome).toBe("woken");
     }
@@ -399,23 +400,22 @@ describe("dependency wake", () => {
     const h = harness();
     Object.assign(h.runs[DEP]![0]!, { createdAt: iso(START - 29 * MIN), startedAt: iso(START - 29 * MIN), finishedAt: iso(START - 28 * MIN) }); // assignee last ran T-29m: the 399 seen
     h.relations[DEP] = []; settledBlockers(h, DEP, 399); addTrigger(h); await h.runtime.poll();
-    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);    const reads = h.ctx.issues.list.mock.calls.length + h.ctx.issues.relations.get.mock.calls.length + h.ctx.issues.get.mock.calls.length + h.ctx.issues.summaries.getOrchestration.mock.calls.length + h.ctx.config.get.mock.calls.length - 1;
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1); // woken exactly once
+    const reads = h.ctx.issues.list.mock.calls.length + h.ctx.issues.relations.get.mock.calls.length + h.ctx.issues.get.mock.calls.length + h.ctx.issues.summaries.getOrchestration.mock.calls.length + h.ctx.config.get.mock.calls.length - 1;
     expect(reads).toBeLessThanOrEqual(805);
     expect(h.ctx.issues.summaries.getOrchestration.mock.calls.length).toBe(401); // one read per blocker, reused for settlement
-    settledBlockers(h, DEP, 1, 999); // a 401st blocker: unsupported fan-in defers
-    await h.runtime.poll();
+    settledBlockers(h, DEP, 1, 999); await h.runtime.poll(); // a 401st blocker: unsupported fan-in
     expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("blocker_fan_in");
-    expect(h.ledger()?.lastTick?.complete).toBe(false);
+    expect(h.ledger()?.lastTick?.complete).toBe(false); // incomplete, not a quiet pass
   });
   it("retries a candidate that ran out of the shared budget on a fresh tick", async () => {
     const h = harness();
-    // An id-sorted-earlier candidate consumes the whole 805-read tick: 400 blockers
-    // that pass the barrier but all settled before its own last run (T-10m), no trigger.
+    // An id-sorted-earlier candidate consumes the whole tick: 400 blockers that pass
+    // the barrier but all settled before its own last run (T-10m), no trigger.
     const early = filler(0);
     h.issues[early] = { id: early, companyId: COMPANY, status: "in_review", assigneeAgentId: AGENT, activeRun: null };
     h.runs[early] = [{ id: "e1", issueId: early, agentId: AGENT, status: "succeeded", createdAt: iso(START - 10 * MIN), startedAt: iso(START - 10 * MIN), finishedAt: iso(START - 9 * MIN) }];
-    settledBlockers(h, early, 400, 1000);
-    await h.runtime.poll(); // DEP gets no reads left; it stays at the cursor
+    settledBlockers(h, early, 400, 1000); await h.runtime.poll(); // DEP gets no reads left
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("tick_budget");
     await h.runtime.poll(); // DEP completes on a fresh tick
