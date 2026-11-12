@@ -232,6 +232,20 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: [] });
   });
 
+  it("does not pass over a current unverified status, but ignores superseded creator history", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }], runs: [run()],
+      statuses: [{ id: 2, context: "build", state: "failure", creatorLogin: "app[bot]", verifiedAppId: null }],
+    });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"], failed: [] });
+    input.statuses.push({ id: 3, context: "build", state: "success", creatorLogin: "APP[bot]", verifiedAppId: 7 });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [] });
+    input.statuses.push({ id: 4, context: "build", state: "error", creatorLogin: "other[bot]", verifiedAppId: null });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"] });
+    input.statuses.push({ id: 5, context: "build", state: "success", creatorLogin: "other[bot]", verifiedAppId: 8 });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [] });
+  });
+
   it("keeps latest runs separately per app, including unbound context collisions", () => {
     const runs = [run(1, { conclusion: "failure" }), run(100, { appId: 8 })];
     expect(evaluateReadiness(snapshot({ runs }), timing).kind).toBe("fail");
@@ -386,7 +400,7 @@ describe("CiGithub REST reads", () => {
     expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(4);
   });
 
-  it.each([403, 404])("keeps HTTP %i app identity unknown without overriding verified evidence", async (status) => {
+  it.each([403, 404])("keeps HTTP %i app identity unknown even with verified evidence", async (status) => {
     const { fetch } = fixtures((url) => {
       if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "review", app_id: 7 }] });
       if (url.pathname.endsWith("statuses")) return response([
@@ -399,7 +413,7 @@ describe("CiGithub REST reads", () => {
       if (url.pathname === "/apps/wrong") return response({ id: 8 });
     });
     const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
-    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", pending: [], missing: [] });
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pending", pending: ["review [app 7]"], missing: [] });
     const unknown = actual.statuses.filter((item) => item.creatorLogin === "unknown[bot]");
     expect(evaluateReadiness({ ...actual, statuses: unknown }, timing))
       .toMatchObject({ kind: "pending", pending: ["review [app 7]"], missing: [] });
