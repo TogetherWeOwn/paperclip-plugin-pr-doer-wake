@@ -1151,6 +1151,31 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().report.effects).toBe(0);
     expect(h.ledger().audits).not.toContainEqual(expect.objectContaining({ outcome: "work_product_tier_unavailable" }));
   });
+  it("treats an unreadable (private) card like an omitted field when no read serves the tier", async () => {
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const hidden = card({ id: "00000000-0000-4000-8000-0000000000aa", identifier: "TASK-43" });
+    const h = fixture({ cards: [urlCard, hidden] });
+    const base = { companyId: COMPANY, projectId: PROJECT, title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null };
+    h.ctx.issues.get.mockImplementation(async (id: string) => id === hidden.id ? null : { ...base, id, identifier: "TASK-42" });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown.filter((u: string) => u.startsWith("work_product:"))).toEqual([]);
+    expect(h.ledger().audits).toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "work_product_tier_unavailable" }));
+    expect(h.ledger().report.rows[0]).toMatchObject({ cardId: ISSUE });
+    // Dispatch is not gated: the idle PR's owner card is woken.
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ledger().report.effects).toBeGreaterThan(0);
+  });
+  it("fails closed on an unreadable card when another read serves the tier", async () => {
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const hidden = card({ id: "00000000-0000-4000-8000-0000000000aa", identifier: "TASK-43" });
+    const h = fixture({ cards: [urlCard, hidden] });
+    const base = { companyId: COMPANY, projectId: PROJECT, title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null };
+    h.ctx.issues.get.mockImplementation(async (id: string) => id === hidden.id ? null : { ...base, id, identifier: "TASK-42", workProducts: [] });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain(`work_product:${hidden.id}`);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.effects).toBe(0);
+  });
   it.each([null, "not-an-array", { type: "pull_request" }])("fails closed on a present but malformed workProducts field: %j", async (malformed) => {
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
     const h = fixture({ cards: [urlCard] });
