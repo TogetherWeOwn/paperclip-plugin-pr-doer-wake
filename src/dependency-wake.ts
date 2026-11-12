@@ -18,8 +18,8 @@ export const DEPENDENCY_WAKE_LIMITS = {
   // Storage bound. A receipt whose blocker is still inside the lookback is the
   // dedupe record and is never evicted; when such receipts fill the cap the job
   // fails closed (no new effect, tick incomplete) instead of risking a repeat.
-  // This is below the worst-case live rate over the lookback (10 wakes per
-  // 5-minute tick, about 20,000), deliberately: one company finishing 5,000
+  // This is below the worst-case live rate over the lookback (up to 10 wake
+  // calls per 5-minute tick, about 20,000), deliberately: one company finishing 5,000
   // (dependent, blocker) pairs in 7 days is far beyond a normal workload, and the
   // excess is deferred and reported rather than lost or repeated.
   receipts: 5_000,
