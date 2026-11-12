@@ -427,6 +427,23 @@ describe("CiGithub REST reads", () => {
     await expect(new CiGithub(fetch, TOKEN).readySince(REPO, 0)).rejects.toMatchObject({ code: "input" });
   });
 
+  it("never invalidates the shared credential source from an optional timeline read", async () => {
+    let timelineStatus = 401;
+    const { fetch } = fixtures((url) => url.pathname.endsWith("/timeline") ? response({ message: "Bad credentials" }, timelineStatus) : undefined);
+    const source = { token: vi.fn(async () => "ghs_" + "a".repeat(36)), invalidate: vi.fn() };
+    const github = new CiGithub(fetch, source);
+    await expect(github.readySince(REPO, 1)).rejects.toMatchObject({ code: "http", status: 401 });
+    expect(source.invalidate).not.toHaveBeenCalled();
+    source.token.mockRejectedValueOnce(new Error("mint failed"));
+    await expect(new CiGithub(fetch, source).readySince(REPO, 1)).rejects.toMatchObject({ code: "auth" });
+    expect(source.invalidate).not.toHaveBeenCalled();
+    // A required read still invalidates on its own 401, as before.
+    timelineStatus = 200;
+    const pull401 = fixtures((url) => url.pathname.includes("/pulls/") ? response({ message: "Bad credentials" }, 401) : undefined);
+    await expect(new CiGithub(pull401.fetch, source).pull(REPO, 1)).rejects.toMatchObject({ code: "http", status: 401 });
+    expect(source.invalidate).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps a timeline throttle off the backoff that required reads share, and still honours theirs", async () => {
     let now = 1_000_000;
     let timelineLimited = true;

@@ -702,7 +702,8 @@ export class CiGithub {
         return (await this.request(`/app/installations/${installationId}/access_tokens`, undefined, { jwt, body: JSON.stringify(body) })).data;
       })).catch((error: unknown) => {
         // A path-shape refusal is a caller error, not a credential failure: keep the source.
-        if (!(error instanceof CiGithubError && error.code === "input")) (this.#credential as CiTokenSource).invalidate();
+        // An optional read never invalidates the shared source; a required read would on its own failure.
+        if (!optional && !(error instanceof CiGithubError && error.code === "input")) (this.#credential as CiTokenSource).invalidate();
         if (error instanceof CiGithubError) throw error;
         throw new CiGithubError("auth");
       });
@@ -742,7 +743,7 @@ export class CiGithub {
     // GitHub create-status answers 201; plain reads answer 200. Either created
     // status number is accepted, then strictly projected before returning.
     if (!(exchange ? response.status === 201 : statusBody !== undefined ? response.status === 200 || response.status === 201 : response.status === 200)) {
-      if (!exchange && response.status === 401 && typeof this.#credential !== "string") this.#credential.invalidate();
+      if (!exchange && !optional && response.status === 401 && typeof this.#credential !== "string") this.#credential.invalidate();
       const detail = response.status === 403 || response.status === 429
         ? refusalDetail(response.status, denied, path, response.headers, parsedError.message)
         : undefined;
