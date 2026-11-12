@@ -31,7 +31,7 @@ it.each(["wrong-company", "missing-capability"] as const)("observes %s with inde
   for (const id of [companyId, otherCompanyId]) {
     await db.insert(companies).values({ id, name: "Synthetic company", issuePrefix: `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
   }
-  await db.insert(issues).values({ id: issueId, companyId, identifier: "TEST-1", title: "Synthetic issue", status: "todo", priority: "medium" });
+  await db.insert(issues).values({ id: issueId, companyId, identifier: `T${companyId.replace(/-/g, "").toUpperCase()}-1`, title: "Synthetic issue", status: "todo", priority: "medium" });
   const events = { forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }) };
   const services = buildHostServices(db, "synthetic-plugin-record", manifest.id, events as any);
   const writable = createHostClientHandlers({ pluginId: manifest.id, capabilities: [...manifest.capabilities], services });
@@ -40,6 +40,7 @@ it.each(["wrong-company", "missing-capability"] as const)("observes %s with inde
   const makeHandle = (hostHandlers: typeof writable) => createPluginWorkerHandle(manifest.id, {
     entrypointPath, manifest: manifest as any, config: {}, instanceInfo: { instanceId: "synthetic", hostVersion: "1.0.0" },
     apiVersion: 1, hostHandlers, autoRestart: false, rpcTimeoutMs: 10_000,
+    execArgv: ["--import", import.meta.resolve("tsx")],
   });
   const authorized = makeHandle(writable);
   const restricted = boundary === "missing-capability" ? makeHandle(readOnly) : authorized;
