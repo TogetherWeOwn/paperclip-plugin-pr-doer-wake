@@ -496,7 +496,7 @@ export class CiWakeRuntime {
         const prior = ledger.waits
           .filter((w) => w.companyId === run.companyId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.issueId === registration.issueId)
           .sort((a, b) => b.registeredAt - a.registeredAt)[0];
-        if (prior) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior.headSha, registration.headSha);
+        if (prior) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior.headSha, registration.headSha, pr.draft);
         ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open", ...(pr.draft ? { sawDraft: true } : {}) });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
@@ -521,12 +521,15 @@ export class CiWakeRuntime {
    * Only a genuine new head on an open, same-repo PR counts: closes,
    * merges, forks and number mismatches are not pushes.
    */
-  private noteHeadChange(ledger: Ledger, companyId: string, repo: string, prNumber: number, oldSha: string, newSha: string): void {
+  private noteHeadChange(ledger: Ledger, companyId: string, repo: string, prNumber: number, oldSha: string, newSha: string, draft: boolean): void {
     if (oldSha === newSha) return;
     const key = `${companyId}:${repo}:${prNumber}`;
     const existing = ledger.prHeadPending[key];
-    if (existing && existing.newSha === newSha) return;
-    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now() };
+    if (existing && existing.newSha === newSha) { if (draft) trackDraft(existing, true, this.now()); return; }
+    // Seed draft tracking from the PR read that observed the change, so a
+    // draft that turns ready before the entry's first poll still gets grace.
+    const sawDraft = draft || existing?.sawDraft === true;
+    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now(), ...(sawDraft ? { sawDraft: true } : {}) };
   }
 
   /** Exact work-product match for one PR; mirrors custody's work_product tier. */
@@ -636,7 +639,7 @@ export class CiWakeRuntime {
         const pr = await github.pull(wait.repo, wait.prNumber);
         if (pr.number !== wait.prNumber || pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo) {
           if (pr.number === wait.prNumber && pr.state === "open" && !pr.merged && pr.headSha !== wait.headSha && pr.headRepo?.toLowerCase() === wait.repo) {
-            this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, pr.headSha);
+            this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, pr.headSha, pr.draft);
           }
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
@@ -670,7 +673,7 @@ export class CiWakeRuntime {
         if (current.draft !== pr.draft) continue;
         if (current.number !== wait.prNumber || current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo) {
           if (current.number === wait.prNumber && current.state === "open" && !current.merged && current.headSha !== wait.headSha && current.headRepo?.toLowerCase() === wait.repo) {
-            this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, current.headSha);
+            this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, current.headSha, current.draft);
           }
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }

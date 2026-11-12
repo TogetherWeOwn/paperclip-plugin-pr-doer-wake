@@ -823,6 +823,25 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
+    it("seeds draft state into the head-change entry on push-then-register", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, draft: true }));
+      await h.runtime.register({ ...registration, headSha: NEXT_HEAD }, run);
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ newSha: NEXT_HEAD, sawDraft: true });
+      // The PR turns ready long after the change, before the entry's first poll.
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, draft: false }));
+      github.snapshot.mockResolvedValue({ repo: REPO, sha: NEXT_HEAD, baseBranch: "main", fetchedAt: START,
+        required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      h.advance(3_600_000);
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ readySince: START + 3_600_000 });
+    });
+
     it("does not re-wake the same (card, SHA) whose dedupe record exists", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
