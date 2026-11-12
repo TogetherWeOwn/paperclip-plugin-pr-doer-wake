@@ -170,6 +170,12 @@ function refusalDetail(error: unknown): { code: string; reason: string; auditDet
 // hours outlasts a throttle up to GitHub's hourly primary rate-limit reset
 // plus two 15-minute polls, so a fallback poll still runs before expiry.
 const TIMELINE_EXPIRY_MARGIN_MS = 2 * 60 * 60_000;
+// Optional timeline reads may spend at most a quarter of a poll's time and
+// requests, so they can never crowd required work (or pending-head wakes) out
+// of the tick; a wait that misses the slice is retried on a later poll.
+const OPTIONAL_SHARE = 4;
+
+interface OptionalBudget { allow(): boolean; track<T>(read: () => Promise<T>): Promise<T> }
 
 function transientTimelineError(error: unknown): boolean {
   if (!(error instanceof CiGithubError)) return false;
@@ -574,13 +580,14 @@ export class CiWakeRuntime {
    * (page cap, budget, malformed body, 4xx) falls back to the un-graced
    * verdict: at worst one early wake, never a lost one.
    */
-  private async readyGrace(github: CiGithub, repo: string, prNumber: number, draft: boolean, updatedAt: number | null, expiresAt: number, snapshot: CiSnapshot, timing: CiReadinessTiming): Promise<{ verdict: CiReadiness; consulted: boolean } | null> {
+  private async readyGrace(github: CiGithub, optional: OptionalBudget, repo: string, prNumber: number, draft: boolean, updatedAt: number | null, expiresAt: number, snapshot: CiSnapshot, timing: CiReadinessTiming): Promise<{ verdict: CiReadiness; consulted: boolean } | null> {
     const verdict = evaluateReadiness(snapshot, timing);
     if (verdict.kind !== "fail" || verdict.failed.length || !verdict.missing.length || draft) return { verdict, consulted: false };
     if (updatedAt == null || timing.now >= expiresAt - TIMELINE_EXPIRY_MARGIN_MS) return { verdict, consulted: false };
     if (timing.now >= updatedAt + 2 * timing.medianMs) return { verdict, consulted: true };
+    if (!optional.allow()) return null;
     let readySince: number | undefined;
-    try { readySince = await github.readySince(repo, prNumber); } catch (error) {
+    try { readySince = await optional.track(() => github.readySince(repo, prNumber)); } catch (error) {
       if (transientTimelineError(error)) return null;
       readySince = undefined;
     }
@@ -636,6 +643,14 @@ export class CiWakeRuntime {
       if (++requests > LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
       return this.ctx.http.fetch(url, init);
     };
+    const spent = { ms: 0, requests: 0 };
+    const optional: OptionalBudget = {
+      allow: () => spent.ms < LIMITS.tickMs / OPTIONAL_SHARE && spent.requests < LIMITS.requestsPerTick / OPTIONAL_SHARE,
+      track: async (read) => {
+        const at = this.now(), before = requests;
+        try { return await read(); } finally { spent.ms += this.now() - at; spent.requests += requests - before; }
+      },
+    };
     // Oldest last-attempt first prevents one unavailable repository starving others.
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const wait of pending) {
@@ -664,7 +679,7 @@ export class CiWakeRuntime {
         const samples = ledger.samples[`${wait.companyId}:${wait.repo}`] ?? [];
         const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
-        const graced = await this.readyGrace(github, wait.repo, wait.prNumber, pr.draft, pr.updatedAt, wait.expiresAt, snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
+        const graced = await this.readyGrace(github, optional, wait.repo, wait.prNumber, pr.draft, pr.updatedAt, wait.expiresAt, snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
         if (!graced || graced.verdict.kind === "pending") continue;
         const { verdict } = graced;
         await this.checkBinding(wait);
@@ -771,7 +786,7 @@ export class CiWakeRuntime {
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
           const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
-          const graced = await this.readyGrace(github, entry.repo, entry.prNumber, current.draft, current.updatedAt, entry.observedAt + LIMITS.waitMs, snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
+          const graced = await this.readyGrace(github, optional, entry.repo, entry.prNumber, current.draft, current.updatedAt, entry.observedAt + LIMITS.waitMs, snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
           if (!graced || graced.verdict.kind === "pending") continue;
           const { verdict } = graced;

@@ -1005,6 +1005,37 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     });
 
+    it("caps optional timeline reads per poll so slow ones cannot starve a pending reviewer wake", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      const { CiGithubError } = await import("../src/ci-github.js");
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      expect(Object.values(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      const others = Array.from({ length: 15 }, (_, i) => ({ prNumber: 30 + i, headSha: (30 + i).toString(16).padStart(40, "a") }));
+      // Fifteen other open waits on the same card, each missing its required check.
+      const seeded = h.ledger();
+      const template = seeded.waits[0]!;
+      seeded.waits.push(...others.map((o, i) => ({ ...template, ...o, waitId: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`,
+        status: "open" as const, reason: undefined, finishedAt: undefined, lastAttemptAt: undefined, aliases: [], registeredAt: h.clock(), expiresAt: h.clock() + LIMITS.waitMs })));
+      h.seed(seeded);
+      github.pull.mockImplementation(async (_repo: string, n: number) => n === 17
+        ? pull({ headSha: NEXT_HEAD, updatedAt: h.clock() - 10_000 })
+        : pull({ number: n, headSha: others.find((o) => o.prNumber === n)!.headSha, updatedAt: h.clock() - 10_000 }));
+      github.snapshot.mockImplementation(async (_repo: string, sha: string) => ({ repo: REPO, sha, baseBranch: "main", fetchedAt: START,
+        required: [{ context: "review", appId: 8 }], statuses: [], suites: [],
+        runs: sha === NEXT_HEAD ? [{ id: 1, name: "review", appId: 8, suiteId: null, status: "completed", conclusion: "failure" }] : [] }));
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      // Every optional timeline read is slow and fails: 15 x 45 s would exceed the 600 s tick.
+      github.readySince.mockImplementation(async () => { h.advance(45_000); throw new CiGithubError("http", 503); });
+      h.advance(180_000);
+      await h.runtime.poll();
+      expect(github.readySince.mock.calls.length).toBeLessThanOrEqual(4);
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("CI fail") });
+    });
+
     it("does not let a ready event older than the new head delay the reviewer wake", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
       inReviewIssue(h, OTHER);
