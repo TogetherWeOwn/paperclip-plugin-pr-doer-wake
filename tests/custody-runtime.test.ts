@@ -741,6 +741,17 @@ describe("coverage, summary and cursor controls", () => {
     await h.runtime.poll();
     expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
   });
+  it("does not clock HTML comment examples but clocks a real directive after a commented fence", async () => {
+    const directive = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ status: "done", texts: [{ id: "comment", body: `<!--\n\`\`\`\n${directive}\n-->`, at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner], dryRun: true });
+    h.activity.mockResolvedValue(NOW);
+    await h.runtime.poll();
+    expect(Object.keys(h.ledger().dispositions)).toHaveLength(0);
+    owner.texts[0]!.body += `\n${directive}`;
+    await h.runtime.poll();
+    expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
+  });
   it("acknowledges a terminal trigger when the same disposition is genuinely posted in a new comment", async () => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
     const owner = card({ status: "done", texts: [{ id: "description", body, at: NOW - DAY, ownership: true }] });

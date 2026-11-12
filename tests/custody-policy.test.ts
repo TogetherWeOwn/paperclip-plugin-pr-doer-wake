@@ -143,6 +143,17 @@ describe("PR-specific trigger policy", () => {
     expect(latestDisposition(card({ texts: [{ ...example, body }] }), pull())).toBeNull();
     expect(latestDisposition(card({ texts: [{ ...example, body: `${body}\n${directive("finish", "event", NOW).body}` }] }), pull())?.action).toBe("finish");
   });
+  it("ignores HTML comment examples and fence markers without hiding later directives", () => {
+    const example = directive("defer", "2099-01-01", NOW);
+    const comment = `<!--\n\`\`\`\n${example.body}\n-->`;
+    expect(latestDisposition(card({ texts: [{ ...example, body: comment }] }), pull())).toBeNull();
+    expect(latestDisposition(card({ texts: [{ ...example, body: `${comment}\n${example.body}` }] }), pull())?.action).toBe("defer");
+    expect(latestDisposition(card({ texts: [{ ...example, body: `\`\`\`\n<!--\n\`\`\`\n${example.body}` }] }), pull())?.action).toBe("defer");
+    expect(latestDisposition(card({ texts: [{ ...example, body: `<!-- -->\n${example.body}` }] }), pull())?.action).toBe("defer");
+    expect(latestDisposition(card({ texts: [{ ...example, body: `<!--\n${example.body}` }] }), pull())).toBeNull();
+    expect(hasCardClosure(card({ texts: [{ ...example, body: "<!--\nClosed unmerged: burden; source example/project#42\n-->" }] }), pull())).toBe(false);
+    expect(hasPrClosure(["<!--\nClosed unmerged: burden\n-->"])).toBe(false);
+  });
   it("rejects an empty card closure reason", () => {
     const text = { body: "Closed unmerged: ; source example/project#42", at: NOW, ownership: true };
     expect(hasCardClosure(card({ texts: [text] }), pull())).toBe(false);

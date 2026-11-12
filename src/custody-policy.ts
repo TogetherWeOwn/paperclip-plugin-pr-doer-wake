@@ -99,19 +99,31 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   return tracker ?? { card: null, source: "unmapped", candidates: [] };
 }
 
-/** Only unquoted, unfenced lines can be directive evidence. */
+/** Only unquoted lines outside fences and HTML comments can be directive evidence. */
 export function directiveLines(body: string): string[] {
   const result: string[] = [];
   let fence: { marker: string; length: number } | null = null;
+  let comment = false;
   for (const line of body.split(/\r?\n/)) {
     const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
     if (fence) {
       if (marker && marker[1]![0] === fence.marker && marker[1]!.length >= fence.length && /^\s*$/.test(marker[2]!)) fence = null;
-    } else if (marker && (marker[1]![0] !== "`" || !marker[2]!.includes("`"))) {
-      fence = { marker: marker[1]![0]!, length: marker[1]!.length };
-    } else {
-      result.push(line);
+      continue;
     }
+    if (!comment && marker && (marker[1]![0] !== "`" || !marker[2]!.includes("`"))) {
+      fence = { marker: marker[1]![0]!, length: marker[1]!.length };
+      continue;
+    }
+    let touchedComment = comment;
+    let position = 0;
+    while (position < line.length) {
+      const boundary = line.indexOf(comment ? "-->" : "<!--", position);
+      if (boundary < 0) break;
+      touchedComment = true;
+      position = boundary + (comment ? 3 : 4);
+      comment = !comment;
+    }
+    if (!touchedComment) result.push(line);
   }
   return result;
 }
