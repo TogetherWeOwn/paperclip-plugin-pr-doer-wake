@@ -840,10 +840,12 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
       const matchingStatuses = current && (required.appId === null || current.verifiedAppId === required.appId) ? [current] : [];
       // A failed lookup is not proof of a different app, even when a matching run exists.
       const unverified = required.appId !== null && current?.verifiedAppId === null;
-      // GitHub refuses the merge while another source holds the current status.
+      // GitHub refuses the merge while another source holds the current
+      // status: a definite failure, so it never waits on grace or hides a failed run.
       const foreign = required.appId !== null && current !== undefined && !unverified && !matchingStatuses.length;
       if (unverified) pending.push(label(required));
-      if (foreign || !matchingRuns.length && !matchingStatuses.length && !unverified) missing.push(label(required));
+      if (foreign) record(label(required), "fail");
+      else if (!matchingRuns.length && !matchingStatuses.length && !unverified) missing.push(label(required));
       for (const run of matchingRuns) {
         // An active suite can hide a required rerun not yet materialized. Only
         // positive current-attempt job evidence permits same-suite optional work.

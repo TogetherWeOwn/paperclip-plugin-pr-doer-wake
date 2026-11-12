@@ -228,11 +228,11 @@ describe("evaluateReadiness", () => {
       required: [{ context: "build", appId: 7 }], runs: [run(99, { appId: 8 })],
       statuses: [{ id: 100, context: "build", state: "success" }],
     });
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "fail", failed: ["build [app 7]"], missing: [] });
+    input.statuses = [];
     expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"] });
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["build [app 7]"], failed: [] });
     input.runs.push(run(1, { status: "queued", conclusion: null }));
-    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: ["build [app 7]"] });
-    input.statuses = [];
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: [] });
   });
 
@@ -247,7 +247,7 @@ describe("evaluateReadiness", () => {
     input.statuses.push({ id: 4, context: "build", state: "error", creatorLogin: "other[bot]", verifiedAppId: null });
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"] });
     input.statuses.push({ id: 5, context: "build", state: "success", creatorLogin: "other[bot]", verifiedAppId: 8 });
-    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", pending: [], missing: ["build [app 7]"] });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", pending: [], failed: ["build [app 7]"], missing: [] });
     input.statuses.push({ id: 6, context: "build", state: "success", creatorLogin: "app[bot]", verifiedAppId: 7 });
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [], missing: [] });
   });
@@ -265,8 +265,17 @@ describe("evaluateReadiness", () => {
         { id: 11, context: "Devin Review", state, ...creator },
       ],
     });
-    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["Devin Review [app 811515]"] });
-    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["Devin Review [app 811515]"] });
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "fail", failed: ["Devin Review [app 811515]"], missing: [] });
+  });
+
+  it("never lets a foreign status hide a failed required run while a suite is active", () => {
+    const input = snapshot({
+      required: [{ context: "build", appId: 7 }],
+      suites: [suite(1, { status: "in_progress", conclusion: null, completedAt: null })],
+      runs: [run(1, { conclusion: "failure" })], currentAttemptRunIds: [1],
+      statuses: [{ id: 2, context: "build", state: "success", creatorLogin: "other[bot]", verifiedAppId: 8 }],
+    });
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "fail", failed: ["build [app 7]"], missing: [], pending: [] });
   });
 
   it("keeps latest runs separately per app, including unbound context collisions", () => {
@@ -447,7 +456,7 @@ describe("CiGithub REST reads", () => {
     const actual = await github.snapshot(REPO, SHA, "main", cycle);
     expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", missing: [] });
     expect(evaluateReadiness({ ...actual, statuses: actual.statuses.filter((status) => status.verifiedAppId !== 811515) }, timing))
-      .toMatchObject({ kind: "fail", missing: ["Devin Review [app 811515]"] });
+      .toMatchObject({ kind: "fail", failed: ["Devin Review [app 811515]"], missing: [] });
     await github.snapshot(REPO, SHA, "main", cycle);
     expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(2);
     await github.snapshot(REPO, SHA, "main");
@@ -473,7 +482,7 @@ describe("CiGithub REST reads", () => {
       .toMatchObject({ kind: "pending", pending: ["review [app 7]"], missing: [] });
     const wrong = actual.statuses.filter((item) => item.creatorLogin === "wrong[bot]");
     expect(evaluateReadiness({ ...actual, statuses: wrong }, timing))
-      .toMatchObject({ kind: "fail", missing: ["review [app 7]"] });
+      .toMatchObject({ kind: "fail", failed: ["review [app 7]"], missing: [] });
   });
 
   it.each([401, 429, 500])("does not turn app lookup HTTP %i into a missing check", async (status) => {
