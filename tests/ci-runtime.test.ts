@@ -748,7 +748,10 @@ describe("CI runtime polling and durable wake outcomes", () => {
       inReviewIssue(h, OTHER);
       delete (h.issue as { workProducts?: unknown }).workProducts;
       await movedHead(h);
-      // The card is re-scoped to a different execution workspace before CI settles.
+      // First poll: the head move retires the wait and records the pending head while CI runs.
+      await h.runtime.poll();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      // The card is then re-scoped to a different execution workspace before CI settles.
       Object.assign(h.issue, { executionWorkspaceId: "77777777-7777-4777-8777-777777777777" });
       github.readiness.mockReturnValue(verdict("pass"));
       await h.runtime.poll();
