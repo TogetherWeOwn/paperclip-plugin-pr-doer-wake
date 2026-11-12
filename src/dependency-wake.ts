@@ -43,7 +43,7 @@ export function validateDependencyWakeConfig(raw: Record<string, unknown>): stri
   return raw.dependencyWakeEnabled === true && !parseDependencyWakeConfig(raw).companyId ? ["dependencyWakeCompanyId must be a UUID when dependencyWakeEnabled is true"] : [];
 }
 
-type Outcome = "would_wake" | "intent" | "woken" | "not_queued" | "unconfirmed";
+type Outcome = "would_wake" | "intent" | "woken" | "unconfirmed";
 interface Receipt { at: number; outcome: Outcome; blockerDoneAt: number; runId?: string | null }
 export interface DependencyWakeLedger {
   version: 1;
@@ -96,6 +96,9 @@ export class DependencyWakeRuntime {
     const stored = await this.ctx.state.get(key) as DependencyWakeLedger | null;
     if (stored && (stored.version !== 1 || !stored.receipts || !Array.isArray(stored.audits))) throw new Error("invalid_dependency_wake_ledger");
     const ledger: DependencyWakeLedger = stored ?? { version: 1, receipts: {}, audits: [] };
+    // An old not_queued receipt suppressed retry even though no run was queued: a confirmed
+    // non-queued result is now released instead, so any recorded ones must not keep deduping.
+    for (const [key, receipt] of Object.entries(ledger.receipts)) if ((receipt as { outcome: string }).outcome === "not_queued") delete ledger.receipts[key];
     const started = this.now();
     let reads = 0;
     const tick: Tick = {
@@ -112,13 +115,22 @@ export class DependencyWakeRuntime {
     };
     try {
       let capped = false;
+      // A failed status page is isolated to that status: the other still sweeps, and the
+      // tick reports incomplete so the failure is not mistaken for a quiet pass.
+      let listFailed = false;
       const candidates: Array<{ issue: Issue; status: (typeof STATUSES)[number] }> = [];
       for (const status of STATUSES) {
-        // One bounded page per status: the installed host applies `offset` twice
-        // (SQL, then the plugin window), so any offset > 0 reads an empty page.
-        const page = await tick.read(() => this.ctx.issues.list({ companyId, status, limit: L.maxPerStatus }));
-        if (page.length >= L.maxPerStatus) { capped = true; tick.audit("candidate_cap"); }
-        for (const issue of page) candidates.push({ issue, status });
+        try {
+          // One bounded page per status: the installed host applies `offset` twice
+          // (SQL, then the plugin window), so any offset > 0 reads an empty page.
+          const page = await tick.read(() => this.ctx.issues.list({ companyId, status, limit: L.maxPerStatus }));
+          if (page.length >= L.maxPerStatus) { capped = true; tick.audit("candidate_cap"); }
+          for (const issue of page) candidates.push({ issue, status });
+        } catch (error) {
+          if (error instanceof Error && error.message === "tick_budget") throw error;
+          listFailed = true;
+          tick.audit("status_list_error");
+        }
       }
       // Stable id order plus a persisted cursor: a tick that runs out of budget
       // resumes where it stopped, so every candidate in both statuses is reached.
@@ -138,7 +150,7 @@ export class DependencyWakeRuntime {
         }
       }
       delete ledger.cursor;
-      tick.report.complete = !capped && start === 0;
+      tick.report.complete = !capped && !listFailed && start === 0;
     } catch (error) {
       tick.audit(error instanceof Error && ["tick_budget", "wake_budget", "receipt_capacity", "configuration_changed"].includes(error.message) ? error.message : "tick_error");
     } finally {
@@ -190,20 +202,25 @@ export class DependencyWakeRuntime {
     const dependent = await this.liveRun(tick, issue.id, issue.assigneeAgentId);
     if (dependent.live || dependent.budgetBlocked) return;
     // Watermark on the assignee's runs, on start only: another agent's run (a reviewer) is not the
-    // assignee seeing the blocker; a run that started before a blocker finished was built without
-    // that completion, even if it ended after it; a run that never started saw nothing at all.
+    // assignee seeing the blocker; a run that never started saw nothing at all.
     const lastRun = Math.max(-Infinity, ...dependent.runs.map((run) => time(run.startedAt)).filter(Number.isFinite));
-    // Only blockers that finished after the dependent's last run started; an earlier one was seen by that run.
-    const triggers = fresh.filter((b) => doneAt.get(b.id)! > lastRun);
+    // A blocker is settled only when its last run has finished: an issue can be marked done
+    // while its run still finalizes the workspace, so a dependent run started in that
+    // done-to-finalize window was built without the completion and must not consume the
+    // trigger. A blocker with a live run or a truncated run window is also a wait: a full
+    // window may have dropped an older live or later-finished run.
+    const settledAt = new Map<string, number>();
+    for (const b of fresh) {
+      const blocker = await this.liveRun(tick, b.id);
+      if (blocker.live || blocker.truncated) { if (blocker.truncated) tick.audit("blocker_window_truncated", issue.id); return; }
+      const finished = Math.max(-Infinity, ...blocker.runs.map((run) => time(run.finishedAt)).filter(Number.isFinite));
+      settledAt.set(b.id, Number.isFinite(finished) ? Math.max(doneAt.get(b.id)!, finished) : doneAt.get(b.id)!);
+    }
+    // Only blockers that settled after the dependent's last run started; an earlier one was seen by that run.
+    const triggers = fresh.filter((b) => settledAt.get(b.id)! > lastRun);
     if (!triggers.length) return;
     // A full window may have dropped an assignee run that started after a trigger: unknown, so no wake.
     if (dependent.truncated) { tick.audit("run_window_truncated", issue.id); return; }
-    // A done blocker with a live run may still be finalizing its workspace: wait for it. A full
-    // window may have dropped an older live run, so it is treated the same way.
-    for (const b of triggers) {
-      const blocker = await this.liveRun(tick, b.id);
-      if (blocker.live || blocker.truncated) return;
-    }
     report.eligible += 1;
     // Fail closed rather than evict a dedupe record: resume at this candidate once old receipts age out.
     if (Object.values(ledger.receipts).filter((r) => relevant(r, now)).length + triggers.length > L.receipts) throw new Error("receipt_capacity");
@@ -234,8 +251,11 @@ export class DependencyWakeRuntime {
         reason, contextSource: "plugin.dependency-wake",
         idempotencyKey: `dependency-wake:${issue.id}:${createHash("sha256").update(ids.join(",")).digest("hex").slice(0, 32)}`,
       });
-      record(result.queued ? "woken" : "not_queued", result.runId);
-      tick.audit(result.queued ? "woken" : "not_queued", issue.id);
+      // A confirmed non-queued result provably ran no effect: release the intent (like
+      // custody's pending receipt) so a later tick retries with the same epoch key. Only a
+      // queued wake or an ambiguous failure stays recorded.
+      if (result.queued) { record("woken", result.runId); tick.audit("woken", issue.id); }
+      else { forget(); tick.audit("host_deferred", issue.id); }
     } catch (error) {
       if (retryableBeforeQueue(error)) { forget(); tick.audit("host_deferred", issue.id); } else {
         record("unconfirmed");

@@ -198,7 +198,7 @@ describe("dependency wake", () => {
     expect(wokenIds(h).at(-1)).toBe(DEP);
   });
 
-  it("retries a host-deferred wake next tick but never repeats an unconfirmed or not-queued one", async () => {
+  it("retries a host-deferred wake next tick but never repeats an unconfirmed one", async () => {
     const deferred = harness();
     deferred.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("worker RPC host is not running"));
     await deferred.runtime.poll();
@@ -206,14 +206,83 @@ describe("dependency wake", () => {
     await deferred.runtime.poll();
     expect(deferred.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
     expect(deferred.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("woken");
-    for (const [outcome, impl] of [["unconfirmed", async () => { throw new Error("boom"); }], ["not_queued", async () => ({ queued: false, runId: null })]] as const) {
-      const h = harness();
-      h.ctx.issues.requestWakeup.mockImplementationOnce(impl);
-      await h.runtime.poll();
-      await h.runtime.poll();
-      expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
-      expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe(outcome);
-    }
+    const h = harness();
+    h.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("boom"));
+    await h.runtime.poll();
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("unconfirmed");
+  });
+
+  it("retries a confirmed non-queued wake on a later tick under the same epoch idempotency key", async () => {
+    const h = harness();
+    h.ctx.issues.requestWakeup
+      .mockResolvedValueOnce({ queued: false, runId: null })
+      .mockResolvedValueOnce({ queued: true, runId: "run-new" });
+    await h.runtime.poll();
+    // queued:false is a confirmed non-effect: the intent is released, not recorded.
+    expect(h.ledger()?.receipts).toEqual({});
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("host_deferred");
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    const keys = (h.ctx.issues.requestWakeup.mock.calls as unknown as Array<[string, string, { idempotencyKey: string }]>).map(([, , o]) => o.idempotencyKey);
+    expect(keys[0]).toBe(keys[1]);
+    expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("woken");
+    // A stale not_queued receipt written by an older version must not keep suppressing either.
+    const stale = harness();
+    stale.seed({ version: 1, audits: [], receipts: { [rk(DEP, BLK, DONE)]: { at: START - 25 * MIN, outcome: "not_queued" as never, blockerDoneAt: DONE } } });
+    await stale.runtime.poll();
+    expect(stale.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a definite pre-queue budget denial on a later tick under the same epoch idempotency key", async () => {
+    const h = harness();
+    h.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("Agent cannot start work while completed runs await accounting."));
+    await h.runtime.poll();
+    expect(h.ledger()?.receipts).toEqual({});
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("host_deferred");
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    const keys = (h.ctx.issues.requestWakeup.mock.calls as unknown as Array<[string, string, { idempotencyKey: string }]>).map(([, , o]) => o.idempotencyKey);
+    expect(keys[0]).toBe(keys[1]);
+    expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("woken");
+    // A post-dispatch budget observation is not proof a prior call never ran; but a definite
+    // host pre-queue error must never be recorded unconfirmed.
+    const denied = harness();
+    denied.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("Company is paused because its budget hard-stop was reached."));
+    await denied.runtime.poll();
+    await denied.runtime.poll();
+    expect(denied.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("still wakes when the dependent's run started in the blocker's done-to-finalize window", async () => {
+    const h = harness();
+    // The blocker was marked done at T-30m but its finishing run ran until T-25m; a dependent
+    // run started at T-27m saw neither the completion nor the finalized workspace.
+    h.runs[BLK] = [{ id: "b1", issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 45 * MIN), startedAt: iso(START - 45 * MIN), finishedAt: iso(START - 25 * MIN) }];
+    h.runs[DEP]!.push({ id: "r2", issueId: DEP, agentId: AGENT, status: "succeeded", createdAt: iso(START - 27 * MIN), startedAt: iso(START - 27 * MIN), finishedAt: iso(START - 26 * MIN) });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    // A run that started only after the blocker fully settled still counts as having seen it.
+    const seen = harness();
+    seen.runs[BLK] = [{ id: "b1", issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 45 * MIN), startedAt: iso(START - 45 * MIN), finishedAt: iso(START - 25 * MIN) }];
+    seen.runs[DEP]!.push({ id: "r2", issueId: DEP, agentId: AGENT, status: "succeeded", createdAt: iso(START - 24 * MIN), startedAt: iso(START - 24 * MIN), finishedAt: iso(START - 22 * MIN) });
+    await seen.runtime.poll();
+    expect(seen.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(seen.ledger()?.receipts).toEqual({});
+  });
+
+  it("survives a failed status list read and still sweeps the other status", async () => {
+    const h = harness();
+    h.issues[DEP]!.status = "in_progress";
+    h.ctx.issues.list.mockImplementation(async ({ status, limit }: { status: string; limit?: number }) => {
+      if (status === "in_review") throw new Error("host read failed");
+      return Object.values(h.issues).filter((i) => i.status === status).slice(0, limit);
+    });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("status_list_error");
+    expect(h.ledger()?.lastTick?.complete).toBe(false);
   });
 
   it("ignores other agents' runs for the watermark: a reviewer's run after the blocker finished is not the assignee seeing it", async () => {
