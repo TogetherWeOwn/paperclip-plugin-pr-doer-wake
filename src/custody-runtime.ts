@@ -325,6 +325,10 @@ export class CustodyRuntime {
         try {
           guard();
           const fresh = await this.ctx.issues.get(cardId, config.companyId);
+          // The host returns null for a card the plugin may not read (a private
+          // issue the snapshot still lists). Such a card yields no work-product
+          // data, exactly like an omitted field, so it joins the tier decision below.
+          if (fresh === null) { omitted.push(cardId); continue; }
           if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
           // The host omits workProducts from issue reads (Paperclip 1106); see
           // the tier decision after this loop. A present but malformed field fails closed.
@@ -335,9 +339,10 @@ export class CustodyRuntime {
           card.workProducts = bindings;
         } catch { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
       }
-      // Omitted on every read: the tier is unavailable, so map through the
-      // remaining tiers. Omitted on only some: an unread binding could outrank
-      // a lower-tier match, so those cards are UNKNOWN and effects are deferred.
+      // Omitted or unreadable on every read: the tier is unavailable, so map
+      // through the remaining tiers. Served on some reads: an unread binding
+      // could outrank a lower-tier match, so those cards are UNKNOWN and
+      // effects are deferred.
       if (omitted.length && tierServed) for (const cardId of omitted) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
       else if (omitted.length) audit("inventory", "work_product_tier_unavailable");
       const candidates = new Map<string, CustodyCard>();
