@@ -613,6 +613,105 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe(failure ? "woken" : "open");
   });
 
+  it("gives ready-only checks fresh grace after a draft is first seen ready", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.pull.mockResolvedValue(pull({ draft: true }));
+    h.advance(24 * 3_600_000);
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", sawDraft: true });
+    github.pull.mockResolvedValue(pull({ draft: false }));
+    h.advance(60_000);
+    await h.runtime.poll();
+    const readyAt = START + 24 * 3_600_000 + 60_000;
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", readySince: readyAt });
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    h.advance(120_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
+  });
+
+  it("keeps a draft seen at registration, so the first ready poll starts fresh grace", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    github.pull.mockResolvedValue(pull({ draft: true }));
+    await h.runtime.register(registration, run);
+    expect(h.ledger().waits[0]).toMatchObject({ sawDraft: true });
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.pull.mockResolvedValue(pull({ draft: false }));
+    h.advance(180_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", readySince: START + 180_000 });
+  });
+
+  it("records a draft read even when the snapshot then fails", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    github.pull.mockResolvedValue(pull({ draft: true }));
+    github.snapshot.mockRejectedValueOnce(new Error("temporary"));
+    h.advance(60_000);
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", sawDraft: true });
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.pull.mockResolvedValue(pull({ draft: false }));
+    h.advance(180_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", readySince: START + 240_000 });
+  });
+
+  it("keeps a draft seen on the final read, so the next ready poll starts fresh grace", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.pull.mockResolvedValueOnce(pull({ draft: false })).mockResolvedValueOnce(pull({ draft: true }));
+    h.advance(180_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", sawDraft: true });
+    github.pull.mockResolvedValue(pull({ draft: false }));
+    h.advance(10_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", readySince: START + 190_000 });
+  });
+
+  it("keeps a final-read draft even when revalidation after it fails", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.pull.mockResolvedValueOnce(pull({ draft: false })).mockImplementationOnce(async () => {
+      h.issueGet.mockRejectedValueOnce(new Error("temporary host read failure"));
+      return pull({ draft: true });
+    });
+    h.advance(180_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", sawDraft: true });
+    github.pull.mockResolvedValue(pull({ draft: false }));
+    h.advance(10_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", readySince: START + 190_000 });
+  });
+
   it("does not wake a ready PR when required status identity is unverified", async () => {
     const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
