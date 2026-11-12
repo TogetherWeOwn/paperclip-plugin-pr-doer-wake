@@ -623,12 +623,16 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe(failure ? "woken" : "open");
   });
 
+  // pull() reports the PR's updated_at; marking a PR ready bumps it, so these
+  // fixtures stamp it at the ready flip ("fresh") unless a test says otherwise.
+  const fresh = (h: { clock(): number }, ago = 10_000) => pull({ updatedAt: h.clock() - ago });
+
   it("gives ready-only checks fresh grace from the ready_for_review event, then wakes", async () => {
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
     await h.runtime.register(registration, run);
     await missingOnly();
-    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
     h.advance(24 * 3_600_000);
+    github.pull.mockResolvedValue(fresh(h, 30_000));
     github.readySince.mockResolvedValue(h.clock() - 30_000);
     await h.runtime.poll();
     expect(github.readySince).toHaveBeenCalledWith(REPO, 17);
@@ -636,8 +640,21 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe("open");
     h.advance(90_000);
     await h.runtime.poll();
+    // updated_at is now a full grace old, so the wake needs no second timeline read.
+    expect(github.readySince).toHaveBeenCalledTimes(1);
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("required check missing: review [app 8]") });
+  });
+
+  it("wakes without reading the timeline when updated_at is already a full grace old", async () => {
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    h.advance(180_000);
+    github.pull.mockResolvedValue(pull({ updatedAt: START }));
+    await h.runtime.poll();
+    expect(github.readySince).not.toHaveBeenCalled();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
   });
 
   it.each([["network"], ["timeout"], ["backoff"], ["auth"], ["http", 503], ["http", 429]] as const)("stays pending on a transient timeline error (%s %s), then wakes a never-draft PR as before", async (code, status?: number) => {
@@ -645,8 +662,8 @@ describe("CI runtime polling and durable wake outcomes", () => {
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
     await h.runtime.register(registration, run);
     await missingOnly();
-    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
     h.advance(180_000);
+    github.pull.mockResolvedValue(fresh(h));
     github.readySince.mockRejectedValueOnce(new CiGithubError(code, status));
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
@@ -660,8 +677,8 @@ describe("CI runtime polling and durable wake outcomes", () => {
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
     await h.runtime.register(registration, run);
     await missingOnly();
-    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
     h.advance(180_000);
+    github.pull.mockResolvedValue(fresh(h));
     github.readySince.mockRejectedValue(new CiGithubError(code, status));
     await h.runtime.poll();
     expect(github.readySince).toHaveBeenCalledTimes(1);
@@ -669,49 +686,81 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("required check missing") });
   });
 
-  it("stops retrying a persistent transient timeline error an hour past the un-graced fail point", async () => {
+  it("stops reading a persistently failing timeline once updated_at is a full grace old", async () => {
     const { CiGithubError } = await import("../src/ci-github.js");
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
     await h.runtime.register(registration, run);
     await missingOnly();
-    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
-    github.readySince.mockRejectedValue(new CiGithubError("http", 503));
     h.advance(180_000);
+    github.pull.mockResolvedValue(fresh(h));
+    github.readySince.mockRejectedValue(new CiGithubError("http", 429));
     await h.runtime.poll();
-    h.advance(45 * 60_000);
+    h.advance(60_000);
     await h.runtime.poll();
+    expect(github.readySince).toHaveBeenCalledTimes(2);
     expect(h.requestWakeup).not.toHaveBeenCalled();
-    h.advance(15 * 60_000);
+    h.advance(60_000);
     await h.runtime.poll();
+    expect(github.readySince).toHaveBeenCalledTimes(2);
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("required check missing") });
+  });
+
+  it("stops reading a failing timeline in the last hour before the wait expires, even on a busy PR", async () => {
+    const { CiGithubError } = await import("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    github.readySince.mockRejectedValue(new CiGithubError("http", 503));
+    h.advance(LIMITS.waitMs - 2 * 3_600_000);
+    github.pull.mockResolvedValue(fresh(h));
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    h.advance(90 * 60_000);
+    github.pull.mockResolvedValue(fresh(h));
+    await h.runtime.poll();
+    expect(github.readySince).toHaveBeenCalledTimes(1);
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
   });
 
   it("falls back on a non-GitHub timeline error too", async () => {
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
     await h.runtime.register(registration, run);
     await missingOnly();
-    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
     h.advance(180_000);
+    github.pull.mockResolvedValue(fresh(h));
     github.readySince.mockRejectedValue(new Error("timeline unavailable"));
     await h.runtime.poll();
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
   });
 
-  it.each([[5, 6], [null, null]])("does not wake when updated_at moves (or is absent) across the final read (%s -> %s)", async (before, after) => {
+  it("wakes without timeline grace when updated_at is absent", async () => {
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
     await h.runtime.register(registration, run);
     await missingOnly();
     h.advance(180_000);
-    // A draft/ready toggle after the timeline read keeps draft=false but bumps updated_at.
-    github.pull.mockResolvedValueOnce(pull({ updatedAt: before })).mockResolvedValueOnce(pull({ updatedAt: after }));
+    github.pull.mockResolvedValue(pull({ updatedAt: null }));
+    await h.runtime.poll();
+    expect(github.readySince).not.toHaveBeenCalled();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([[10_000], [200_000]])("does not wake when updated_at moves across the final read (updated_at %s ms before the poll)", async (ago) => {
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    h.advance(180_000);
+    // A draft/ready toggle after the first read keeps draft=false but bumps updated_at,
+    // whether or not the timeline was read (200 s old: grace already spent, no read).
+    github.pull.mockResolvedValueOnce(fresh(h, ago)).mockResolvedValueOnce(pull({ updatedAt: h.clock() }));
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger().waits[0]?.status).toBe("open");
     // A draft on the final read is retried; the next ready read sees the newer ready event.
-    github.pull.mockResolvedValueOnce(pull({ updatedAt: 5 })).mockResolvedValueOnce(pull({ updatedAt: 5, draft: true }));
+    github.pull.mockResolvedValueOnce(fresh(h)).mockResolvedValueOnce(pull({ updatedAt: h.clock(), draft: true }));
     await h.runtime.poll();
-    github.pull.mockResolvedValue(pull({ updatedAt: 7 }));
+    github.pull.mockResolvedValue(fresh(h));
     github.readySince.mockResolvedValue(h.clock() - 10_000);
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
@@ -844,21 +893,24 @@ describe("CI runtime polling and durable wake outcomes", () => {
     });
 
     it("gives a reviewer's new head fresh grace from the ready_for_review event", async () => {
+      const { CiGithubError } = await import("../src/ci-github.js");
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
       inReviewIssue(h, OTHER);
       await movedHead(h);
       await missingOnly(NEXT_HEAD);
-      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: 5 }));
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() }));
       await h.runtime.poll();
       h.advance(3_600_000);
-      github.readySince.mockResolvedValue(h.clock() - 30_000);
+      const ready = h.clock() - 30_000;
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: ready }));
+      github.readySince.mockResolvedValue(ready);
       await h.runtime.poll();
       expect(github.readySince).toHaveBeenCalledWith(REPO, 17);
-      const { CiGithubError } = await import("../src/ci-github.js");
+      h.advance(30_000);
       github.readySince.mockRejectedValueOnce(new CiGithubError("network"));
-      h.advance(90_000);
       await h.runtime.poll();
-      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: 5 })).mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: 6 }));
+      h.advance(60_000);
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: ready })).mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: ready + 1 }));
       await h.runtime.poll();
       expect(h.requestWakeup).not.toHaveBeenCalled();
       expect(Object.values(h.ledger().prHeadPending ?? {})).toHaveLength(1);
@@ -873,9 +925,10 @@ describe("CI runtime polling and durable wake outcomes", () => {
       inReviewIssue(h, OTHER);
       await movedHead(h);
       await missingOnly(NEXT_HEAD);
-      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: 5 }));
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() }));
       await h.runtime.poll();
       h.advance(3_600_000);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() - 10_000 }));
       github.readySince.mockRejectedValue(new CiGithubError("pages"));
       await h.runtime.poll();
       expect(github.readySince).toHaveBeenCalledWith(REPO, 17);
@@ -883,23 +936,47 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("CI fail") });
     });
 
-    it("wakes the reviewer once a persistent transient timeline error outlasts the retry window", async () => {
+    it("stops reading a persistently failing timeline for the reviewer once updated_at is a full grace old", async () => {
       const { CiGithubError } = await import("../src/ci-github.js");
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
       inReviewIssue(h, OTHER);
       await movedHead(h);
       await missingOnly(NEXT_HEAD);
-      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: 5 }));
       github.readySince.mockRejectedValue(new CiGithubError("timeout"));
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() }));
       await h.runtime.poll();
       h.advance(180_000);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() - 10_000 }));
       await h.runtime.poll();
-      expect(github.readySince).toHaveBeenCalled();
+      h.advance(60_000);
+      await h.runtime.poll();
+      expect(github.readySince).toHaveBeenCalledTimes(2);
       expect(h.requestWakeup).not.toHaveBeenCalled();
-      h.advance(3_600_000);
+      h.advance(60_000);
       await h.runtime.poll();
+      expect(github.readySince).toHaveBeenCalledTimes(2);
       expect(h.requestWakeup).toHaveBeenCalledTimes(1);
       expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("CI fail") });
+    });
+
+    it("stops reading a failing timeline in the reviewer's last hour before the pending head expires", async () => {
+      const { CiGithubError } = await import("../src/ci-github.js");
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await missingOnly(NEXT_HEAD);
+      github.readySince.mockRejectedValue(new CiGithubError("http", 503));
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() }));
+      await h.runtime.poll();
+      h.advance(LIMITS.waitMs - 2 * 3_600_000);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() - 10_000 }));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      h.advance(90 * 60_000);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() - 10_000 }));
+      await h.runtime.poll();
+      expect(github.readySince).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     });
 
     it("does not let a ready event older than the new head delay the reviewer wake", async () => {
@@ -907,11 +984,13 @@ describe("CI runtime polling and durable wake outcomes", () => {
       inReviewIssue(h, OTHER);
       await movedHead(h);
       await missingOnly(NEXT_HEAD);
-      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: 5 }));
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() }));
       github.readySince.mockResolvedValue(START - 3_600_000);
       await h.runtime.poll();
       h.advance(120_000);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: h.clock() - 10_000 }));
       await h.runtime.poll();
+      expect(github.readySince).toHaveBeenCalled();
       expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     });
 

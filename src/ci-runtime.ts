@@ -165,7 +165,9 @@ function refusalDetail(error: unknown): { code: string; reason: string; auditDet
   return { code, reason, auditDetail };
 }
 
-const TIMELINE_RETRY_MS = 60 * 60_000;
+// The last stretch before a wait or pending head expires never consults the
+// timeline, so an unrecovered timeline error cannot outlive the entry.
+const TIMELINE_EXPIRY_MARGIN_MS = 60 * 60_000;
 
 function transientTimelineError(error: unknown): boolean {
   if (!(error instanceof CiGithubError)) return false;
@@ -563,18 +565,21 @@ export class CiWakeRuntime {
    * Checks that only run on ready PRs register after the draft flips. Only a
    * missing-check-only failure on a ready PR consults the timeline, so its
    * grace restarts at the latest ready_for_review event. Null: retry later.
-   * Only transient timeline errors retry, and only for TIMELINE_RETRY_MS past
-   * the un-graced fail point; a repeatable one (page cap, budget, malformed
-   * body, 4xx) or a transient one that outlasts that window would otherwise
-   * retry until the wait expires, so it falls back to the un-graced verdict:
-   * at worst one early wake, never a lost one.
+   * Marking a PR ready bumps its updated_at, so once updated_at is a full
+   * grace old the timeline cannot change the verdict and is not read; the
+   * verdict still counts as consulted so a toggle before the final re-read
+   * defers the wake. Only transient timeline errors retry; a repeatable one
+   * (page cap, budget, malformed body, 4xx) falls back to the un-graced
+   * verdict: at worst one early wake, never a lost one.
    */
-  private async readyGrace(github: CiGithub, repo: string, prNumber: number, draft: boolean, snapshot: CiSnapshot, timing: CiReadinessTiming): Promise<{ verdict: CiReadiness; consulted: boolean } | null> {
+  private async readyGrace(github: CiGithub, repo: string, prNumber: number, draft: boolean, updatedAt: number | null, expiresAt: number, snapshot: CiSnapshot, timing: CiReadinessTiming): Promise<{ verdict: CiReadiness; consulted: boolean } | null> {
     const verdict = evaluateReadiness(snapshot, timing);
     if (verdict.kind !== "fail" || verdict.failed.length || !verdict.missing.length || draft) return { verdict, consulted: false };
+    if (updatedAt == null || timing.now >= expiresAt - TIMELINE_EXPIRY_MARGIN_MS) return { verdict, consulted: false };
+    if (timing.now >= updatedAt + 2 * timing.medianMs) return { verdict, consulted: true };
     let readySince: number | undefined;
     try { readySince = await github.readySince(repo, prNumber); } catch (error) {
-      if (transientTimelineError(error) && verdict.missingFailAt !== null && timing.now < verdict.missingFailAt + TIMELINE_RETRY_MS) return null;
+      if (transientTimelineError(error)) return null;
       readySince = undefined;
     }
     return { verdict: readySince === undefined ? verdict : evaluateReadiness(snapshot, { ...timing, readySince }), consulted: true };
@@ -657,7 +662,7 @@ export class CiWakeRuntime {
         const samples = ledger.samples[`${wait.companyId}:${wait.repo}`] ?? [];
         const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
-        const graced = await this.readyGrace(github, wait.repo, wait.prNumber, pr.draft, snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
+        const graced = await this.readyGrace(github, wait.repo, wait.prNumber, pr.draft, pr.updatedAt, wait.expiresAt, snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
         if (!graced || graced.verdict.kind === "pending") continue;
         const { verdict } = graced;
         await this.checkBinding(wait);
@@ -764,7 +769,7 @@ export class CiWakeRuntime {
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
           const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
-          const graced = await this.readyGrace(github, entry.repo, entry.prNumber, current.draft, snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
+          const graced = await this.readyGrace(github, entry.repo, entry.prNumber, current.draft, current.updatedAt, entry.observedAt + LIMITS.waitMs, snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
           if (!graced || graced.verdict.kind === "pending") continue;
           const { verdict } = graced;
