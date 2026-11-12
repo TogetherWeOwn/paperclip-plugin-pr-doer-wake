@@ -4,7 +4,7 @@ import type { CustodyPull } from "../src/custody-github.js";
 import { CustodyGithub } from "../src/custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
-import { CUSTODY_ORIGIN, DAY } from "../src/custody-policy.js";
+import { CUSTODY_ORIGIN, DAY, hasCardClosure, latestDisposition } from "../src/custody-policy.js";
 vi.mock("../src/custody-reader.js", () => ({ custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -85,10 +85,27 @@ describe("custody native effects", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ reason: "pr_disposition_due", idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
     expect(h.docs.get(ISSUE).body).toContain("Head: " + "a".repeat(40));
     expect(h.docs.get(ISSUE).body).toContain("disposition in a comment on the source card");
-    expect(h.docs.get(ISSUE).body).toContain("closure rationale belongs in a source-card comment and on the PR");
+    expect(h.docs.get(ISSUE).body).toContain("PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD");
+    expect(h.docs.get(ISSUE).body).toContain("Closed unmerged: <reason>; source owner/repo#number");
     await h.restart().poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.ledger().report.complete).toBe(true);
+  });
+  it("provides directives that the policy accepts when placeholders are filled", async () => {
+    const h = fixture();
+    await h.runtime.poll();
+    const guidance = h.docs.get(ISSUE).body as string;
+    const directive = guidance.match(/`(PR disposition:[^`]+)`/)![1]!
+      .replace("owner/repo#number", "example/project#42")
+      .replace("finish|rework|defer|close", "defer")
+      .replace("<actor>", "reviewer")
+      .replace("YYYY-MM-DD", "2026-11-01");
+    const closure = guidance.match(/`(Closed unmerged:[^`]+)`/)![1]!
+      .replace("<reason>", "superseded")
+      .replace("owner/repo#number", "example/project#42");
+    const source = card({ texts: [{ id: "comment:1", body: `${directive}\n${closure}`, at: NOW, ownership: false }] });
+    expect(latestDisposition(source, pull())).toEqual(expect.objectContaining({ action: "defer", revisit: Date.parse("2026-11-01T00:00:00Z") }));
+    expect(hasCardClosure(source, pull())).toBe(true);
   });
   it.each(["done", "cancelled", "backlog", "blocked"])("creates explicit todo child and wake for %s source", async (status) => {
     const h = fixture({ cards: [card({ status })] });
@@ -143,7 +160,9 @@ describe("custody native effects", () => {
     const h = fixture();
     h.ctx.issues.requestWakeup.mockRejectedValue(new Error("synthetic-provider-token must never be logged"));
     await h.runtime.poll();
+    h.docs.set(ISSUE, { body: "Legacy guidance" });
     await h.restart().poll();
+    expect(h.docs.get(ISSUE).body).toBe("Legacy guidance");
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "unconfirmed" })]);
     expect(JSON.stringify([...h.state.values()])).not.toContain("synthetic-provider-token");
@@ -152,6 +171,20 @@ describe("custody native effects", () => {
     const h = fixture();
     h.ctx.issues.requestWakeup.mockResolvedValueOnce({ queued: false, runId: null } as any);
     await h.runtime.poll();
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+  });
+  it("updates legacy guidance on a deferred retry without losing prior evidence", async () => {
+    const h = fixture();
+    h.ctx.issues.requestWakeup.mockResolvedValueOnce({ queued: false, runId: null } as any);
+    await h.runtime.poll();
+    const legacy = `Previous notes\nKey: example/project#42|idle|${NOW - 8 * DAY}\nOld guidance\n`;
+    h.docs.set(ISSUE, { body: legacy });
+    await h.restart().poll();
+    expect(h.docs.get(ISSUE).body).toContain(legacy);
+    expect(h.docs.get(ISSUE).body).toContain("PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD");
+    expect(h.docs.get(ISSUE).body).toContain("Closed unmerged: <reason>; source owner/repo#number");
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
     await h.restart().poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
   });

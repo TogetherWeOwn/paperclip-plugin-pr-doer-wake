@@ -592,7 +592,9 @@ export class CustodyRuntime {
           }
           guard();
           const previous = await this.ctx.issues.documents.get(target, "pr-custody", config.companyId);
-          const evidence = previous?.body.includes(`Key: ${trigger.key}\n`) ? previous.body : `${previous?.body ?? ""}\n${this.evidence(pr, trigger)}`;
+          let evidence = previous?.body.includes(`Key: ${trigger.key}\n`) ? previous.body : `${previous?.body ?? ""}\n${this.evidence(pr, trigger)}`;
+          // Pending retries may retain guidance written by an older version.
+          if (!evidence.includes(this.dispositionGuidance())) evidence += `\n${this.dispositionGuidance()}\n`;
           if (evidence.length > 250_000) throw new Error("evidence_capacity");
           guard();
           spend();
@@ -643,8 +645,12 @@ export class CustodyRuntime {
     if (!current || JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("custody_configuration_changed");
   }
 
+  private dispositionGuidance(): string {
+    return "Record a PR-specific disposition in a comment on the source card using one line: `PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD` (choose one action and replace the placeholders). For a closed unmerged PR, also record `Closed unmerged: <reason>; source owner/repo#number` in a source-card comment, and put the closure rationale on the PR.";
+  }
+
   private evidence(pr: CustodyPull, trigger: Trigger): string {
-    return `# PR disposition due\n\nPR: ${prUrl(pr)}\nHead: ${pr.headSha}\nTrigger: ${trigger.kind}\nEpoch: ${trigger.epoch}\nKey: ${trigger.key}\n\nChoose finish, rework, defer or close using current evidence and existing review/release gates. Idle age is a trigger, never a verdict. Preserve valid supersession and unique work. Record a PR-specific disposition in a comment on the source card; closure rationale belongs in a source-card comment and on the PR. This job never closes, reopens or merges PRs.\n`;
+    return `# PR disposition due\n\nPR: ${prUrl(pr)}\nHead: ${pr.headSha}\nTrigger: ${trigger.kind}\nEpoch: ${trigger.epoch}\nKey: ${trigger.key}\n\nChoose finish, rework, defer or close using current evidence and existing review/release gates. Idle age is a trigger, never a verdict. Preserve valid supersession and unique work. ${this.dispositionGuidance()} This job never closes, reopens or merges PRs.\n`;
   }
 
   private async child(config: CustodyConfig, originId: string, title: string, body: string, card: CustodyCard | null, guard: () => void, audit: (operation: string, outcome: string, key?: string) => void, save: () => Promise<void>, receipt: Receipt, spend: () => void): Promise<string> {
