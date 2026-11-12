@@ -743,6 +743,18 @@ describe("CI runtime polling and durable wake outcomes", () => {
       }
     });
 
+    it("does not wake a card that has since moved to another workspace when the host omits work products", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      delete (h.issue as { workProducts?: unknown }).workProducts;
+      await movedHead(h);
+      // The card is re-scoped to a different execution workspace before CI settles.
+      Object.assign(h.issue, { executionWorkspaceId: "77777777-7777-4777-8777-777777777777" });
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);

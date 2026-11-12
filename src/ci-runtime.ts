@@ -776,9 +776,20 @@ export class CiWakeRuntime {
             if (issue.status !== "in_review") continue;
             const state = issue.executionState;
             if (!state || state.status !== "pending" || state.currentStageId == null || !state.currentParticipant) continue;
-            // The host's issues.get omits work products (Paperclip 2026.1106.0), so the
-            // registered wait's PR binding is the link; a supplied list must still match.
-            if (issue.workProducts !== undefined && !this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
+            // The host's issues.get omits work products (Paperclip 2026.1106.0). Then the
+            // card's latest wait on this PR must still match its current project,
+            // workspace and repository; a historical registration alone is not a link.
+            // A supplied work-product list must still name this PR.
+            if (issue.workProducts !== undefined) {
+              if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
+            } else {
+              const latest = ledger.waits
+                .filter((w) => w.companyId === entry.companyId && w.issueId === issueId && w.repo === entry.repo && w.prNumber === entry.prNumber && w.reason !== "binding_changed")
+                .sort((a, b) => b.registeredAt - a.registeredAt)[0];
+              if (!latest) continue;
+              try { await this.checkBinding(latest); }
+              catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
+            }
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
