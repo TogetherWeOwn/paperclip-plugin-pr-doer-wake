@@ -1,6 +1,9 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { DEPENDENCY_WAKE_LIMITS, DependencyWakeRuntime, validateDependencyWakeConfig, type DependencyWakeLedger } from "../src/dependency-wake.js";
+import { validateCiConfig } from "../src/ci-config.js";
+import manifest from "../src/manifest.js";
+import { validateInstanceConfig } from "./fixtures/host-config-validator.js";
 
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const OTHER = "22222222-2222-4222-8222-222222222222";
@@ -138,4 +141,192 @@ describe("dependency wake", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
 
+  // Receipts for other dependents whose blockers are still inside the lookback (newer than DEP's).
+  const heldReceipts = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [rk(filler(i), BLK2, START - 5 * MIN), { at: START - MIN, outcome: "woken" as const, blockerDoneAt: START - 5 * MIN }]));
+
+  it("never evicts a still-relevant receipt at the cap, so a wake whose run never started is not repeated", async () => {
+    const h = harness();
+    h.seed({ version: 1, audits: [], receipts: { [rk(DEP, BLK, DONE)]: { at: START - 25 * MIN, outcome: "woken", blockerDoneAt: START - 30 * MIN, runId: "run-new" }, ...heldReceipts(DEPENDENCY_WAKE_LIMITS.receipts) } });
+    // The queued wake was cancelled before it started, so it sets no run watermark.
+    h.runs[DEP]!.push({ id: "run-new", issueId: DEP, agentId: AGENT, status: "cancelled", createdAt: iso(START - 25 * MIN), startedAt: null, finishedAt: iso(START - 24 * MIN) });
+    for (let n = 0; n < 3; n += 1) await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("woken");
+  });
+
+  it("fails closed when still-relevant receipts fill the cap, and evicts stale ones first", async () => {
+    const h = harness();
+    h.seed({ version: 1, audits: [], receipts: heldReceipts(DEPENDENCY_WAKE_LIMITS.receipts) });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.lastTick).toMatchObject({ complete: false, wakes: 0 });
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("receipt_capacity");
+    // Receipts whose blocker left the lookback no longer dedupe anything and make room.
+    const stale = heldReceipts(DEPENDENCY_WAKE_LIMITS.receipts);
+    for (const r of Object.values(stale)) r.blockerDoneAt = START - 8 * 1_440 * MIN;
+    h.seed({ ...h.ledger()!, receipts: stale });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes a budget-exhausted traversal so later candidates and both statuses are examined", async () => {
+    const h = harness();
+    const dep = h.issues[DEP]!;
+    delete h.issues[DEP];
+    for (let n = 0; n < 900; n += 1) h.issues[filler(n)] = { id: filler(n), companyId: COMPANY, status: "in_review", assigneeAgentId: AGENT, activeRun: null };
+    h.issues[DEP] = dep;
+    h.issues[DEP2] = { id: DEP2, companyId: COMPANY, status: "in_progress", assigneeAgentId: AGENT, activeRun: null };
+    h.relations[DEP2] = [{ id: BLK, identifier: "TWO-1", status: "done" }];
+    for (let n = 0; n < 3; n += 1) await h.runtime.poll();
+    expect(h.ctx.issues.list.mock.calls.map(([query]) => query.status)).toContain("in_progress");
+    expect(wokenIds(h).sort()).toEqual([DEP, DEP2]);
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("tick_budget");
+  });
+
+  it("reports an incomplete tick when the wake budget defers eligible wakes, and wakes the rest next tick", async () => {
+    const h = harness();
+    for (let n = 0; n < 10; n += 1) {
+      h.issues[filler(n)] = { id: filler(n), companyId: COMPANY, status: "in_review", assigneeAgentId: AGENT, activeRun: null };
+      h.relations[filler(n)] = [{ id: BLK, identifier: "TWO-1", status: "done" }];
+    }
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(10);
+    expect(h.ledger()?.lastTick).toMatchObject({ complete: false, wakes: 10 });
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("wake_budget");
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(11);
+    expect(wokenIds(h).at(-1)).toBe(DEP);
+  });
+
+  it("retries a host-deferred wake next tick but never repeats an unconfirmed or not-queued one", async () => {
+    const deferred = harness();
+    deferred.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("worker RPC host is not running"));
+    await deferred.runtime.poll();
+    expect(deferred.ledger()?.receipts).toEqual({});
+    await deferred.runtime.poll();
+    expect(deferred.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(deferred.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("woken");
+    for (const [outcome, impl] of [["unconfirmed", async () => { throw new Error("boom"); }], ["not_queued", async () => ({ queued: false, runId: null })]] as const) {
+      const h = harness();
+      h.ctx.issues.requestWakeup.mockImplementationOnce(impl);
+      await h.runtime.poll();
+      await h.runtime.poll();
+      expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe(outcome);
+    }
+  });
+
+  it("ignores other agents' runs for the watermark: a reviewer's run after the blocker finished is not the assignee seeing it", async () => {
+    const h = harness();
+    h.runs[DEP]!.push({ id: "rv", issueId: DEP, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN), startedAt: iso(START - 20 * MIN), finishedAt: iso(START - 15 * MIN) });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a run window truncated by the host's 100-row cap as unknown evidence, not as the assignee never running", async () => {
+    // Blocker done at T-30m; the assignee started a run at T-25m and so saw it.
+    const reviewerRuns = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `rv${i}`, issueId: DEP, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN + i * 1_000), startedAt: iso(START - 20 * MIN + i * 1_000), finishedAt: iso(START - 20 * MIN + i * 1_000 + 500) }));
+    for (const [n, audited] of [[99, false], [100, true]] as const) {
+      const h = harness();
+      Object.assign(h.runs[DEP]![0]!, { createdAt: iso(START - 25 * MIN), startedAt: iso(START - 25 * MIN), finishedAt: iso(START - 22 * MIN) });
+      // Newer reviewer runs; at 100 they push the assignee's run out of the window.
+      h.runs[DEP]!.push(...reviewerRuns(n));
+      await h.runtime.poll();
+      expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger()?.receipts).toEqual({});
+      expect(h.ledger()?.audits.map((a) => a.outcome).includes("run_window_truncated")).toBe(audited);
+    }
+  });
+
+  it("fails closed on a full window even when every visible assignee run started before the blocker finished", async () => {
+    // A truncated history hides only runs created earlier, but one of those could have been
+    // queued long and started after the blocker finished: unknown, so audit rather than guess.
+    const h = harness();
+    h.runs[DEP]!.push(...Array.from({ length: 99 }, (_, i) => ({ id: `rv${i}`, issueId: DEP, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 80 * MIN + i * 1_000), startedAt: iso(START - 80 * MIN + i * 1_000), finishedAt: iso(START - 80 * MIN + i * 1_000 + 500) })));
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("run_window_truncated");
+  });
+
+  it("treats a genuine re-completion (new completedAt epoch) as a new event and wakes once for it", async () => {
+    const h = harness();
+    await h.runtime.poll();
+    // The wake ran; the blocker was then reopened (completedAt cleared) and finished again.
+    h.runs[DEP]!.push({ id: "run-new", issueId: DEP, agentId: AGENT, status: "succeeded", createdAt: iso(START - 28 * MIN), startedAt: iso(START - 28 * MIN), finishedAt: iso(START - 26 * MIN) });
+    h.issues[BLK]!.completedAt = iso(START - 15 * MIN);
+    await h.runtime.poll();
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    const keys = (h.ctx.issues.requestWakeup.mock.calls as unknown as Array<[string, string, { idempotencyKey: string }]>).map(([, , o]) => o.idempotencyKey);
+    expect(new Set(keys).size).toBe(2);
+    expect(Object.keys(h.ledger()!.receipts).sort()).toEqual([rk(DEP, BLK, DONE), rk(DEP, BLK, START - 15 * MIN)].sort());
+  });
+
+  it("never re-wakes the same completion epoch under stale-receipt cap pressure", async () => {
+    const h = harness();
+    // Cap-many newer receipts whose blockers left the lookback: eviction may drop only those.
+    const stale = Object.fromEntries(Array.from({ length: DEPENDENCY_WAKE_LIMITS.receipts }, (_, i) => [rk(filler(i), BLK2, START - 8 * 1_440 * MIN), { at: START - MIN, outcome: "woken" as const, blockerDoneAt: START - 8 * 1_440 * MIN }]));
+    h.seed({ version: 1, audits: [], receipts: { [rk(DEP, BLK, DONE)]: { at: START - 25 * MIN, outcome: "woken", blockerDoneAt: DONE, runId: "run-new" }, ...stale } });
+    h.runs[DEP]!.push({ id: "run-new", issueId: DEP, agentId: AGENT, status: "cancelled", createdAt: iso(START - 25 * MIN), startedAt: null, finishedAt: iso(START - 24 * MIN) });
+    for (let n = 0; n < 3; n += 1) await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("woken");
+    expect(Object.keys(h.ledger()!.receipts)).toHaveLength(DEPENDENCY_WAKE_LIMITS.receipts);
+  });
+
+  it("honors the global dryRun kill switch: no live wake, shadow evidence only, and a mid-tick dryRun aborts", async () => {
+    for (const config of [{ ...live, dryRun: true }, { dependencyWakeEnabled: true, dependencyWakeShadow: false, dependencyWakeCompanyId: COMPANY }]) {
+      const h = harness();
+      h.setConfig(config);
+      await h.runtime.poll();
+      expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger()).toBeUndefined();
+      expect(h.ledger("shadow")?.receipts[rk(DEP, BLK, DONE)]?.outcome).toBe("would_wake");
+    }
+    const h = harness();
+    h.ctx.config.get.mockResolvedValueOnce({ ...live }).mockResolvedValueOnce({ ...live, dryRun: true });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toEqual(["configuration_changed"]);
+  });
+
+  it("aborts before the effect when a rollback lands mid-tick", async () => {
+    const h = harness();
+    h.ctx.config.get.mockResolvedValueOnce({ ...live }).mockResolvedValueOnce({ ...live, dependencyWakeShadow: true });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toEqual(["configuration_changed"]);
+    expect(h.ledger()?.receipts).toEqual({});
+  });
+
+  it("isolates a failing candidate read and keeps the tick going", async () => {
+    const h = harness();
+    h.ctx.issues.relations.get.mockRejectedValueOnce(new Error("Issue not found"));
+    await h.runtime.poll();
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toEqual(["candidate_error"]);
+    expect(h.ledger()?.lastTick?.complete).toBe(true);
+  });
+
+  it("fails closed when disabled, unscoped or configured for another company", async () => {
+    for (const setup of [
+      (h: ReturnType<typeof harness>) => h.runtime.setCompanyId(null),
+      (h: ReturnType<typeof harness>) => h.setConfig({ ...live, dependencyWakeEnabled: false }),
+      (h: ReturnType<typeof harness>) => h.setConfig({ ...live, dependencyWakeCompanyId: OTHER }),
+    ]) {
+      const h = harness();
+      setup(h);
+      await h.runtime.poll();
+      expect(h.ctx.issues.list).not.toHaveBeenCalled();
+      expect(h.ledger()).toBeUndefined();
+    }
+  });
+
+  it("validates config at both layers: enabling requires the company id", () => {
+    expect(validateDependencyWakeConfig({ dependencyWakeEnabled: true }).length).toBe(1);
+    expect(validateDependencyWakeConfig(live)).toEqual([]);
+    expect(validateCiConfig(live)).toEqual([]);
+    expect(validateInstanceConfig(live, manifest.instanceConfigSchema!).valid).toBe(true);
+    expect(validateInstanceConfig({ dependencyWakeEnabled: true }, manifest.instanceConfigSchema!).valid).toBe(false);
+    expect(manifest.jobs?.find((job) => job.jobKey === "dependency-wake")?.schedule).toBe("*/5 * * * *");
+  });
 });

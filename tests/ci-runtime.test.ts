@@ -249,7 +249,7 @@ describe("native CI plugin entrypoint", () => {
       "jobs.schedule", "plugin.state.read", "plugin.state.write", "secrets.read-ref", "webhooks.receive",
       "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
 "projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
-      "events.subscribe", "issue.interactions.read",
+      "events.subscribe", "issue.interactions.read", "issues.orchestration.read",
     ].sort());
     expect(manifest.tools).toEqual([registrationTool]);
     expect(registrationTool.parametersSchema).toMatchObject({ additionalProperties: false, required: ["issueId", "repo", "prNumber", "headSha"] });
@@ -257,6 +257,7 @@ describe("native CI plugin entrypoint", () => {
       expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/15 * * * *" }),
       expect.objectContaining({ jobKey: "gates-status-sweep", schedule: "*/4 * * * *" }),
       expect.objectContaining({ jobKey: "pr-custody", schedule: "17 * * * *" }),
+      expect.objectContaining({ jobKey: "dependency-wake", schedule: "*/5 * * * *" }),
     ]);
     expect(manifest.capabilities).not.toContain("issues.update");
     expect(manifest.capabilities).not.toContain("issue.comments.create");
