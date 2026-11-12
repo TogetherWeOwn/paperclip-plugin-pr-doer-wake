@@ -95,6 +95,8 @@ describe("custody native effects", () => {
     if (status === "blocked") h.activity.mockResolvedValue(NOW - 8 * DAY);
     await h.runtime.poll();
     expect(h.ctx.issues.create).toHaveBeenCalledWith(expect.objectContaining({ status: "todo", parentId: ISSUE, assigneeAgentId: ISSUE, originKind: CUSTODY_ORIGIN }));
+    // An explicit null opts out of inheriting the source card's (possibly archived) workspace.
+    expect(h.ctx.issues.create.mock.calls[0]![0]).toHaveProperty("executionWorkspaceId", null);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(CHILD, COMPANY, expect.objectContaining({ idempotencyKey: h.created[0].originId }));
   });
   it("routes unassigned source child to the configured summary owner", async () => {

@@ -663,7 +663,10 @@ export class CustodyRuntime {
     receipt.status = "attempting";
     try { await save(); guard(); }
     catch (error) { receipt.status = "pending"; throw error; }
-    const created = await this.ctx.issues.create({ companyId: config.companyId, ...(card ? { parentId: card.id } : {}), title, description: body.slice(0, 16_000), status: "todo", priority: "medium", assigneeAgentId: card?.assigneeAgentId ?? config.summaryAgentId, originKind: CUSTODY_ORIGIN, originId });
+    // A child would otherwise inherit the source card's execution workspace,
+    // which for an old card is often archived: the run then fails at setup.
+    // An explicit null keeps the source project but takes a fresh workspace.
+    const created = await this.ctx.issues.create({ companyId: config.companyId, ...(card ? { parentId: card.id } : {}), executionWorkspaceId: null, title, description: body.slice(0, 16_000), status: "todo", priority: "medium", assigneeAgentId: card?.assigneeAgentId ?? config.summaryAgentId, originKind: CUSTODY_ORIGIN, originId });
     if (!created || created.companyId !== config.companyId || !UUID.test(created.id) || created.originId !== originId || created.originKind !== CUSTODY_ORIGIN) throw new Error("invalid_created_card");
     receipt.childId = created.id;
     receipt.status = "pending";
