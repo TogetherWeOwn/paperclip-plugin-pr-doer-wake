@@ -120,4 +120,234 @@ describe("loadCustodyCards", () => {
     expect(h.trace).toEqual(["guard", "query", "guard", "query"]);
   });
 
+  it("retains all card statuses, null project/identifier, and unrelated plugin/routine origins", async () => {
+    const statuses = ["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"];
+    const origins = ["manual", "routine_execution", "plugin:other:operation", "plugin:togetherweown.pr-doer-wake:another",
+      "plugin:pr-custody-other", `${OWN}-other`, "task_watchdog"];
+    const h = host({ cards: statuses.map((status, i) => card(i + 1, {
+      status, origin_kind: origins[i], project_id: null, identifier: null, description: null,
+      completed_at: status === "done" ? AT : null, cancelled_at: status === "cancelled" ? AT : null,
+    })) });
+    const result = await loadAll(h.ctx,  h.guard);
+    expect(result.map((c) => c.status)).toEqual(statuses);
+    expect(result.every((c) => c.projectId === null && c.identifier === null)).toBe(true);
+    expect(result.find((c) => c.status === "done")?.completedAt).toBe(MS);
+    expect(result.find((c) => c.status === "cancelled")?.cancelledAt).toBe(MS);
+    expect(h.query.mock.calls[0]![0]).not.toMatch(/status\s*(?:=|IN)/i);
+  });
+
+  it("excludes only chat conversations and generated custody cards, not their sibling origins", async () => {
+    const h = host({ cards: [
+      card(1, { origin_kind: "chat_channel" }), card(2, { origin_kind: OWN }),
+      card(3, { origin_kind: `${OWN}:operation` }), card(4, { origin_kind: "plugin_pr_custody" }),
+      card(5, { conversation_agent_id: AGENT, conversation_user_id: "human", conversation_state: "active" }),
+      card(6, { origin_kind: "plugin:other:operation" }),
+    ] });
+    expect((await loadAll(h.ctx,  h.guard)).map((c) => c.id)).toEqual([uuid(6)]);
+    for (const [, params] of h.query.mock.calls.slice(1)) expect(params?.[3]).toBe(`{${uuid(6)}}`);
+  });
+
+  it("does not read document metadata or bodies, including generated documents", async () => {
+    const h = host({ documents: [document(1, { key: "pr-custody" }), document(2)] });
+    const result = await loadAll(h.ctx, h.guard);
+    expect(h.query.mock.calls.every(([sql]) => !sql.includes("issue_documents"))).toBe(true);
+    expect(h.get).not.toHaveBeenCalled();
+    expect(result[0]!.texts).toHaveLength(2);
+  });
+
+  it("retains author metadata for live comments and excludes deleted comments", async () => {
+    const h = host({ comments: [
+      comment(1, { body: "agent" }),
+      comment(2, { body: "human", author_agent_id: null, author_user_id: "human", author_type: "user" }),
+      comment(3, { body: "deleted", deleted_at: AT }),
+      comment(4, { body: "legacy-agent", author_type: null }),
+      comment(5, { body: "system", author_type: "system" }),
+      comment(6, { body: "ambiguous", author_user_id: "human" }),
+    ] });
+    const result = await loadAll(h.ctx,  h.guard);
+    expect(result[0]!.texts.slice(2).map(({ body, ownership }) => ({ body, ownership }))).toEqual([
+      { body: "agent", ownership: true }, { body: "human", ownership: false },
+      { body: "legacy-agent", ownership: true }, { body: "system", ownership: false },
+      { body: "ambiguous", ownership: false },
+    ]);
+  });
+
+  it("keyset-paginates without losing evidence after page one", async () => {
+    const h = host({
+      cards: Array.from({ length: 201 }, (_, i) => card(i + 1)),
+      comments: Array.from({ length: 201 }, (_, i) => comment(i + 1)),
+      documents: Array.from({ length: 201 }, (_, i) => document(i + 1)),
+    });
+    const result = await loadAll(h.ctx,  h.guard);
+    expect(result).toHaveLength(201);
+    expect(result[0]!.texts).toHaveLength(203);
+    const calls = h.query.mock.calls;
+    expect(calls).toHaveLength(5);
+    for (const index of [1, 3]) expect(calls[index]![1]?.[1]).toBe(uuid(200));
+    expect(calls[4]![1]?.[3]).toBe(`{${uuid(201)}}`);
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.guard).toHaveBeenCalledTimes(5);
+  });
+
+  it("paginates comments to exhaustion in both selected issue batches", async () => {
+    const h = host({
+      cards: Array.from({ length: 201 }, (_, i) => card(i + 1)),
+      comments: Array.from({ length: 402 }, (_, i) => comment(i + 1, { issue_id: uuid(i < 201 ? 1 : 201) })),
+    });
+    const result = await loadAll(h.ctx, h.guard);
+    expect(result[0]!.texts).toHaveLength(203);
+    expect(result[200]!.texts).toHaveLength(203);
+    const calls = h.query.mock.calls.filter(([sql]) => sql.includes("FROM public.issue_comments"));
+    expect(calls.map(([, params]) => params?.[1])).toEqual([null, uuid(200), null, uuid(401)]);
+    expect(calls.map(([, params]) => params?.[3])).toEqual([
+      `{${Array.from({ length: 200 }, (_, i) => uuid(i + 1)).join(",")}}`,
+      `{${Array.from({ length: 200 }, (_, i) => uuid(i + 1)).join(",")}}`,
+      `{${uuid(201)}}`, `{${uuid(201)}}`,
+    ]);
+  });
+
+  it.each([0, 1])("shares the metadata and comment byte limit (overflow %i)", async (overflow) => {
+    const chunk = "a".repeat(128_000);
+    const cards = Array.from({ length: 262 }, (_, i) => card(i + 1, { title: chunk, description: chunk }));
+    const remaining = CUSTODY_READ_LIMITS.totalBytes - 524 * chunk.length - 1;
+    const h = host({ cards, comments: [
+      comment(1, { body: "x", issue_id: uuid(1) }),
+      comment(2, { body: "界" + "a".repeat(remaining - 3 + overflow), issue_id: uuid(201) }),
+    ] });
+    if (overflow) await expect(loadAll(h.ctx, h.guard)).rejects.toThrow("total byte budget");
+    else {
+      const result = await loadAll(h.ctx, h.guard);
+      expect(result).toHaveLength(262);
+      expect(result[0]!.texts.at(-1)?.body).toBe("x");
+      expect(result[200]!.texts.at(-1)?.body.startsWith("界")).toBe(true);
+    }
+  });
+
+  it("allows an exactly-at-cap card view only after an exhaustion probe", async () => {
+    const count = CUSTODY_READ_LIMITS.cards;
+    const h = host({ cards: Array.from({ length: count }, (_, i) => card(i + 1, { description: null })) });
+    expect(await loadAll(h.ctx,  h.guard)).toHaveLength(count); // metadata-only at-cap view
+    const issueCalls = h.query.mock.calls.filter(([sql]) => sql.includes("FROM public.issues\n"));
+    expect(issueCalls).toHaveLength(count / 200 + 1);
+    expect(issueCalls.at(-1)?.[1]).toEqual([COMPANY, uuid(count), 1]);
+  });
+
+  it.each([
+    ["cards", CUSTODY_READ_LIMITS.cards + 1, card, "issues"],
+    ["comments", CUSTODY_READ_LIMITS.comments + 1, comment, "issue_comments"],
+  ] as const)("rejects %s cap exhaustion rather than returning a partial view", async (key, count, make, table) => {
+    const h = host({ [key]: Array.from({ length: count }, (_, i) => make(i + 1)) });
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow(`UNKNOWN custody snapshot: ${table} row budget exceeded`);
+    expect(h.get).not.toHaveBeenCalled();
+    const relevant = h.query.mock.calls.filter(([sql]) => sql.includes(`FROM public.${table}\n`));
+    expect(relevant.length).toBeLessThanOrEqual(Math.ceil(count / 200) + 1);
+  });
+
+  it.each(["issues", "issue_comments"])("rejects a cross-company %s row even if the host violates its query scope", async (table) => {
+    const h = host();
+    if (table !== "issues") h.query.mockResolvedValueOnce([card()]);
+    h.query.mockResolvedValueOnce([{ ...(table === "issues" ? card() : comment()), company_id: OTHER }]);
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("cross-company");
+    expect(h.get).not.toHaveBeenCalled();
+  });
+
+  it.each(["issues", "issue_comments"])("rejects duplicate %s row IDs", async (table) => {
+    const h = host();
+    if (table !== "issues") h.query.mockResolvedValueOnce([card()]);
+    const row = table === "issues" ? card() : comment();
+    h.query.mockResolvedValueOnce([row, row]);
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate or unordered");
+  });
+
+  it("rejects duplicate IDs across page boundaries", async () => {
+    const h = host();
+    h.query.mockResolvedValueOnce(Array.from({ length: 200 }, (_, i) => card(i + 1)));
+    h.query.mockResolvedValueOnce([card(200)]);
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate or unordered");
+  });
+
+  it("rejects comments linked to an unexpected issue", async () => {
+    const h = host();
+    h.query.mockResolvedValueOnce([card()]);
+    h.query.mockResolvedValueOnce([comment(1, { issue_id: uuid(99) })]);
+    await expect(loadAll(h.ctx, h.guard)).rejects.toThrow("unexpected issue");
+  });
+
+  it("rejects a comment belonging to a different selected batch", async () => {
+    const cards = Array.from({ length: 201 }, (_, i) => card(i + 1));
+    const h = host({ cards });
+    h.query.mockResolvedValueOnce(cards.slice(0, 200)).mockResolvedValueOnce(cards.slice(200));
+    h.query.mockResolvedValueOnce([comment(1, { issue_id: uuid(201) })]);
+    await expect(loadAll(h.ctx, h.guard)).rejects.toThrow("unexpected issue");
+  });
+
+  it.each([
+    { id: "not-an-id" }, { title: 1 }, { description: undefined }, { status: "unknown" },
+    { status_version: -1 }, { status_version: "9007199254740992" }, { status_version: "1.5" },
+    { status_version: undefined }, { updated_at: "invalid" }, { completed_at: "invalid" },
+    { assignee_agent_id: "invalid" }, { project_id: undefined }, { origin_kind: null },
+  ])("rejects malformed card data: %j", async (patch) => {
+    const h = host({ cards: [card(1, patch)] });
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+  });
+
+  it("accepts a numeric status version without deriving it from mutable timestamps", async () => {
+    const h = host({ cards: [card(1, { status_version: 0, updated_at: new Date(AT) })] });
+    expect((await loadAll(h.ctx,  h.guard))[0]!.statusVersion).toBe(0);
+  });
+
+  it.each([null, {}, [null], Array.from({ length: 201 }, (_, i) => card(i + 1))])("rejects malformed host page responses", async (page) => {
+    const h = host();
+    h.query.mockResolvedValueOnce(page as Row[]);
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+  });
+
+  it.each([
+    ["title", "a".repeat(128_001)], ["description", "a".repeat(128_001)],
+    ["description", "界".repeat(90_000)],
+  ])("rejects %s character or UTF-8 body budgets", async (field, body) => {
+    const h = host({ cards: [card(1, { [field]: body })] });
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+  });
+
+  it("rejects oversized comments without reading oversized documents", async () => {
+    const comments = host({ comments: [comment(1, { body: "a".repeat(128_001) })] });
+    await expect(loadAll(comments.ctx, comments.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    const docs = host({ documents: [document()] });
+    docs.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "界".repeat(90_000), updatedAt: AT });
+    await expect(loadAll(docs.ctx, docs.guard)).resolves.toHaveLength(1);
+    expect(docs.get).not.toHaveBeenCalled();
+  });
+
+  it("accepts exactly the shared byte limit and rejects one more byte", () => {
+    const budget = createCustodyByteBudget();
+    const chunk = "a".repeat(128_000);
+    const count = Math.floor(CUSTODY_READ_LIMITS.totalBytes / chunk.length);
+    for (let i = 0; i < count; i++) budget(chunk);
+    budget("a".repeat(CUSTODY_READ_LIMITS.totalBytes - count * chunk.length));
+    expect(() => budget("a")).toThrow("total byte budget");
+  });
+
+  it("rejects aggregate evidence bytes during pagination", async () => {
+    const body = "a".repeat(128_000);
+    const count = Math.floor(CUSTODY_READ_LIMITS.totalBytes / body.length) + 1;
+    const h = host({ comments: Array.from({ length: count }, (_, i) => comment(i + 1, { body })) });
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("total byte budget");
+    // Reject while consuming the page crossing the byte budget.
+    expect(h.query).toHaveBeenCalledTimes(1 + Math.ceil(count / 200));
+  });
+
+  it.each([1, 2])("runs guard immediately before host RPC %s and stops if it throws", async (stopAt) => {
+    const h = host({ documents: [document()] });
+    let count = 0;
+    h.guard.mockImplementation(() => { if (++count === stopAt) throw new Error("lease expired"); });
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("lease expired");
+    expect(h.query.mock.calls.length + h.get.mock.calls.length).toBe(stopAt - 1);
+  });
+
+  it("propagates host errors rather than returning cards already collected", async () => {
+    const h = host({ documents: [document()] });
+    h.query.mockResolvedValueOnce([card()]).mockRejectedValueOnce(new Error("SDK read failed"));
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("SDK read failed");
+  });
 });
