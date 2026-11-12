@@ -7,7 +7,7 @@ import { parseCustodyConfig, type CustodyConfig } from "./custody-config.js";
 import { CustodyAppAuth } from "./custody-auth.js";
 import { CustodyGithub, type CustodyPull } from "./custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, parseWorkProductBindings, type CustodyCard } from "./custody-reader.js";
-import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prIndexRef, prReference, prRefFromUrl, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
+import { CUSTODY_ORIGIN, DAY, custodyTriggers, directiveLines, latestDisposition, mapCustodyCard, prIndexRef, prReference, prRefFromUrl, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
 
 // A 100-PR listing page carries full PR bodies; long bodies push it past the
 // default 2 MiB response cap, so custody uses the transport's 8 MiB maximum.
@@ -294,33 +294,16 @@ export class CustodyRuntime {
       // Phase B: explicit-tier mapping over metadata only, then bounded
       // evidence loads for mapped candidates only.
       const cardsById = new Map(cards.map((c) => [c.id, c]));
-      // Enrich work-product bindings for every card in a project that owns
-      // at least one inventoried repo, plus any card the index already
-      // knows. A card bound to a PR only by a work product (a dormant/done
-      // card with no registration, workspace branch, URL text or tracker
-      // identifier) is discoverable only through this tier, so enrichment
-      // must reach cards the cold ledger has never seen — restricting it
-      // to index-known cards would leave such cards unmapped forever
-      // while the tick still reports complete=true. Every eligible card
-      // is enriched each tick, bounded by the existing host-read and tick
-      // budgets (guard throws fail closed as a surfaced inventory
-      // failure); event subscriptions only accelerate discovery between
-      // ticks. A missing/unreadable workProducts field is UNKNOWN, never
-      // treated as proven-absent (see parseWorkProductBindings). Projectless
-      // cards are enriched too: the work-product tier itself has no project
-      // gate, so skipping them would leave projectless work-product-only
-      // cards unmapped while the tick reports complete=true.
-      const enrichIds = new Set<string>(Object.values(ledger.prToCards));
-      for (const card of cards) {
-        if (card.projectId === null) enrichIds.add(card.id);
-        else if ([...(reposByProject.get(card.projectId) ?? [])].some((repo) => monitored.has(repo))) enrichIds.add(card.id);
-      }
+      // Explicit work-product ownership has no project restriction, so a
+      // cold index cannot rule out any company card, even one in a project
+      // whose workspace points elsewhere. Read every card within the existing
+      // host/time budgets; an unsuccessful read prevents ownership effects.
+      const enrichIds = new Set(cards.map((card) => card.id));
       // A failed/absent enrichment read could hide the true work-product
       // owner, so any such UNKNOWN bars ownership effects this tick (fail
       // closed): mapping and discovery persist, dispatch is deferred.
       let enrichmentUnknown = false;
       const omitted: string[] = [];
-      let tierServed = false;
       for (const cardId of enrichIds) {
         const card = cardsById.get(cardId);
         if (!card) continue;
@@ -335,18 +318,16 @@ export class CustodyRuntime {
           // The host omits workProducts from issue reads (Paperclip 1106); see
           // the tier decision after this loop. A present but malformed field fails closed.
           if (!("workProducts" in fresh) || (fresh as { workProducts?: unknown }).workProducts === undefined) { omitted.push(cardId); continue; }
-          tierServed = true;
           const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
           if (bindings === null) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
           card.workProducts = bindings;
-        } catch { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
+        } catch (error) {
+          unknown(`work_product:${cardId}`); enrichmentUnknown = true;
+          if (error instanceof Error && error.message === "custody_tick_budget") break;
+        }
       }
-      // Omitted or unreadable on every read: the tier is unavailable, so map
-      // through the remaining tiers. Served on some reads: an unread binding
-      // could outrank a lower-tier match, so those cards are UNKNOWN and
-      // effects are deferred.
-      if (omitted.length && tierServed) for (const cardId of omitted) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
-      else if (omitted.length) audit("inventory", "work_product_tier_unavailable");
+      // Even universal omission cannot prove that a higher-tier owner is absent.
+      for (const cardId of omitted) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
       const candidates = new Map<string, CustodyCard>();
       const seenPrs = new Set<string>();
       for (const [, inv] of inventories) {
@@ -619,7 +600,7 @@ export class CustodyRuntime {
 
   private async dispositionClock(card: CustodyCard, pr: CustodyPull, ledger: Ledger, archived: (id: string) => Promise<number | null>): Promise<CustodyCard> {
     const texts: CustodyCard["texts"] = [];
-    for (const text of card.texts) for (const line of text.body.split(/\r?\n/)) {
+    for (const text of card.texts) for (const line of directiveLines(text.body)) {
       const entry = { ...text, body: line };
       if (latestDisposition({ ...card, texts: [entry] }, pr)) {
         const key = createHash("sha256").update(JSON.stringify([card.id, text.id ?? "legacy", line])).digest("hex");

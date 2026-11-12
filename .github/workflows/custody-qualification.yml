@@ -1,0 +1,53 @@
+name: custody parser base qualification
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  parser-base:
+    if: github.head_ref == 'fix/custody-ownership-directives'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Run current regression tests against pinned base policy
+        run: |
+          git show 8f37d2ac3fda74dc8c639472a0d8ec1a08d132e8:src/custody-policy.ts > src/custody-policy.ts
+          set +e
+          npx --no-install vitest run tests/custody-policy.test.ts -t 'rejects a disposition with a blank actor|ignores disposition examples inside|rejects an empty card closure reason|ignores fenced card closure examples|ignores fenced PR closure examples' --reporter=json --outputFile="$RUNNER_TEMP/base-results.json"
+          result=$?
+          set -e
+          test "$result" -eq 1
+          node --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs';
+          const report = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/base-results.json`, 'utf8'));
+          const cases = report.testResults.flatMap(file => file.assertionResults).filter(test => test.status !== 'pending');
+          const names = [
+            'rejects a disposition with a blank actor',
+            'ignores disposition examples inside ``` fences',
+            'ignores disposition examples inside ~~~~ fences',
+            'rejects an empty card closure reason',
+            'ignores fenced card closure examples without suppressing a later closure',
+            'ignores fenced PR closure examples without suppressing a later closure',
+          ];
+          if (cases.length !== names.length) throw new Error(`Expected ${names.length} cases; got ${cases.length}`);
+          for (const name of names) {
+            const matches = cases.filter(test => test.fullName.endsWith(name));
+            if (matches.length !== 1 || matches[0].status !== 'failed' || !matches[0].failureMessages.some(message => message.includes('AssertionError'))) {
+              throw new Error(`Expected assertion failure for ${name}: ${JSON.stringify(matches)}`);
+            }
+            console.log(`Expected assertion failure: ${name}\n${matches[0].failureMessages.join('\n')}`);
+          }
+          JS

@@ -730,6 +730,17 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
     expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "pending" })]);
   });
+  it("does not clock fenced dispositions, but clocks real directives after the fence", async () => {
+    const directive = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ status: "done", texts: [{ id: "comment", body: `\`\`\`\n${directive}\n\`\`\``, at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner], dryRun: true });
+    h.activity.mockResolvedValue(NOW);
+    await h.runtime.poll();
+    expect(Object.keys(h.ledger().dispositions)).toHaveLength(0);
+    owner.texts[0]!.body += `\n${directive}`;
+    await h.runtime.poll();
+    expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
+  });
   it("acknowledges a terminal trigger when the same disposition is genuinely posted in a new comment", async () => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
     const owner = card({ status: "done", texts: [{ id: "description", body, at: NOW - DAY, ownership: true }] });
@@ -1084,6 +1095,50 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
     expect(h.ledger().report.complete).toBe(true);
   });
+  it("finds an explicit owner in an unrelated project before a URL-only candidate", async () => {
+    const otherProject = "cccccccc-0000-4000-8000-000000000002";
+    const ownerId = "bbbbbbbb-0000-4000-8000-000000000002";
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: null, status: null };
+    const owner = card({ id: ownerId, projectId: otherProject, identifier: "TASK-43" });
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner, urlCard], open: [pull({ headBranch: "feat/change" })], dryRun: true });
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [{ projectId, repoUrl: projectId === otherProject ? "https://github.com/example/other" : "https://github.com/example/project" }]);
+    h.ctx.issues.get.mockImplementation(async (id: string) => id === ownerId ? { ...owner, workProducts: [binding] } : { ...urlCard, workProducts: [] });
+    await h.runtime.poll();
+    expect(h.ctx.issues.get).toHaveBeenCalledWith(ownerId, COMPANY);
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ mapping: "work_product", cardId: ownerId })]);
+    expect(h.ledger().report.complete).toBe(true);
+  });
+  it("stops enrichment and fails closed when the tick time budget expires", async () => {
+    const owner = card();
+    const other = card({ id: "bbbbbbbb-0000-4000-8000-000000000002", projectId: null });
+    const h = fixture({ cards: [owner, other] });
+    h.ctx.issues.get.mockImplementation(async (id: string) => {
+      h.advance(240_000);
+      return { ...(id === owner.id ? owner : other), workProducts: [] };
+    });
+    await h.runtime.poll();
+    expect(h.ctx.issues.get).toHaveBeenCalledTimes(1);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.unknown).toContain(`work_product:${other.id}`);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+  it("defers effects if an unrelated-project work-product read fails", async () => {
+    const otherProject = "cccccccc-0000-4000-8000-000000000002";
+    const ownerId = "bbbbbbbb-0000-4000-8000-000000000002";
+    const owner = card({ id: ownerId, projectId: otherProject, identifier: "TASK-43" });
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner, urlCard], open: [pull({ headBranch: "feat/change" })] });
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [{ projectId, repoUrl: projectId === otherProject ? "https://github.com/example/other" : "https://github.com/example/project" }]);
+    h.ctx.issues.get.mockImplementation(async (id: string) => {
+      if (id === ownerId) throw new Error("read failed");
+      return { ...urlCard, workProducts: [] };
+    });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain(`work_product:${ownerId}`);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
   it("defers all effects when a work-product enrichment read fails", async () => {
     // A failed enrichment could hide the true work-product owner, so a
     // lower-tier (title URL) match must not receive the wake this tick.
@@ -1122,9 +1177,8 @@ describe("work-product discovery from a cold ledger", () => {
     await h.restart().poll();
     expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
   });
-  it("treats workProducts omitted on every read as tier-unavailable: no UNKNOWN, effects not deferred", async () => {
-    // Paperclip 1106 omits workProducts from issue reads; plugins cannot read
-    // issue_work_products. The tier is skipped, lower tiers still map.
+  it("fails closed when workProducts is omitted on every read", async () => {
+    // Universal omission cannot prove that a higher-tier owner is absent.
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
     const other = card({ id: "00000000-0000-4000-8000-0000000000aa", identifier: "TASK-43" });
     const h = fixture({ cards: [urlCard, other] });
@@ -1132,10 +1186,12 @@ describe("work-product discovery from a cold ledger", () => {
     await h.runtime.poll();
     // Every candidate is still read: one omission is not proof for the others.
     expect(h.ctx.issues.get.mock.calls.filter((c: unknown[]) => c[0] === other.id)).toHaveLength(1);
-    expect(h.ledger().report.unknown.filter((u: string) => u.startsWith("work_product:"))).toEqual([]);
-    expect(h.ledger().audits).toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "work_product_tier_unavailable" }));
-    expect(h.ledger().audits).not.toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "unknown" }));
-    expect(h.ledger().report.rows[0]).toMatchObject({ cardId: ISSUE });
+    expect(h.ledger().report.unknown).toContain(`work_product:${urlCard.id}`);
+    expect(h.ledger().report.unknown).toContain(`work_product:${other.id}`);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.effects).toBe(0);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
   it("fails closed when workProducts is omitted on some reads but served on others", async () => {
     // A lower-tier title URL must not claim a PR while an unread binding could outrank it.
@@ -1153,19 +1209,19 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().report.effects).toBe(0);
     expect(h.ledger().audits).not.toContainEqual(expect.objectContaining({ outcome: "work_product_tier_unavailable" }));
   });
-  it("treats an unreadable (private) card like an omitted field when no read serves the tier", async () => {
+  it("fails closed on unreadable and omitted cards when no read serves the tier", async () => {
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
     const hidden = card({ id: "00000000-0000-4000-8000-0000000000aa", identifier: "TASK-43" });
     const h = fixture({ cards: [urlCard, hidden] });
     const base = { companyId: COMPANY, projectId: PROJECT, title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null };
     h.ctx.issues.get.mockImplementation(async (id: string) => id === hidden.id ? null : { ...base, id, identifier: "TASK-42" });
     await h.runtime.poll();
-    expect(h.ledger().report.unknown.filter((u: string) => u.startsWith("work_product:"))).toEqual([]);
-    expect(h.ledger().audits).toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "work_product_tier_unavailable" }));
-    expect(h.ledger().report.rows[0]).toMatchObject({ cardId: ISSUE });
-    // Dispatch is not gated: the idle PR's owner card is woken.
-    expect(h.ledger().report.complete).toBe(true);
-    expect(h.ledger().report.effects).toBeGreaterThan(0);
+    expect(h.ledger().report.unknown).toContain(`work_product:${urlCard.id}`);
+    expect(h.ledger().report.unknown).toContain(`work_product:${hidden.id}`);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.effects).toBe(0);
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
   it("fails closed on an unreadable card when another read serves the tier", async () => {
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });

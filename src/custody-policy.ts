@@ -99,11 +99,28 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   return tracker ?? { card: null, source: "unmapped", candidates: [] };
 }
 
+/** Only unquoted, unfenced lines can be directive evidence. */
+export function directiveLines(body: string): string[] {
+  const result: string[] = [];
+  let fence: { marker: string; length: number } | null = null;
+  for (const line of body.split(/\r?\n/)) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (marker && marker[1]![0] === fence.marker && marker[1]!.length >= fence.length && /^\s*$/.test(marker[2]!)) fence = null;
+    } else if (marker && (marker[1]![0] !== "`" || !marker[2]!.includes("`"))) {
+      fence = { marker: marker[1]![0]!, length: marker[1]!.length };
+    } else {
+      result.push(line);
+    }
+  }
+  return result;
+}
+
 /** A directive belongs to this PR, not to every PR mentioned elsewhere in the same card. */
 export function latestDisposition(card: CustodyCard, pr: CustodyPull): Disposition | null {
   const found: Disposition[] = [];
-  for (const text of card.texts) for (const line of text.body.split(/\r?\n/)) {
-    const match = new RegExp(`^PR disposition:\\s+${escape(prReference(pr))}\\s+(finish|rework|defer|close);\\s*next actor\\s+[^;]+;\\s*revisit\\s+(.+?)\\s*$`, "i").exec(line);
+  for (const text of card.texts) for (const line of directiveLines(text.body)) {
+    const match = new RegExp(`^PR disposition:\\s+${escape(prReference(pr))}\\s+(finish|rework|defer|close);\\s*next actor\\s+[^;]*[^;\\s][^;]*;\\s*revisit\\s+(.+?)\\s*$`, "i").exec(line);
     if (!match) continue;
     const revisitText = match[2]!;
     const revisit = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?$/.test(revisitText) ? Date.parse(revisitText) : NaN;
@@ -114,8 +131,8 @@ export function latestDisposition(card: CustodyCard, pr: CustodyPull): Dispositi
   return found.sort((a, b) => b.at - a.at)[0] ?? null;
 }
 export function hasCardClosure(card: CustodyCard, pr: CustodyPull): boolean {
-  return card.texts.some((t) => t.body.split(/\r?\n/).some((line) => {
-    if (!/^Closed unmerged:\s+\S/i.test(line)) return false;
+  return card.texts.some((t) => directiveLines(t.body).some((line) => {
+    if (!/^Closed unmerged:\s+[^;\s]/i.test(line)) return false;
     const sources = line.split(";").slice(1).map((field) => field.trim()).filter((field) => /^source\b/i.test(field));
     if (sources.length !== 1) return false;
     const source = /^source\s+(.+)$/i.exec(sources[0]!);
@@ -123,7 +140,7 @@ export function hasCardClosure(card: CustodyCard, pr: CustodyPull): boolean {
   }));
 }
 export function hasPrClosure(texts: string[]): boolean {
-  return texts.some((body) => body.split(/\r?\n/).some((line) => /^Closed unmerged:\s+(?:duplicate of|superseded by|need lost|mismatch|burden)\b/i.test(line)));
+  return texts.some((body) => directiveLines(body).some((line) => /^Closed unmerged:\s+(?:duplicate of|superseded by|need lost|mismatch|burden)\b/i.test(line)));
 }
 export function custodyTriggers(pr: CustodyPull, card: CustodyCard, activityAt: number | null, closureTexts: string[] | null, now: number): Trigger[] {
   const result: Trigger[] = [];

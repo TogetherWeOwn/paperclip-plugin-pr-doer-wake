@@ -133,6 +133,30 @@ describe("PR-specific trigger policy", () => {
     expect(latestDisposition(owner, pull())?.revisit).toBe(Date.parse(revisit));
     expect(custodyTriggers(pull(), owner, now - 8 * DAY, null, now)).toEqual([]);
   });
+  it("rejects a disposition with a blank actor", () => {
+    const blank = { ...directive("defer", "2099-01-01", NOW), body: "PR disposition: example/project#42 defer; next actor   ; revisit 2099-01-01" };
+    expect(latestDisposition(card({ texts: [blank] }), pull())).toBeNull();
+  });
+  it.each(["```", "~~~~"])("ignores disposition examples inside %s fences", (fence) => {
+    const example = directive("defer", "2099-01-01", NOW);
+    const body = `${fence}markdown\n${example.body}\n${fence}`;
+    expect(latestDisposition(card({ texts: [{ ...example, body }] }), pull())).toBeNull();
+    expect(latestDisposition(card({ texts: [{ ...example, body: `${body}\n${directive("finish", "event", NOW).body}` }] }), pull())?.action).toBe("finish");
+  });
+  it("rejects an empty card closure reason", () => {
+    const text = { body: "Closed unmerged: ; source example/project#42", at: NOW, ownership: true };
+    expect(hasCardClosure(card({ texts: [text] }), pull())).toBe(false);
+  });
+  it("ignores fenced card closure examples without suppressing a later closure", () => {
+    const text = (body: string) => ({ body, at: NOW, ownership: true });
+    const line = "Closed unmerged: burden; source example/project#42";
+    expect(hasCardClosure(card({ texts: [text(`\`\`\`\n${line}\n\`\`\``)] }), pull())).toBe(false);
+    expect(hasCardClosure(card({ texts: [text(`\`\`\`\n${line}\n\`\`\`\n${line}`)] }), pull())).toBe(true);
+  });
+  it("ignores fenced PR closure examples without suppressing a later closure", () => {
+    expect(hasPrClosure(["~~~\nClosed unmerged: burden\n~~~"])).toBe(false);
+    expect(hasPrClosure(["~~~\nClosed unmerged: burden\n~~~\nClosed unmerged: burden"])).toBe(true);
+  });
   it("does not apply another PR's disposition to this PR", () => {
     expect(latestDisposition(card({ texts: [{ ...directive("defer", "2026-10-21T12:00:00Z", NOW), body: directive("defer", "2026-10-21T12:00:00Z", NOW).body.replace("#42", "#43") }] }), pull())).toBeNull();
   });
