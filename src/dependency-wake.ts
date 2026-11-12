@@ -204,17 +204,33 @@ export class DependencyWakeRuntime {
     // Watermark on the assignee's runs, on start only: another agent's run (a reviewer) is not the
     // assignee seeing the blocker; a run that never started saw nothing at all.
     const lastRun = Math.max(-Infinity, ...dependent.runs.map((run) => time(run.startedAt)).filter(Number.isFinite));
-    // A blocker is settled only when its last run has finished: an issue can be marked done
-    // while its run still finalizes the workspace, so a dependent run started in that
-    // done-to-finalize window was built without the completion and must not consume the
-    // trigger. A blocker with a live run or a truncated run window is also a wait: a full
-    // window may have dropped an older live or later-finished run.
+    // A blocker is settled only when the run(s) spanning its completion have finished: an issue
+    // can be marked done while a run still finalizes the workspace, so a dependent run started
+    // in that done-to-finalize window was built without the completion and must not consume the
+    // trigger. Settlement for epoch B is the conservative temporal envelope max(B, finishes of
+    // runs with startedAt <= B <= finishedAt): runs that started after B can never have produced
+    // this completion, so they must not advance the watermark (the separate live-run check above
+    // still defers a currently-live one). Malformed or inconsistent run timestamps, or no
+    // qualifying interval at all, mean the bound cannot be established: audit and wait rather
+    // than guess. A live run or a truncated window is also a wait: a full window may have
+    // dropped the spanning run.
     const settledAt = new Map<string, number>();
     for (const b of fresh) {
       const blocker = await this.liveRun(tick, b.id);
       if (blocker.live || blocker.truncated) { if (blocker.truncated) tick.audit("blocker_window_truncated", issue.id); return; }
-      const finished = Math.max(-Infinity, ...blocker.runs.map((run) => time(run.finishedAt)).filter(Number.isFinite));
-      settledAt.set(b.id, Number.isFinite(finished) ? Math.max(doneAt.get(b.id)!, finished) : doneAt.get(b.id)!);
+      const done = doneAt.get(b.id)!;
+      let malformed = false;
+      let span = -Infinity;
+      for (const run of blocker.runs) {
+        const started = time(run.startedAt);
+        if (run.startedAt == null) continue; // a never-started terminal run is not completion evidence
+        if (!Number.isFinite(started)) { malformed = true; break; }
+        const finished = time(run.finishedAt);
+        if (!Number.isFinite(finished) || finished < started) { malformed = true; break; }
+        if (started <= done && finished >= done) span = Math.max(span, finished);
+      }
+      if (malformed || !Number.isFinite(span)) { tick.audit("blocker_settlement_unknown", issue.id); return; }
+      settledAt.set(b.id, Math.max(done, span));
     }
     // Only blockers that settled after the dependent's last run started; an earlier one was seen by that run.
     const triggers = fresh.filter((b) => settledAt.get(b.id)! > lastRun);
