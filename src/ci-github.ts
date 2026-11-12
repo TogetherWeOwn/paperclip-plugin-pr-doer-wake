@@ -61,6 +61,8 @@ export interface CiCommitStatus {
   id: number;
   context: string;
   state: string;
+  creatorLogin?: string | null;
+  verifiedAppId?: number | null;
 }
 export interface CiSnapshot {
   repo: string;
@@ -98,6 +100,7 @@ export interface CiReadinessTiming {
   now: number;
   registeredAt: number;
   medianMs: number;
+  draft?: boolean;
 }
 export interface CiReadiness {
   kind: "pending" | "pass" | "fail";
@@ -398,7 +401,7 @@ export class CiGithub {
     };
   }
 
-  async snapshot(repo: string, sha: string, baseBranch: string): Promise<CiSnapshot> {
+  async snapshot(repo: string, sha: string, baseBranch: string, appIds = new Map<string, number | null>()): Promise<CiSnapshot> {
     repo = repoName(repo);
     sha = fullSha(sha);
     baseBranch = branchName(baseBranch);
@@ -457,8 +460,25 @@ export class CiGithub {
     // /status is a combined, truncated summary. /statuses is the paginated history we need.
     const statuses = (await this.pages(`${root}/commits/${sha}/statuses`)).map((value): CiCommitStatus => {
       const status = object(value);
-      return { id: id(status.id), context: text(status.context), state: text(status.state) };
+      const result: CiCommitStatus = { id: id(status.id), context: text(status.context), state: text(status.state) };
+      if (status.creator != null) result.creatorLogin = text(object(status.creator).login);
+      return result;
     });
+    for (const status of statuses) {
+      if (!required.some((check) => check.appId !== null && check.context === status.context)) continue;
+      const match = /^([a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*)\[bot\]$/.exec(status.creatorLogin ?? "");
+      if (!match || match[1]!.length > 100) continue;
+      const slug = match[1]!.toLowerCase();
+      if (!appIds.has(slug)) {
+        try {
+          appIds.set(slug, id(object((await this.request(`/apps/${slug}`)).data).id));
+        } catch (error) {
+          if (!(error instanceof CiGithubError && error.code === "http" && !error.retryAt && (error.status === 403 || error.status === 404))) throw error;
+          appIds.set(slug, null);
+        }
+      }
+      status.verifiedAppId = appIds.get(slug) ?? null;
+    }
     const unique = new Map(required.map((check) => [JSON.stringify([check.context, check.appId]), check]));
     const relevant = latest(runs, (run) => JSON.stringify([run.name, run.appId])).filter((run) =>
       [...unique.values()].some((check) => check.context === run.name && (check.appId === null || check.appId === run.appId)));
@@ -806,8 +826,9 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   if (snapshot.required.length) {
     for (const required of snapshot.required) {
       const matchingRuns = runs.filter((run) => run.name === required.context && (required.appId === null || run.appId === required.appId));
-      // Legacy statuses have no authenticated app ID: never infer one from creator.id.
-      const matchingStatuses = required.appId === null ? statuses.filter((status) => status.context === required.context) : [];
+      // A creator's user ID is not an app ID; only a verified app lookup counts.
+      const matchingStatuses = required.appId === null ? statuses.filter((status) => status.context === required.context)
+        : latest(snapshot.statuses.filter((status) => status.context === required.context && status.verifiedAppId === required.appId), (status) => status.context);
       if (!matchingRuns.length && !matchingStatuses.length) missing.push(label(required));
       for (const run of matchingRuns) {
         // An active suite can hide a required rerun not yet materialized. Only
@@ -826,9 +847,9 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
     for (const suite of suites) record(`suite [app ${suite.appId ?? "unknown"}]`, conclusion(suite.status, suite.conclusion));
     if (!runs.length && !statuses.length && !suites.length) pending.push("checks not registered");
   }
-  const missingExpired = missing.length > 0 && pending.length === 0 && missingFailAt !== null && timing.now >= missingFailAt;
+  const missingExpired = !timing.draft && missing.length > 0 && pending.length === 0 && missingFailAt !== null && timing.now >= missingFailAt;
   return {
-    kind: pending.length || (missing.length && !missingExpired) ? "pending" : failed.length || missingExpired ? "fail" : "pass",
+    kind: pending.length || (missing.length && !missingExpired && !(timing.draft && failed.length)) ? "pending" : failed.length || missingExpired ? "fail" : "pass",
     failed: [...new Set(failed)], missing: [...new Set(missing)], pending: [...new Set(pending)],
     lastSuiteCompletedAt, missingSince, missingFailAt,
   };

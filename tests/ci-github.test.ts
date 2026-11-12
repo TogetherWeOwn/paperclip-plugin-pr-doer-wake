@@ -239,6 +239,13 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(snapshot({ runs, required: [{ context: "build", appId: null }] }), timing).kind).toBe("fail");
   });
 
+  it("keeps missing draft checks pending but reports real failures", () => {
+    const input = snapshot({ required: [{ context: "build", appId: 7 }, { context: "review", appId: 8 }] });
+    expect(evaluateReadiness(input, { ...timing, draft: true })).toMatchObject({ kind: "pending", missing: ["build [app 7]", "review [app 8]"] });
+    input.runs.push(run(1, { conclusion: "failure" }));
+    expect(evaluateReadiness(input, { ...timing, draft: true })).toMatchObject({ kind: "fail", failed: ["build [app 7]"], missing: ["review [app 8]"] });
+  });
+
   it("starts missing grace at registration only when there are no suites", () => {
     const input = snapshot({ required: [{ context: "build", appId: null }] });
     expect(evaluateReadiness(input, { ...timing, now: 2_999 })).toMatchObject({ kind: "pending", missingSince: 1_000, missingFailAt: 3_000 });
@@ -355,6 +362,37 @@ describe("CiGithub REST reads", () => {
     expect(calls[0]!.url.pathname).toContain("/rules/branches/release%2Fone");
     expect(calls[1]!.url.pathname).toContain("/branches/release%2Fone/protection/required_status_checks");
     expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("all");
+  });
+
+  it("verifies app status creators and caches slug lookups only for the supplied cycle", async () => {
+    const { fetch, calls } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "Devin Review", app_id: 811515 }] });
+      if (url.pathname.endsWith("statuses")) return response([
+        { id: 1, context: "Devin Review", state: "success", creator: { login: "devin-ai-integration[bot]" } },
+        { id: 2, context: "Devin Review", state: "success", creator: { login: "other[bot]" } },
+      ]);
+      if (url.pathname === "/apps/devin-ai-integration") return response({ id: 811515 });
+      if (url.pathname === "/apps/other") return response({ id: 123 });
+    });
+    const github = new CiGithub(fetch, TOKEN);
+    const cycle = new Map<string, number | null>();
+    const actual = await github.snapshot(REPO, SHA, "main", cycle);
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", missing: [] });
+    expect(evaluateReadiness({ ...actual, statuses: actual.statuses.filter((status) => status.verifiedAppId !== 811515) }, timing))
+      .toMatchObject({ kind: "fail", missing: ["Devin Review [app 811515]"] });
+    await github.snapshot(REPO, SHA, "main", cycle);
+    expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(2);
+    await github.snapshot(REPO, SHA, "main");
+    expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(4);
+  });
+
+  it.each([401, 429, 500])("does not turn app lookup HTTP %i into a missing check", async (status) => {
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "review", app_id: 7 }] });
+      if (url.pathname.endsWith("statuses")) return response([{ id: 1, context: "review", state: "success", creator: { login: "reviewer[bot]" } }]);
+      if (url.pathname === "/apps/reviewer") return response({}, status);
+    });
+    await expect(new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main")).rejects.toMatchObject({ code: "http", status });
   });
 
   it.each([undefined, null, 0, 1])("carries suite run count %s from REST into readiness", async (latest_check_runs_count) => {
