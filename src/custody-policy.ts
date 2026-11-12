@@ -114,16 +114,19 @@ export function directiveLines(body: string): string[] {
       fence = { marker: marker[1]![0]!, length: marker[1]!.length };
       continue;
     }
-    let touchedComment = comment;
+    let visible = "";
     let position = 0;
     while (position < line.length) {
       const boundary = line.indexOf(comment ? "-->" : "<!--", position);
-      if (boundary < 0) break;
-      touchedComment = true;
+      if (boundary < 0) {
+        if (!comment) visible += line.slice(position);
+        break;
+      }
+      if (!comment) visible += line.slice(position, boundary) + " ";
       position = boundary + (comment ? 3 : 4);
       comment = !comment;
     }
-    if (!touchedComment) result.push(line);
+    result.push(visible);
   }
   return result;
 }

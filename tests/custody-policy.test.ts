@@ -154,6 +154,18 @@ describe("PR-specific trigger policy", () => {
     expect(hasCardClosure(card({ texts: [{ ...example, body: "<!--\nClosed unmerged: burden; source example/project#42\n-->" }] }), pull())).toBe(false);
     expect(hasPrClosure(["<!--\nClosed unmerged: burden\n-->"])).toBe(false);
   });
+  it("retains visible directives around comments without borrowing commented fields", () => {
+    const text = (body: string) => ({ body, at: NOW, ownership: true });
+    const closure = "Closed unmerged: burden; source example/project#42; <!-- note -->";
+    const pr = pull({ state: "closed", closedAt: NOW - DAY });
+    expect(custodyTriggers(pr, card({ texts: [text(closure)] }), null, ["Closed unmerged: burden; <!-- note -->"], NOW)).toEqual([]);
+    expect(hasCardClosure(card({ texts: [text("Closed unmerged: burden; <!-- source example/project#42 -->")] }), pr)).toBe(false);
+    expect(hasCardClosure(card({ texts: [text("Closed unmerged: burden; source example/pro<!-- hidden -->ject#42")] }), pr)).toBe(false);
+    const disposition = directive("defer", "2099-01-01", NOW);
+    expect(latestDisposition(card({ texts: [{ ...disposition, body: `${disposition.body} <!-- note -->` }] }), pr)?.revisit).toBe(Date.parse("2099-01-01"));
+    expect(latestDisposition(card({ texts: [{ ...disposition, body: "PR disposition: example/project#42 defer; next actor <!-- contributor -->; revisit event" }] }), pr)).toBeNull();
+    expect(latestDisposition(card({ texts: [{ ...disposition, body: "PR disposition: example/project#42 finish; next actor contributor; revisit event <!-- note -->" }] }), pr)?.revisit).toBeNull();
+  });
   it("rejects an empty card closure reason", () => {
     const text = { body: "Closed unmerged: ; source example/project#42", at: NOW, ownership: true };
     expect(hasCardClosure(card({ texts: [text] }), pull())).toBe(false);
