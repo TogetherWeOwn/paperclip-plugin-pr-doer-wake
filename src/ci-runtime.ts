@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
 import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, InvalidRegistrationError, type CiConfig, type Registration } from "./ci-config.js";
-import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness, relevantSuites } from "./ci-github.js";
+import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness, relevantSuites, requiredCheckStates } from "./ci-github.js";
 import { CiAppAuth } from "./ci-auth.js";
 import { retryableBeforeQueue } from "./native-wake.js";
 import { parseWorkProductBindings } from "./custody-reader.js";
@@ -43,6 +43,8 @@ export interface Wait extends Registration {
   status: WaitStatus;
   finishedAt?: number;
   lastAttemptAt?: number;
+  /** Same-head check baseline, bounded by the lifetime of its retained wait. */
+  reviewerObservation?: PrHeadPending;
   reason?: string;
 }
 interface Audit { at: number; operation: string; runId?: string; companyId?: string; waitId?: string; outcome: string; detail?: string }
@@ -63,6 +65,9 @@ export interface PrHeadPending {
   oldSha: string;
   newSha: string;
   observedAt: number;
+  lastAttemptAt?: number;
+  checkBaseBranch?: string;
+  checkStates?: Record<string, "missing" | "pending" | "fail" | "pass">;
   shadowLogged?: string[];
 }
 interface Ledger {
@@ -75,6 +80,8 @@ interface Ledger {
   prHeadPending: Record<string, PrHeadPending>;
   /** Per-(company, card, SHA) wake dedupe timestamps for pr_head_changed. */
   reviewerWakes: Record<string, number>;
+  /** Alternate first access to shared tick budgets across full polls. */
+  reviewerFirstNext?: boolean;
 }
 const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {}, prHeadPending: {}, reviewerWakes: {} });
 class BindingChanged extends Error {}
@@ -286,7 +293,15 @@ export class CiWakeRuntime {
       if (wait.status === "waking") { wait.status = "unconfirmed"; wait.finishedAt = now; }
       if (wait.status === "open" && wait.expiresAt <= now) { wait.status = "retired"; wait.finishedAt = now; wait.reason = "wait_expired"; }
     }
-    ledger.waits = ledger.waits.filter((w) => w.status === "open" || now - (w.finishedAt ?? w.registeredAt) < LIMITS.retentionMs);
+    const retainedWaits = ledger.waits.filter((w) => w.status === "open" || now - (w.finishedAt ?? w.registeredAt) < LIMITS.retentionMs);
+    // Move a baseline off an expiring duplicate before removing its wait.
+    // Otherwise a newer registration for the same PR loses observed history.
+    for (const wait of ledger.waits) {
+      if (!wait.reviewerObservation || retainedWaits.includes(wait)) continue;
+      const replacement = retainedWaits.find((w) => w.companyId === wait.companyId && w.repo === wait.repo && w.prNumber === wait.prNumber);
+      if (replacement && !replacement.reviewerObservation) replacement.reviewerObservation = wait.reviewerObservation;
+    }
+    ledger.waits = retainedWaits;
     const retainedRepos = new Set(ledger.waits.map((w) => `${w.companyId}:${w.repo}`));
     for (const repo of Object.keys(ledger.samples)) if (!retainedRepos.has(repo)) delete ledger.samples[repo];
     for (const [id, at] of Object.entries(ledger.deliveries)) if (now - at >= LIMITS.replayMs) delete ledger.deliveries[id];
@@ -296,13 +311,21 @@ export class CiWakeRuntime {
       if (entry && (entry as { shadowLogged?: unknown }).shadowLogged === true) entry.shadowLogged = ["*"];
       else if (entry && (entry as { shadowLogged?: unknown }).shadowLogged !== undefined && !Array.isArray((entry as { shadowLogged?: unknown }).shadowLogged)) entry.shadowLogged = [];
       if (!entry || typeof entry.companyId !== "string" || typeof entry.repo !== "string" || !Number.isSafeInteger(entry.prNumber) || !SHA.test(entry.newSha) || !SHA.test(entry.oldSha)) delete ledger.prHeadPending[key];
-      else if (now - entry.observedAt >= LIMITS.waitMs) delete ledger.prHeadPending[key];
+      else if (now - entry.observedAt >= LIMITS.waitMs) {
+        if (entry.oldSha === entry.newSha && entry.checkStates) {
+          const owner = ledger.waits.find((wait) => wait.companyId === entry.companyId && wait.repo === entry.repo && wait.prNumber === entry.prNumber && wait.reviewerObservation)
+            ?? ledger.waits.find((wait) => wait.companyId === entry.companyId && wait.repo === entry.repo && wait.prNumber === entry.prNumber);
+          if (owner) owner.reviewerObservation = entry;
+        }
+        delete ledger.prHeadPending[key];
+      }
     }
     for (const [key, at] of Object.entries(ledger.reviewerWakes)) if (now - at >= LIMITS.retentionMs) delete ledger.reviewerWakes[key];
     // Explicit count caps (mirroring deliveries), evicting oldest first so a
     // busy company cannot grow these maps without bound between TTL expiries.
     if (Object.keys(ledger.prHeadPending).length > LIMITS.prHeadPending) {
-      const oldest = Object.entries(ledger.prHeadPending).sort((a, b) => a[1].observedAt - b[1].observedAt).slice(0, Object.keys(ledger.prHeadPending).length - LIMITS.prHeadPending);
+      // Same-head observations must not displace pending head-change wakes.
+      const oldest = Object.entries(ledger.prHeadPending).sort((a, b) => Number(b[1].oldSha === b[1].newSha) - Number(a[1].oldSha === a[1].newSha) || a[1].observedAt - b[1].observedAt).slice(0, Object.keys(ledger.prHeadPending).length - LIMITS.prHeadPending);
       for (const [key] of oldest) delete ledger.prHeadPending[key];
     }
     if (Object.keys(ledger.reviewerWakes).length > LIMITS.reviewerWakes) {
@@ -310,7 +333,10 @@ export class CiWakeRuntime {
       // successfully-woken candidates would be woken again on the next
       // tick. (Keys are companyId:issueId:sha; UUIDs and SHAs carry no
       // colons, so membership is a (company, sha) pair check.)
-      const live = new Set(Object.values(ledger.prHeadPending).map((entry) => `${entry.companyId}:${entry.newSha}`));
+      const live = new Set([
+        ...Object.values(ledger.prHeadPending),
+        ...ledger.waits.flatMap((wait) => wait.reviewerObservation ? [wait.reviewerObservation] : []),
+      ].map((entry) => `${entry.companyId}:${entry.newSha}`));
       const evictable = Object.entries(ledger.reviewerWakes)
         .filter(([key]) => { const [c, , s] = key.split(":"); return !live.has(`${c}:${s}`); })
         .sort((a, b) => a[1] - b[1]);
@@ -589,6 +615,8 @@ export class CiWakeRuntime {
   private async pollLocked(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
     const ledger = await this.load();
     this.compact(ledger);
+    const reviewerFirst = !only && ledger.reviewerFirstNext === true;
+    if (!only) ledger.reviewerFirstNext = !reviewerFirst;
     await this.save(ledger);
     const started = this.now();
     let requests = 0;
@@ -600,6 +628,7 @@ export class CiWakeRuntime {
       if (++requests > LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
       return this.ctx.http.fetch(url, init);
     };
+    const pollWaits = async () => {
     // Oldest last-attempt first prevents one unavailable repository starving others.
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const wait of pending) {
@@ -629,6 +658,16 @@ export class CiWakeRuntime {
         const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
         const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
+        // Retain a same-head observation even if the CI wait later terminates
+        // on missing checks. Only an eventual pass can wake a reviewer for it.
+        if (config.prHeadWakeEnabled && snapshot.required?.length && (verdict.missing.length || verdict.pending.length)) {
+          const key = `${wait.companyId}:${wait.repo}:${wait.prNumber}`;
+          const retainedObservation = ledger.waits.some((w) => w.companyId === wait.companyId && w.repo === wait.repo && w.prNumber === wait.prNumber && w.reviewerObservation);
+          if (!ledger.prHeadPending[key] && !retainedObservation && Object.keys(ledger.prHeadPending).length < LIMITS.prHeadPending) {
+            ledger.prHeadPending[key] = { companyId: wait.companyId, repo: wait.repo, prNumber: wait.prNumber, oldSha: wait.headSha, newSha: wait.headSha, observedAt: this.now(), checkBaseBranch: pr.baseBranch, checkStates: requiredCheckStates(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft }) };
+            await this.save(ledger);
+          }
+        }
         if (verdict.kind === "pending") continue;
         await this.checkBinding(wait);
         const freshConfig = await this.config(wait.companyId);
@@ -707,43 +746,76 @@ export class CiWakeRuntime {
         await this.save(ledger);
       }
     }
+    };
     // Reviewer wakes for observed head changes (settled heads only).
-    {
-      const entries = Object.entries(ledger.prHeadPending)
-        .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
-        .sort((a, b) => a[1].observedAt - b[1].observedAt);
-      for (const [key, entry] of entries) {
+    const pollReviewers = async () => {
+      // Keep same-head baselines on retained registrations, independently of
+      // the head-change cap. One registration owns the baseline for each PR.
+      const groups = new Map<string, Wait[]>();
+      for (const wait of ledger.waits) {
+        const key = `${wait.companyId}:${wait.repo}:${wait.prNumber}`;
+        const group = groups.get(key) ?? [];
+        group.push(wait);
+        groups.set(key, group);
+      }
+      const retainedEntries: Array<[string, PrHeadPending, Wait]> = [];
+      for (const [key, group] of groups) {
+        if (ledger.prHeadPending[key]) continue;
+        const owner = group.find((w) => w.reviewerObservation) ?? group[group.length - 1]!;
+        owner.reviewerObservation ??= { companyId: owner.companyId, repo: owner.repo, prNumber: owner.prNumber, oldSha: owner.headSha, newSha: owner.headSha, observedAt: this.now() };
+        retainedEntries.push([key, owner.reviewerObservation, owner]);
+      }
+      const entries: Array<[string, PrHeadPending, Wait | undefined]> = [
+        ...Object.entries(ledger.prHeadPending).map(([key, entry]): [string, PrHeadPending, undefined] => [key, entry, undefined]),
+        ...retainedEntries,
+      ].filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
+        .sort((a, b) => (a[1].lastAttemptAt ?? 0) - (b[1].lastAttemptAt ?? 0) || a[1].observedAt - b[1].observedAt);
+      for (const [key, entry, owner] of entries) {
+        const removeEntry = () => { if (owner) delete owner.reviewerObservation; else delete ledger.prHeadPending[key]; };
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
         try {
           const config = await this.config(entry.companyId, false);
           // Feature off: drop the entry rather than accumulate stale wakes.
-          if (!config.enabled || !config.prHeadWakeEnabled) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
-          if (!config.allowedRepos.includes(entry.repo)) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (!config.enabled || !config.prHeadWakeEnabled || !config.allowedRepos.includes(entry.repo)) { removeEntry(); continue; }
+          // Persist the attempt before I/O so repeated failures cannot starve later entries.
+          entry.lastAttemptAt = this.now();
+          await this.save(ledger);
           const github = await this.client(entry.companyId, config, entry.repo, fetch, cycle);
           const current = await github.pull(entry.repo, entry.prNumber);
-          if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { removeEntry(); await this.save(ledger); continue; }
           if (current.headSha !== entry.newSha) {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
-            entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
+            entry.oldSha = owner ? current.headSha : entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = []; delete entry.checkStates; delete entry.checkBaseBranch;
             await this.save(ledger); continue;
           }
-          const snapshot = await github.snapshot(entry.repo, entry.newSha, current.baseBranch);
+          const identity = `${entry.companyId}:${authIdentity(config)}`;
+          let appIds = appIdsByIdentity.get(identity);
+          if (!appIds) { appIds = new Map(); appIdsByIdentity.set(identity, appIds); }
+          const snapshot = await github.snapshot(entry.repo, entry.newSha, current.baseBranch, appIds);
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
           const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
           const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
-          // Unsettled heads do not wake yet; the entry stays for a later tick.
-          if (verdict.kind === "pending") continue;
+          if (entry.oldSha === entry.newSha) {
+            const states = requiredCheckStates(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
+            const transitioned = entry.checkBaseBranch === current.baseBranch && Object.entries(states).some(([check, state]) => state === "pass" && (entry.checkStates?.[check] === "missing" || entry.checkStates?.[check] === "pending"));
+            if (!transitioned) {
+              entry.checkBaseBranch = current.baseBranch;
+              entry.checkStates = states;
+              await this.save(ledger);
+              continue;
+            }
+          } else if (verdict.kind === "pending") continue;
           // Mirror the CI path: re-read the live PR after the readiness
           // snapshot and before any wake intent. A push during the snapshot
           // must retarget the entry, never wake for the stale SHA.
           const checked = await github.pull(entry.repo, entry.prNumber);
-          if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { removeEntry(); await this.save(ledger); continue; }
           if (checked.headSha !== entry.newSha) {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
-            entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
+            entry.oldSha = owner ? checked.headSha : entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = []; delete entry.checkStates; delete entry.checkBaseBranch;
             await this.save(ledger); continue;
           }
           if (checked.draft !== current.draft) continue;
@@ -752,6 +824,7 @@ export class CiWakeRuntime {
             // keep oldSha/newSha (never collapse them into a meaningless
             // same-SHA wake) and retry against the new base next tick.
             entry.observedAt = this.now();
+            delete entry.checkStates; delete entry.checkBaseBranch;
             await this.save(ledger); continue;
           }
           // Revalidate binding, enablement, allowlist, pr-head flags, dry-run
@@ -778,7 +851,9 @@ export class CiWakeRuntime {
             if (!state || state.status !== "pending" || state.currentStageId == null || !state.currentParticipant) continue;
             if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
-            const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
+            const reason = entry.oldSha === entry.newSha
+              ? `pr_checks_passed: ${entry.repo}#${entry.prNumber} head ${entry.newSha.slice(0, 7)}; required check passed`
+              : `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
               entry.shadowLogged ??= [];
               if (!entry.shadowLogged.includes(issueId) && !entry.shadowLogged.includes("*")) {
@@ -829,13 +904,15 @@ export class CiWakeRuntime {
             await this.save(ledger);
           }
           // Clear only when every candidate is woken/deduped/ineligible/excluded.
-          if (!outstanding && !shadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
+          if (!outstanding && !shadow) { removeEntry(); await this.save(ledger); }
         } catch (error) {
           this.audit(ledger, "pr_head_wake", "retryable");
           await this.save(ledger);
         }
       }
-    }
+    };
+    if (reviewerFirst) { await pollReviewers(); await pollWaits(); }
+    else { await pollWaits(); await pollReviewers(); }
     await this.save(ledger);
   }
 

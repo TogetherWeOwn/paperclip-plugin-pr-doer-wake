@@ -59,8 +59,9 @@ type Ledger = {
   deliveries: Record<string, number>;
   hints: Record<string, number>;
   samples: Record<string, Array<{ sha: string; ms: number }>>;
-  prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: string[] }>;
+  prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; lastAttemptAt?: number; shadowLogged?: string[] }>;
   reviewerWakes?: Record<string, number>;
+  reviewerFirstNext?: boolean;
 };
 const clone = <T>(value: T): T => structuredClone(value);
 const waitData = (result: ToolResult) => result.data as { waitId: string; status: string; expiresAt: number };
@@ -704,6 +705,341 @@ describe("CI runtime polling and durable wake outcomes", () => {
       github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
     }
 
+    it.each(["missing", "pending"] as const)("wakes a reviewer when same-head required checks go from %s to success", async (initial) => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: initial === "pending" ? [{ id: 1, context: "Devin Review", state: "pending", verifiedAppId: 811515 }] : [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.values(h.ledger().prHeadPending ?? {})).toMatchObject([{ oldSha: HEAD, newSha: HEAD }]);
+      if (initial === "missing") {
+        h.advance(61 * 60_000);
+        await h.runtime.poll(); // Missing check expires; the CI wait finishes, but the observation remains.
+        expect(h.ledger().waits[0]?.status).toBe("woken");
+      }
+      h.requestWakeup.mockClear();
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll();
+      const reviewerCalls = h.requestWakeup.mock.calls.filter(([, , wake]) => (wake as { idempotencyKey: string }).idempotencyKey.startsWith("pr-head-wake:"));
+      expect(reviewerCalls).toHaveLength(1);
+      expect(reviewerCalls[0]?.[2]).toMatchObject({ reason: expect.stringContaining("pr_checks_passed"), idempotencyKey: `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}` });
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.filter(([, , wake]) => (wake as { idempotencyKey: string }).idempotencyKey.startsWith("pr-head-wake:"))).toHaveLength(1);
+    });
+
+    it("wakes on a required check succeeding while another required check remains pending", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main",
+        required: [{ context: "Devin Review", appId: 811515 }, { context: "CI", appId: null }],
+        runs: [], suites: [], statuses: [{ id: 1, context: "CI", state: "pending" }], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [...snapshot.statuses, { id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({
+        idempotencyKey: `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+      }));
+    });
+
+    it("does not compare a same-head baseline across base branches", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      github.pull.mockResolvedValue(pull({ baseBranch: "release" }));
+      github.snapshot.mockResolvedValue({ ...snapshot, baseBranch: "release", statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.values(h.ledger().prHeadPending ?? {})).toMatchObject([{ checkBaseBranch: "release" }]);
+    });
+
+    it("observes missing checks on a retained finished wait before waking on success", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({
+        idempotencyKey: `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+      }));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("transfers a retained missing baseline when its duplicate owner expires", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      const observed = h.ledger();
+      const owner = observed.waits[0]!;
+      expect(owner.reviewerObservation?.checkStates).toBeDefined();
+      observed.waits.push({ ...owner, waitId: "retained-duplicate", reviewerObservation: undefined, finishedAt: START + 1 });
+      h.seed(observed);
+      h.advance(LIMITS.retentionMs);
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll();
+      expect(h.ledger().waits.map((w) => w.waitId)).toEqual(["retained-duplicate"]);
+      expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({
+        idempotencyKey: `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+      }));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("preserves a same-head baseline when the pending entry expires", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      h.advance(LIMITS.waitMs);
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({
+        idempotencyKey: `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+      }));
+    });
+
+    it("does not wake a reviewer when a retained wait is initially green", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      github.snapshot.mockResolvedValue({
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [{ id: 1, context: "Devin Review", state: "success", verifiedAppId: 811515 }], fetchedAt: START,
+      });
+      await h.runtime.poll();
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("does not create a head-change wake from a finished wait", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      github.snapshot.mockResolvedValue({ ...snapshot, sha: NEXT_HEAD, statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll();
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("retries a deferred same-head reviewer wake without duplicating a queued wake", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      h.requestWakeup.mockResolvedValueOnce({ queued: false }).mockResolvedValueOnce({ queued: true });
+      await h.runtime.poll();
+      await h.runtime.poll();
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(2);
+      expect(h.requestWakeup.mock.calls.map(([, , wake]) => (wake as { idempotencyKey: string }).idempotencyKey)).toEqual([
+        `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+        `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+      ]);
+    });
+
+    it("retries a retained deferred transition when an open duplicate is polled first", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      h.seed(ledger);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main",
+        required: [{ context: "Devin Review", appId: 811515 }, { context: "CI", appId: null }],
+        runs: [], suites: [], statuses: [{ id: 1, context: "CI", state: "pending" }], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll();
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [...snapshot.statuses, { id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      h.requestWakeup.mockResolvedValueOnce({ queued: false }).mockResolvedValueOnce({ queued: true });
+      await h.runtime.poll();
+      const deferredLedger = h.ledger();
+      const retained = deferredLedger.waits[0]!;
+      deferredLedger.waits.push({ ...retained, waitId: "open-duplicate", status: "open", finishedAt: undefined, reviewerObservation: undefined });
+      deferredLedger.reviewerFirstNext = false;
+      h.seed(deferredLedger);
+      await h.runtime.poll();
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.map(([, , wake]) => (wake as { idempotencyKey: string }).idempotencyKey)).toEqual([
+        `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+        `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+      ]);
+    });
+
+    it("preserves head-change entries before same-head observations at capacity", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      await h.runtime.poll({ companyId: OTHER, repo: REPO, sha: HEAD });
+      const ledger = h.ledger();
+      ledger.prHeadPending = Object.fromEntries(Array.from({ length: LIMITS.prHeadPending }, (_, i) => [
+        `head-${i}`, { companyId: COMPANY, repo: REPO, prNumber: i + 1, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START - 100 },
+      ]));
+      ledger.prHeadPending.same = { companyId: COMPANY, repo: REPO, prNumber: 1001, oldSha: HEAD, newSha: HEAD, observedAt: START };
+      h.seed(ledger);
+      await h.runtime.poll({ companyId: OTHER, repo: REPO, sha: HEAD });
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(LIMITS.prHeadPending);
+      expect(h.ledger().prHeadPending?.same).toBeUndefined();
+      expect(h.ledger().prHeadPending?.["head-0"]).toBeDefined();
+    });
+
+    it("preserves a retained wait's missing baseline when head-change capacity is saturated", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.waits[0]!.status = "woken";
+      ledger.waits[0]!.finishedAt = START;
+      ledger.prHeadPending = Object.fromEntries(Array.from({ length: LIMITS.prHeadPending }, (_, i) => [
+        `head-${i}`, { companyId: OTHER, repo: REPO, prNumber: i + 1, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START },
+      ]));
+      h.seed(ledger);
+      const snapshot = {
+        repo: REPO, sha: HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }],
+        runs: [], suites: [], statuses: [], fetchedAt: START,
+      };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [{ id: 2, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      await h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+      expect(h.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({
+        idempotencyKey: `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`,
+      }));
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(LIMITS.prHeadPending);
+    });
+
+    it("alternates shared budget priority between open waits and reviewer observations", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.prHeadPending = {
+        other: { companyId: COMPANY, repo: REPO, prNumber: 18, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START },
+      };
+      h.seed(ledger);
+      github.pull.mockClear();
+      github.pull.mockImplementation(async () => { h.advance(LIMITS.tickMs); throw new Error("unavailable"); });
+      await h.runtime.poll();
+      await h.runtime.poll();
+      await h.runtime.poll();
+      expect(github.pull.mock.calls.map((call) => call[1])).toEqual([17, 18, 17]);
+    });
+
+    it("attempts the least recently attempted reviewer observation first", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      await h.runtime.poll({ companyId: OTHER, repo: REPO, sha: HEAD });
+      const ledger = h.ledger();
+      ledger.prHeadPending = {
+        first: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START - 2, lastAttemptAt: START - 1 },
+        second: { companyId: COMPANY, repo: REPO, prNumber: 18, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START - 1 },
+      };
+      h.seed(ledger);
+      github.pull.mockRejectedValue(new Error("unavailable"));
+      await h.runtime.poll();
+      expect(github.pull.mock.calls.map((call) => call[1])).toEqual([18, 17]);
+      expect(h.ledger().prHeadPending?.first?.lastAttemptAt).toBe(START);
+      expect(h.ledger().prHeadPending?.second?.lastAttemptAt).toBe(START);
+    });
+
     it("wakes a pending reviewer once the new head settles", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
@@ -738,6 +1074,27 @@ describe("CI runtime polling and durable wake outcomes", () => {
       await h.runtime.poll();
       expect(h.requestWakeup).toHaveBeenCalledTimes(1);
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("deduplicates a same-head success after a head-change wake on that SHA", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("fail"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup.mock.calls[0]?.[2]).toMatchObject({ reason: expect.stringContaining("pr_head_changed") });
+      const ledger = h.ledger();
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: NEXT_HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      const snapshot = { repo: REPO, sha: NEXT_HEAD, baseBranch: "main", required: [{ context: "Devin Review", appId: 811515 }], runs: [], suites: [], statuses: [], fetchedAt: START };
+      github.snapshot.mockResolvedValue(snapshot);
+      await h.runtime.poll(); // Observe missing before the success transition.
+      github.snapshot.mockResolvedValue({ ...snapshot, statuses: [{ id: 1, context: "Devin Review", state: "success", verifiedAppId: 811515 }] });
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().prHeadPending).toEqual({});
     });
 
     it("ignores a head change on a repo outside the allowlist", async () => {
@@ -829,7 +1186,9 @@ describe("CI runtime polling and durable wake outcomes", () => {
       // The new wait's own CI wake (author card) plus one pr_head_changed
       // reviewer wake.
       expect(h.requestWakeup.mock.calls.length).toBe(wakesBefore + 2);
-      const [, , wake] = h.requestWakeup.mock.calls.at(-1)!;
+      const reviewerCall = h.requestWakeup.mock.calls.find(([, , wake]) => (wake as { reason: string }).reason.includes("pr_head_changed"));
+      expect(reviewerCall).toBeDefined();
+      const [, , wake] = reviewerCall!;
       expect(wake).toMatchObject({ reason: expect.stringContaining("pr_head_changed") });
       expect((wake as { reason: string }).reason).toContain(HEAD.slice(0, 7));
       expect((wake as { reason: string }).reason).toContain(NEXT_HEAD.slice(0, 7));
@@ -924,6 +1283,19 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup).not.toHaveBeenCalled(); // dedupe intact: no repeat wake
       expect(h.ledger().reviewerWakes?.[protectedKey]).toBe(START - 2);
       expect(Object.keys(h.ledger().reviewerWakes ?? {})).toHaveLength(10_000); // cap still enforced
+    });
+
+    it("protects dedupe records for retained reviewer observations at capacity", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      const protectedKey = `${COMPANY}:${ISSUE}:${HEAD}`;
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [{ companyId: COMPANY, repo: REPO, prNumber: 17, issueId: ISSUE, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken", reviewerObservation: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: HEAD, observedAt: START } }] as unknown as Wait[];
+      ledger.reviewerWakes = { [protectedKey]: START - 2 };
+      for (let i = 0; i < 10_000; i++) ledger.reviewerWakes[`${COMPANY}:00000000-0000-4000-8000-${String(i).padStart(12, "0")}:${"d".repeat(40)}`] = START - 1 + i;
+      h.seed(ledger as Ledger);
+      await h.runtime.poll();
+      expect(h.ledger().reviewerWakes?.[protectedKey]).toBe(START - 2);
+      expect(Object.keys(h.ledger().reviewerWakes ?? {})).toHaveLength(10_000);
     });
 
     it("logs intended wakes in shadow mode and fires none", async () => {

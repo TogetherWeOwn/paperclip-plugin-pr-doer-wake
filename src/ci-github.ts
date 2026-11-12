@@ -861,3 +861,14 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
     lastSuiteCompletedAt, missingSince, missingFailAt,
   };
 }
+
+/** Evaluate required checks independently without weakening readiness's identity or suite safeguards. */
+export function requiredCheckStates(snapshot: CiSnapshot, timing: CiReadinessTiming): Record<string, "missing" | "pending" | "fail" | "pass"> {
+  const states: Record<string, "missing" | "pending" | "fail" | "pass"> = Object.create(null);
+  for (const required of snapshot.required) {
+    const verdict = evaluateReadiness({ ...snapshot, required: [required] }, timing);
+    const key = JSON.stringify([required.context, required.appId]);
+    states[key] = verdict.missing.length ? "missing" : verdict.kind;
+  }
+  return states;
+}
