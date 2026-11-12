@@ -79,6 +79,7 @@ it("observes the pinned worker-to-host sequential revision contract", async () =
     expect(created).toMatchObject({ key: "plan", body: "v1", latestRevisionNumber: 1 });
     expect(created.latestRevisionId).toBeTruthy();
     const params = { key: "write", companyId, params: { body: "v2", baseRevisionId: created.latestRevisionId } };
+    let updatedRevisionId: string | undefined;
     if (process.env.CUSTODY_EXPECTATION === "baseline") {
       await expect(call("getData", params)).rejects.toThrow("Document update requires baseRevisionId");
       expect(forwarded[1]).not.toHaveProperty("baseRevisionId");
@@ -86,12 +87,15 @@ it("observes the pinned worker-to-host sequential revision contract", async () =
       const updated = await call("getData", params);
       expect(forwarded[1].baseRevisionId).toBe(created.latestRevisionId);
       expect(updated).toMatchObject({ key: "plan", body: "v2", latestRevisionNumber: 2 });
+      expect(updated.latestRevisionId).toBeTruthy();
       expect(updated.latestRevisionId).not.toBe(created.latestRevisionId);
+      updatedRevisionId = updated.latestRevisionId;
     } else {
       throw new Error("CUSTODY_EXPECTATION must identify the pinned baseline or candidate");
     }
     const saved = await handlers["issues.documents.get"]({ companyId, issueId, key: "plan" }, { invocationScope: { companyId } } as any);
     expect(saved).toMatchObject({ key: "plan", body: process.env.CUSTODY_EXPECTATION === "candidate" ? "v2" : "v1", latestRevisionNumber: process.env.CUSTODY_EXPECTATION === "candidate" ? 2 : 1 });
+    if (process.env.CUSTODY_EXPECTATION === "candidate") expect(saved?.latestRevisionId).toBe(updatedRevisionId);
     console.info("sequential-control", JSON.stringify({ expectation: process.env.CUSTODY_EXPECTATION, created: { key: created.key, body: created.body, revision: created.latestRevisionId }, saved: { key: saved?.key, body: saved?.body, revision: saved?.latestRevisionId }, forwardedRevision: forwarded[1]?.baseRevisionId ?? null }));
   } finally {
     worker.stop();
