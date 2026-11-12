@@ -753,6 +753,7 @@ export class CiWakeRuntime {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
             entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
+            trackDraft(entry, current.draft, this.now());
             await this.save(ledger); continue;
           }
           if (trackDraft(entry, current.draft, this.now())) await this.save(ledger);

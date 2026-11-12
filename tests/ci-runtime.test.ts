@@ -842,6 +842,30 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ readySince: START + 3_600_000 });
     });
 
+    it("tracks draft state when a pending entry retargets to a newer head", async () => {
+      const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+      const THIRD_HEAD = "c".repeat(40);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      github.snapshot.mockImplementation(async (_repo: string, sha: string) => ({ repo: REPO, sha, baseBranch: "main", fetchedAt: START,
+        required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] }));
+      github.readiness.mockImplementation(actual.evaluateReadiness);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      await h.runtime.poll();
+      // A newer head appears as a draft and retargets the pending entry.
+      github.pull.mockResolvedValue(pull({ headSha: THIRD_HEAD, draft: true }));
+      h.advance(10_000);
+      await h.runtime.poll();
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ newSha: THIRD_HEAD, sawDraft: true });
+      // It turns ready an hour later, before the next poll: grace restarts, no premature wake.
+      github.pull.mockResolvedValue(pull({ headSha: THIRD_HEAD, draft: false }));
+      h.advance(3_600_000);
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ newSha: THIRD_HEAD, readySince: START + 3_610_000 });
+    });
+
     it("does not re-wake the same (card, SHA) whose dedupe record exists", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
