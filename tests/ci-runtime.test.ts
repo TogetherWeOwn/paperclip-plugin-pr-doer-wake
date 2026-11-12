@@ -613,6 +613,21 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe(failure ? "woken" : "open");
   });
 
+  it("does not wake a ready PR when required status identity is unverified", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    h.advance(180_000);
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 7 }], runs: [], suites: [],
+      statuses: [{ id: 1, context: "review", state: "success", creatorLogin: "unknown[bot]", verifiedAppId: null }],
+    });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+  });
+
   it("does not wake when draft state changes during the final read", async () => {
     const h = setup();
     await h.runtime.register(registration, run);

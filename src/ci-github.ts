@@ -829,7 +829,14 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
       // A creator's user ID is not an app ID; only a verified app lookup counts.
       const matchingStatuses = required.appId === null ? statuses.filter((status) => status.context === required.context)
         : latest(snapshot.statuses.filter((status) => status.context === required.context && status.verifiedAppId === required.appId), (status) => status.context);
-      if (!matchingRuns.length && !matchingStatuses.length) missing.push(label(required));
+      if (!matchingRuns.length && !matchingStatuses.length) {
+        // A denied or absent app lookup is not proof that this creator is the
+        // wrong app. Do not credit it, but do not turn uncertainty into failure.
+        const unverified = required.appId !== null && snapshot.statuses.some((status) =>
+          status.context === required.context && status.verifiedAppId === null);
+        if (unverified) pending.push(label(required));
+        else missing.push(label(required));
+      }
       for (const run of matchingRuns) {
         // An active suite can hide a required rerun not yet materialized. Only
         // positive current-attempt job evidence permits same-suite optional work.

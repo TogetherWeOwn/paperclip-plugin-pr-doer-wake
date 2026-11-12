@@ -386,6 +386,28 @@ describe("CiGithub REST reads", () => {
     expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(4);
   });
 
+  it.each([403, 404])("keeps HTTP %i app identity unknown without overriding verified evidence", async (status) => {
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "review", app_id: 7 }] });
+      if (url.pathname.endsWith("statuses")) return response([
+        { id: 1, context: "review", state: "success", creator: { login: "unknown[bot]" } },
+        { id: 2, context: "review", state: "success", creator: { login: "verified[bot]" } },
+        { id: 3, context: "review", state: "success", creator: { login: "wrong[bot]" } },
+      ]);
+      if (url.pathname === "/apps/unknown") return response({ message: "Resource not accessible by integration" }, status);
+      if (url.pathname === "/apps/verified") return response({ id: 7 });
+      if (url.pathname === "/apps/wrong") return response({ id: 8 });
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", pending: [], missing: [] });
+    const unknown = actual.statuses.filter((item) => item.creatorLogin === "unknown[bot]");
+    expect(evaluateReadiness({ ...actual, statuses: unknown }, timing))
+      .toMatchObject({ kind: "pending", pending: ["review [app 7]"], missing: [] });
+    const wrong = actual.statuses.filter((item) => item.creatorLogin === "wrong[bot]");
+    expect(evaluateReadiness({ ...actual, statuses: wrong }, timing))
+      .toMatchObject({ kind: "fail", missing: ["review [app 7]"] });
+  });
+
   it.each([401, 429, 500])("does not turn app lookup HTTP %i into a missing check", async (status) => {
     const { fetch } = fixtures((url) => {
       if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "review", app_id: 7 }] });
