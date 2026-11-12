@@ -384,7 +384,7 @@ describe("dependency wake", () => {
     }
   };
   it("defers an eligible epoch while an excluded blocker is live or unbounded", async () => {
-    for (const m of [liveRun, truncRun]) { // a live run, then an unbounded 100-run window
+    for (const m of [liveRun, truncRun]) { // a live run, then an unbounded window
       const h = harness();
       m(h); excluded(h); addTrigger(h); await h.runtime.poll();
       expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
@@ -398,13 +398,14 @@ describe("dependency wake", () => {
   });
   it("supports 400 blockers within the 805-read budget, then fails closed at 401", async () => {
     const h = harness();
-    Object.assign(h.runs[DEP]![0]!, { createdAt: iso(START - 29 * MIN), startedAt: iso(START - 29 * MIN), finishedAt: iso(START - 28 * MIN) }); // assignee last ran T-29m: the 399 seen
+    Object.assign(h.runs[DEP]![0]!, { createdAt: iso(START - 29 * MIN), startedAt: iso(START - 29 * MIN), finishedAt: iso(START - 28 * MIN) }); // last run T-29m: 399 seen
     h.relations[DEP] = []; settledBlockers(h, DEP, 399); addTrigger(h); await h.runtime.poll();
-    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1); // woken exactly once
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     const reads = h.ctx.issues.list.mock.calls.length + h.ctx.issues.relations.get.mock.calls.length + h.ctx.issues.get.mock.calls.length + h.ctx.issues.summaries.getOrchestration.mock.calls.length + h.ctx.config.get.mock.calls.length - 1;
     expect(reads).toBeLessThanOrEqual(805);
-    expect(h.ctx.issues.summaries.getOrchestration.mock.calls.length).toBe(401); // one read per blocker, reused for settlement
-    settledBlockers(h, DEP, 1, 999); await h.runtime.poll(); // a 401st blocker: unsupported fan-in
+    expect(h.ctx.issues.summaries.getOrchestration.mock.calls.length).toBe(401); // one read each
+    settledBlockers(h, DEP, 1, 999); await h.runtime.poll(); // a 401st blocker: fan-in defers
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("blocker_fan_in");
     expect(h.ledger()?.lastTick?.complete).toBe(false); // incomplete, not a quiet pass
   });
@@ -415,13 +416,12 @@ describe("dependency wake", () => {
     const early = filler(0);
     h.issues[early] = { id: early, companyId: COMPANY, status: "in_review", assigneeAgentId: AGENT, activeRun: null };
     h.runs[early] = [{ id: "e1", issueId: early, agentId: AGENT, status: "succeeded", createdAt: iso(START - 10 * MIN), startedAt: iso(START - 10 * MIN), finishedAt: iso(START - 9 * MIN) }];
-    settledBlockers(h, early, 400, 1000); await h.runtime.poll(); // DEP gets no reads left
+    settledBlockers(h, early, 400, 1000); await h.runtime.poll(); // DEP gets no reads
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("tick_budget");
     await h.runtime.poll(); // DEP completes on a fresh tick
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
-
   it("uses the latest finish among multiple runs spanning the completion epoch", async () => {
     // Two runs overlap done-at T-30m and finish at T-28m and T-24m: settlement is T-24m, so a
     // dependent run started at T-26m (before the envelope closed) saw only a partial window and

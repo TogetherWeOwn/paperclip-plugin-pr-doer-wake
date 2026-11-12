@@ -189,8 +189,8 @@ export class DependencyWakeRuntime {
     const blockers = (await tick.read(() => this.ctx.issues.relations.get(issue.id, companyId))).blockedBy as Blocker[];
     // Any open (or cancelled) blocker: core treats it as unresolved, and so do we.
     if (!blockers.length || blockers.some((b) => b.status !== "done")) return;
-    // Fan-in beyond the supported bound cannot be verified in one tick's read budget:
-    // audit and defer (tick reported incomplete), never a quiet pass.
+    // Fan-in beyond the supported bound cannot be verified in one tick's read
+    // budget: audit and defer (tick reported incomplete), never a quiet pass.
     if (blockers.length > L.maxBlockers) { tick.audit("blocker_fan_in", issue.id); tick.deferred = true; return; }
     const doneAt = new Map<string, number>();
     for (const b of blockers) {
