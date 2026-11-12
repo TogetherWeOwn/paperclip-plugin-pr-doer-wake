@@ -776,7 +776,9 @@ export class CiWakeRuntime {
             if (issue.status !== "in_review") continue;
             const state = issue.executionState;
             if (!state || state.status !== "pending" || state.currentStageId == null || !state.currentParticipant) continue;
-            if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
+            // The host's issues.get omits work products (Paperclip 2026.1106.0), so the
+            // registered wait's PR binding is the link; a supplied list must still match.
+            if (issue.workProducts !== undefined && !this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {

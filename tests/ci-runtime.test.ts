@@ -724,6 +724,35 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
+    // Paperclip 2026.1106.0 ctx.issues.get returns no workProducts; the candidate
+    // card is already bound to this PR by its registered wait.
+    it.each([true, false])("handles a reviewer when the host omits work products (shadow=%s), relying on the registered wait's binding", async (shadow) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: shadow });
+      inReviewIssue(h, OTHER);
+      delete (h.issue as { workProducts?: unknown }).workProducts;
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      if (shadow) {
+        expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1);
+        expect(h.requestWakeup).not.toHaveBeenCalled();
+      } else {
+        expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+        expect(h.requestWakeup.mock.calls[0]![0]).toBe(ISSUE);
+        expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("pr_head_changed") });
+      }
+    });
+
+    it("still skips a card whose supplied work products point at a different PR", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      Object.assign(h.issue, { workProducts: [{ ...prWorkProduct, url: `https://github.com/${REPO}/pull/99`, metadata: { repo: REPO, number: 99 } }] });
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
     it("does not re-wake the same (card, SHA) whose dedupe record exists", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
