@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { CUSTODY_READ_LIMITS, createCustodyByteBudget, loadCustodyCards } from "../src/custody-reader-staged.js";
+import { CUSTODY_READ_LIMITS, createCustodyByteBudget, loadCustodyCards } from "./custody-reader-staged.fixture.js";
 // Read company metadata and candidate comments under one observation budget.
 async function loadAll(ctx: PluginContext, guard: () => void) {
   return loadCustodyCards(ctx, COMPANY, guard);
