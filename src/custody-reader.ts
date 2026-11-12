@@ -243,7 +243,7 @@ export async function loadCustodyCards(
 }
 
 /**
- * Load comments + linked document bodies for an explicit candidate set only.
+ * Load comment bodies for an explicit candidate set only (no document bodies).
  * Appends to each card's texts in place and returns the same array. Callers
  * should pass only cards already mapped to a PR in the current inventory so
  * the byte budget tracks PR count, not company history size. Any failure
@@ -307,33 +307,7 @@ export async function loadCustodyTexts(
     card.texts.push({ id: `comment:${id(row.id)}`, body, at: time(row.updated_at), ownership: agent !== null && user === null && (authorType === null || authorType === "agent") });
   });
 
-  // Never join public.documents: only metadata is an allowed core table. Scan
-  // all metadata before fetching bodies so excessive documents fail without RPC fanout.
-  const seenKeys = new Set<string>();
-  const seenDocuments = new Set<string>();
-  const documents: Array<{ card: CustodyCard; documentId: string; key: string }> = [];
-  await rows("issue_documents", `id, company_id, issue_id, document_id, key, updated_at`, MAX_DOCUMENTS, (row) => {
-    const card = parent(row);
-    const documentId = id(row.document_id);
-    const key = text(row.key, "document key");
-    if (!key || key.length > 256) unknown("invalid document key");
-    time(row.updated_at);
-    const identity = JSON.stringify([card.id, key]);
-    if (seenKeys.has(identity) || seenDocuments.has(documentId)) unknown("duplicate document metadata");
-    seenKeys.add(identity);
-    seenDocuments.add(documentId);
-    if (key !== "pr-custody") documents.push({ card, documentId, key });
-  });
-  for (const { card, documentId, key } of documents) {
-    guard();
-    const value = await ctx.issues.documents.get(card.id, key, companyId);
-    const document = record(value);
-    if (document.companyId !== companyId || document.issueId !== card.id || document.id !== documentId || document.key !== key) {
-      unknown("document missing or identity mismatch");
-    }
-    const body = text(document.body, "document body");
-    budget(body);
-    card.texts.push({ id: `document:${documentId}`, body, at: time(document.updatedAt), ownership: true });
-  }
+  // Directives are read from comments only: document bodies are never
+  // loaded, so an oversized document can no longer abort the whole snapshot.
   return [...byId.values()];
 }
