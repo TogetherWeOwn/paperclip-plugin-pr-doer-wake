@@ -173,6 +173,7 @@ export function custodyByteBudget() {
 export async function loadCustodyCards(
   ctx: PluginContext, companyId: string, guard: () => void, budget: ReturnType<typeof custodyByteBudget>,
 ): Promise<CustodyCard[]> {
+  const acquired = (value: unknown): void => { if (typeof value === "string") budget(value); };
   id(companyId);
   async function rows(table: Table, columns: string, cap: number, visit: (row: Row) => void, issueIds?: string[]): Promise<void> {
     let count = 0;
@@ -208,6 +209,9 @@ export async function loadCustodyCards(
     status, status_version, assignee_agent_id, assignee_user_id, origin_kind,
     conversation_agent_id, conversation_user_id, conversation_state,
     updated_at, completed_at, cancelled_at`, MAX_CARDS, (row) => {
+    // Every acquired body counts, including rows excluded below.
+    acquired(row.title);
+    acquired(row.description);
     const origin = text(row.origin_kind, "origin_kind");
     // Chat conversations also have dedicated identity fields, independent of origin.
     const conversationAgent = nullableId(row.conversation_agent_id);
@@ -225,10 +229,8 @@ export async function loadCustodyCards(
       updatedAt: time(row.updated_at), completedAt: nullableTime(row.completed_at), cancelledAt: nullableTime(row.cancelled_at),
       texts: [],
     };
-    budget(card.title);
     card.texts.push({ id: "title", body: card.title, at: card.updatedAt, ownership: true });
     if (card.description !== null) {
-      budget(card.description);
       card.texts.push({ id: "description", body: card.description, at: card.updatedAt, ownership: true });
     }
     cards.set(card.id, card);
@@ -248,6 +250,7 @@ export async function loadCustodyTexts(
   ctx: PluginContext, companyId: string, guard: () => void, cards: CustodyCard[], budget: ReturnType<typeof custodyByteBudget>,
 ): Promise<CustodyCard[]> {
   id(companyId);
+  const acquired = (value: unknown): void => { if (typeof value === "string") budget(value); };
   if (!cards.length) return cards;
   const byId = new Map<string, CustodyCard>();
   for (const card of cards) {
@@ -290,13 +293,14 @@ export async function loadCustodyTexts(
   await rows("issue_comments", `id, company_id, issue_id, body,
     author_agent_id, author_user_id, author_type, deleted_at, updated_at`, MAX_COMMENTS, (row) => {
     const card = parent(row);
+    // Every acquired body counts, including deleted comments skipped below.
+    acquired(row.body);
     if (nullableTime(row.deleted_at) !== null) return;
     const agent = nullableId(row.author_agent_id);
     const user = nullableText(row.author_user_id, "author_user_id");
     const authorType = nullableText(row.author_type, "author_type");
     if (authorType !== null && !["agent", "user", "system"].includes(authorType)) unknown("invalid comment author_type");
     const body = text(row.body, "comment body");
-    budget(body);
     card.texts.push({ id: `comment:${id(row.id)}`, body, at: time(row.updated_at), ownership: agent !== null && user === null && (authorType === null || authorType === "agent") });
   });
 

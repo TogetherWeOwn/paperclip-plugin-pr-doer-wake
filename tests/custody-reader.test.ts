@@ -290,6 +290,19 @@ describe("loadCustodyCards", () => {
     expect(h.query).toHaveBeenCalledTimes(1 + Math.ceil(count / 200));
   });
 
+  it("charges bodies of cards it then excludes (chat cards) against the shared byte limit", async () => {
+    const chunk = "a".repeat(128_000);
+    const h = host({ cards: Array.from({ length: 525 }, (_, i) => card(i + 1, { title: "t", description: chunk, conversation_state: "open" })) });
+    await expect(loadAll(h.ctx, h.guard)).rejects.toThrow("total byte budget");
+  });
+
+  it("charges deleted comment bodies it then skips against the shared byte limit", async () => {
+    const chunk = "a".repeat(128_000);
+    const h = host({ cards: [card(1, { description: null })], comments: Array.from({ length: 525 }, (_, i) =>
+      comment(i + 1, { issue_id: uuid(1), body: chunk, deleted_at: "2026-11-01T00:00:00.000Z" })) });
+    await expect(loadAll(h.ctx, h.guard)).rejects.toThrow("total byte budget");
+  });
+
   it.each([0, 1])("shares the acquisition budget across metadata and comments at limit + %i bytes", async (extra) => {
     const body = "a".repeat(128_000);
     const cardCount = 256;
