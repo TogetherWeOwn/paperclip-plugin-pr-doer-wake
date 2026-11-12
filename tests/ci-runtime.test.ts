@@ -640,16 +640,42 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("required check missing: review [app 8]") });
   });
 
-  it("stays pending when the timeline read fails, then wakes a never-draft PR as before", async () => {
+  it.each([["network"], ["timeout"], ["backoff"], ["auth"], ["http", 503], ["http", 429]] as const)("stays pending on a transient timeline error (%s %s), then wakes a never-draft PR as before", async (code, status?: number) => {
+    const { CiGithubError } = await import("../src/ci-github.js");
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
     await h.runtime.register(registration, run);
     await missingOnly();
     github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
     h.advance(180_000);
-    github.readySince.mockRejectedValueOnce(new Error("timeline unavailable"));
+    github.readySince.mockRejectedValueOnce(new CiGithubError(code, status));
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger().waits[0]?.status).toBe("open");
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([["pages"], ["budget"], ["response"], ["input"], ["http", 404]] as const)("falls back to the un-graced verdict on a repeatable timeline error (%s %s) instead of waiting out the TTL", async (code, status?: number) => {
+    const { CiGithubError } = await import("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
+    h.advance(180_000);
+    github.readySince.mockRejectedValue(new CiGithubError(code, status));
+    await h.runtime.poll();
+    expect(github.readySince).toHaveBeenCalledTimes(1);
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("required check missing") });
+  });
+
+  it("falls back on a non-GitHub timeline error too", async () => {
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
+    h.advance(180_000);
+    github.readySince.mockRejectedValue(new Error("timeline unavailable"));
     await h.runtime.poll();
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
   });
@@ -810,7 +836,8 @@ describe("CI runtime polling and durable wake outcomes", () => {
       github.readySince.mockResolvedValue(h.clock() - 30_000);
       await h.runtime.poll();
       expect(github.readySince).toHaveBeenCalledWith(REPO, 17);
-      github.readySince.mockRejectedValueOnce(new Error("timeline unavailable"));
+      const { CiGithubError } = await import("../src/ci-github.js");
+      github.readySince.mockRejectedValueOnce(new CiGithubError("network"));
       h.advance(90_000);
       await h.runtime.poll();
       github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: 5 })).mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: 6 }));
@@ -818,6 +845,22 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup).not.toHaveBeenCalled();
       expect(Object.values(h.ledger().prHeadPending ?? {})).toHaveLength(1);
       await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("CI fail") });
+    });
+
+    it("wakes the reviewer on a repeatable timeline error instead of dropping the pending head at TTL", async () => {
+      const { CiGithubError } = await import("../src/ci-github.js");
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await missingOnly(NEXT_HEAD);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: 5 }));
+      await h.runtime.poll();
+      h.advance(3_600_000);
+      github.readySince.mockRejectedValue(new CiGithubError("pages"));
+      await h.runtime.poll();
+      expect(github.readySince).toHaveBeenCalledWith(REPO, 17);
       expect(h.requestWakeup).toHaveBeenCalledTimes(1);
       expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("CI fail") });
     });
