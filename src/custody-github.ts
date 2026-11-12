@@ -21,6 +21,8 @@ export interface CustodyPull {
 
 type ObjectValue = Record<string, unknown>;
 function invalid(): never { throw new CiGithubError("response"); }
+/** Tolerated disagreement between GitHub's updated sort and returned updated_at. */
+export const ORDER_SKEW_MS = 5 * 60_000;
 function object(value: unknown): ObjectValue {
   if (!value || typeof value !== "object" || Array.isArray(value)) return invalid();
   return value as ObjectValue;
@@ -135,10 +137,12 @@ export class CustodyGithub extends CiGithub {
     let previous = Infinity;
     const result = await this.collect(`/repos/${repo}/pulls?state=${state}&sort=updated&direction=desc`, (value) => {
       const parsed = pull(value, repo, state);
-      if (parsed.updatedAt > previous) return invalid();
-      previous = parsed.updatedAt;
+      // GitHub's updated sort can disagree with the returned updated_at by a
+      // second or so. Small inversions are tolerated; a large one is refused.
+      if (parsed.updatedAt > previous + ORDER_SKEW_MS) return invalid();
+      previous = Math.min(previous, parsed.updatedAt);
       return { key: parsed.number, value: parsed };
-    }, state === "closed" ? (batch) => batch.some((value) => value.updatedAt < since!) : undefined);
+    }, state === "closed" ? (batch) => batch.some((value) => value.updatedAt < since! - ORDER_SKEW_MS) : undefined);
     return state === "closed" ? result.filter((value) => value.updatedAt >= since!) : result;
   }
 
