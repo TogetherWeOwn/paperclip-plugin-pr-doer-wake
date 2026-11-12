@@ -1,3 +1,4 @@
+import { CUSTODY_LIMITS } from "../src/custody-runtime.js";
 import { describe, expect, it } from "vitest";
 import { CiGithubCache, GITHUB_USER_AGENT, type CiFetch, type CiGithubOptions, type CiHttpResponse } from "../src/ci-github.js";
 import { CustodyGithub, type CustodyPull } from "../src/custody-github.js";
@@ -118,6 +119,23 @@ describe("CustodyGithub REST enumeration", () => {
     await expect(client.pulls(REPO, "open")).rejects.toMatchObject({ code: "response" });
   });
 
+  it("tolerates GitHub's small updated-sort inversions but refuses large ones", async () => {
+    const page = (later: string) => [rawPull(1, { updated_at: "2026-01-02T00:00:00Z" }), rawPull(2, { updated_at: later })];
+    const small = fixtures(() => response(page("2026-01-02T00:00:01Z")));
+    expect(await small.client.pulls(REPO, "open")).toHaveLength(2);
+    const large = fixtures(() => response(page("2026-01-02T01:00:00Z")));
+    await expect(large.client.pulls(REPO, "open")).rejects.toMatchObject({ code: "response" });
+  });
+
+  it("accepts a listing page above the default 2 MiB cap at the custody body limit", async () => {
+    const pulls = Array.from({ length: 50 }, (_, index) => rawPull(index + 1, { body: "x".repeat(60_000) }));
+    const bytes = JSON.stringify(pulls).length;
+    expect(bytes).toBeGreaterThan(2 * 1024 * 1024);
+    expect(bytes).toBeLessThan(CUSTODY_LIMITS.bodyBytes);
+    await expect(fixtures(() => response(pulls)).client.pulls(REPO, "open")).rejects.toMatchObject({ code: "response" });
+    expect(await fixtures(() => response(pulls), { maxBodyBytes: CUSTODY_LIMITS.bodyBytes }).client.pulls(REPO, "open")).toHaveLength(50);
+  });
+
   it("checks a terminal full array with one additional numbered page", async () => {
     const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
       ? Array.from({ length: 100 }, (_, index) => rawPull(index + 1)) : []));
@@ -133,6 +151,18 @@ describe("CustodyGithub REST enumeration", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0]!.url.searchParams.get("sort")).toBe("updated");
     expect(calls[0]!.url.searchParams.get("direction")).toBe("desc");
+  });
+
+  it("keeps reading closed pages past a row just below the cursor when the sort inverts", async () => {
+    // Page 1 ends one second below the cursor; page 2 still holds a PR updated after it.
+    const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
+      ? [...Array.from({ length: 99 }, (_, index) => closed(index + 1, RECENT)), closed(100, "2026-01-02T23:59:59Z")]
+      : [closed(101, "2026-01-03T00:00:01Z")]));
+    const values = await client.pulls(REPO, "closed", Date.parse(RECENT));
+    expect(calls).toHaveLength(2);
+    expect(values.map((value) => value.number)).toContain(101);
+    expect(values.map((value) => value.number)).not.toContain(100);
+    expect(values).toHaveLength(100);
   });
 
   it("requires a bounded bootstrap or stored cursor for closed pulls", async () => {

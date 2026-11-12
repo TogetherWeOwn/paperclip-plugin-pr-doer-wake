@@ -9,7 +9,9 @@ import { CustodyGithub, type CustodyPull } from "./custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, parseWorkProductBindings, type CustodyCard } from "./custody-reader.js";
 import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prIndexRef, prReference, prRefFromUrl, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
 
-export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000 } as const;
+// A 100-PR listing page carries full PR bodies; long bodies push it past the
+// default 2 MiB response cap, so custody uses the transport's 8 MiB maximum.
+export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000, bodyBytes: 8 * 1024 * 1024 } as const;
 type Receipt = { at: number; turn?: number; status: "pending" | "attempting" | "woken" | "unconfirmed" | "cleared"; phase?: "create" | "wake"; issueId?: string; childId?: string };
 function delivered(receipt: Receipt): boolean { return receipt.status === "woken"; }
 interface InventoryRow { pr: string; state: string; cardId: string | null; mapping: string; triggers: string[]; unknown?: boolean }
@@ -249,7 +251,7 @@ export class CustodyRuntime {
       // Reserve discovery capacity inside the client's admission gate, before its sole counter advances.
       const inventoryAvailable = () => github.requestCount < CUSTODY_LIMITS.requests - 100 && this.now() - started < CUSTODY_LIMITS.tickMs - 30_000;
       const github: CustodyGithub = new CustodyGithub((url, init) => this.ctx.http.fetch(url, init), credential, {
-        now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100,
+        now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100, maxBodyBytes: CUSTODY_LIMITS.bodyBytes,
         beforeRequest: () => {
           guard();
           if (!dispatching && !inventoryAvailable()) throw new Error("custody_request_budget");
