@@ -4,7 +4,7 @@ import type { CustodyPull } from "../src/custody-github.js";
 import { CustodyGithub } from "../src/custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
-import { CUSTODY_ORIGIN, DAY, hasCardClosure, latestDisposition } from "../src/custody-policy.js";
+import { CUSTODY_ORIGIN, DAY, hasCardClosure, hasPrClosure, latestDisposition } from "../src/custody-policy.js";
 vi.mock("../src/custody-reader.js", () => ({ custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -106,6 +106,10 @@ describe("custody native effects", () => {
     const source = card({ texts: [{ id: "comment:1", body: `${directive}\n${closure}`, at: NOW, ownership: false }] });
     expect(latestDisposition(source, pull())).toEqual(expect.objectContaining({ action: "defer", revisit: Date.parse("2026-11-01T00:00:00Z") }));
     expect(hasCardClosure(source, pull())).toBe(true);
+    const prClosure = guidance.match(/`(Closed unmerged: <duplicate of\|[^`]+)`/)![1]!
+      .replace("<duplicate of|superseded by|need lost|mismatch|burden>", "superseded by")
+      .replace("<reason>", "another PR");
+    expect(hasPrClosure([prClosure])).toBe(true);
   });
   it.each(["done", "cancelled", "backlog", "blocked"])("creates explicit todo child and wake for %s source", async (status) => {
     const h = fixture({ cards: [card({ status })] });
@@ -171,20 +175,6 @@ describe("custody native effects", () => {
     const h = fixture();
     h.ctx.issues.requestWakeup.mockResolvedValueOnce({ queued: false, runId: null } as any);
     await h.runtime.poll();
-    await h.restart().poll();
-    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
-  });
-  it("updates legacy guidance on a deferred retry without losing prior evidence", async () => {
-    const h = fixture();
-    h.ctx.issues.requestWakeup.mockResolvedValueOnce({ queued: false, runId: null } as any);
-    await h.runtime.poll();
-    const legacy = `Previous notes\nKey: example/project#42|idle|${NOW - 8 * DAY}\nOld guidance\n`;
-    h.docs.set(ISSUE, { body: legacy });
-    await h.restart().poll();
-    expect(h.docs.get(ISSUE).body).toContain(legacy);
-    expect(h.docs.get(ISSUE).body).toContain("PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD");
-    expect(h.docs.get(ISSUE).body).toContain("Closed unmerged: <reason>; source owner/repo#number");
-    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
     await h.restart().poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
   });

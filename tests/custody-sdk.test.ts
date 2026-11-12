@@ -30,7 +30,7 @@ type HostCall = { method: string; params: Record<string, unknown> };
  * resolveRequiredCompanyId refuses it during scheduled (proactive, company-less)
  * job invocations. No SDK mock, no host/core, and no network are involved.
  */
-type InventoryFixture = { issues: Record<string, unknown>[]; comments: Record<string, unknown>[] };
+type InventoryFixture = { issues: Record<string, unknown>[]; comments: Record<string, unknown>[]; open?: boolean };
 
 async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig, inventory?: InventoryFixture) {
   // One worker process per plugin: reset the module so each test gets a
@@ -111,12 +111,32 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
             const url = new URL(String(params.url));
             let body: unknown[] = [];
             if (inventory && url.pathname === "/orgs/example/repos") body = [{ id: 1, full_name: "example/project", archived: false }];
-            if (inventory && url.pathname === "/repos/example/project/pulls" && url.searchParams.get("state") === "closed") body = [{
+            if (inventory && url.pathname === "/graphql" && inventory.open) {
+              const pageInfo = { hasNextPage: false, endCursor: null };
+              const init = params.init as { method?: string; body?: string };
+              const request = JSON.parse(init.body ?? "") as { query: string; variables: Record<string, unknown> };
+              if (init.method !== "POST" || request.variables.owner !== "example" || request.variables.name !== "project"
+                || request.variables.number !== 42 || request.variables.cursor !== null) throw new Error("unexpected GraphQL request");
+              const oid = "a".repeat(40);
+              const suite = { id: "suite", status: "COMPLETED", createdAt: "2026-10-02T00:00:00Z", updatedAt: "2026-10-02T00:00:00Z" };
+              const selection = request.query.includes("checkSuites(")
+                ? { commits: { totalCount: 1, nodes: [{ commit: { oid, checkSuites: { totalCount: 1, pageInfo, nodes: [suite] } } }] } }
+                : request.query.includes("reviews(") ? { reviews: { totalCount: 0, pageInfo, nodes: [] } }
+                  : request.query.includes("commits(first:") ? { commits: { totalCount: 1, pageInfo, nodes: [{ commit: { oid, committedDate: "2026-10-02T00:00:00Z" } }] } }
+                    : null;
+              if (!selection) throw new Error("unexpected GraphQL selection");
+              reply(id, { status: 200, headers: {}, body: JSON.stringify({ data: { repository: { nameWithOwner: "example/project", pullRequest: {
+                number: 42, state: "OPEN", headRefOid: oid, createdAt: "2026-10-01T00:00:00Z", repository: { nameWithOwner: "example/project" },
+                ...selection,
+              } } } }) });
+              return;
+            }
+            if (inventory && url.pathname === "/repos/example/project/pulls" && url.searchParams.get("state") === (inventory.open ? "open" : "closed")) body = [{
               number: 42, user: { login: "contributor", type: "User" },
               head: { ref: "feature", sha: "a".repeat(40), repo: { full_name: "example/project" } },
-              base: { repo: { full_name: "example/project" } }, title: "Example", body: null, state: "closed",
+              base: { repo: { full_name: "example/project" } }, title: "Example", body: null, state: inventory.open ? "open" : "closed",
               created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-10T00:00:00Z",
-              closed_at: "2026-10-10T00:00:00Z", merged_at: "2026-10-10T00:00:00Z", merged: true,
+              closed_at: inventory.open ? null : "2026-10-10T00:00:00Z", merged_at: inventory.open ? null : "2026-10-10T00:00:00Z", merged: !inventory.open,
             }];
             reply(id, { status: 200, headers: {}, body: JSON.stringify(body) });
             return;
@@ -166,6 +186,20 @@ const comment = (n: number, body: string) => ({
 });
 
 describe("scheduled pr-custody job over the real SDK/host contract", () => {
+  it.each([false, true])("only a comment defer suppresses an open idle PR (comment present: %s)", async (withComment) => {
+    const h = await custodyHost(custodyConfig, {
+      open: true, issues: [issue(1, PR_URL, DIRECTIVE)], comments: withComment ? [comment(1, DIRECTIVE)] : [],
+    });
+    try {
+      await h.send("initialize-open", "initialize", initialize);
+      await h.send("config-open", "configChanged", { config: custodyConfig, companyId: COMPANY });
+      await h.send("job-open", "runJob", runJob);
+      const report = h.ledger()?.report;
+      expect(report).toMatchObject({ complete: true, unknown: [], rows: [{ pr: "example/project#42", state: "open", cardId: fixtureId(1), mapping: "url" }] });
+      expect((report!.rows[0] as { triggers: string[] }).triggers).toEqual(withComment ? [] : [expect.stringMatching(/^example\/project#42\|idle\|/)]);
+    } finally { h.stop(); }
+  });
+
   it.each([false, true])("records disposition clocks from comments only (comment present: %s)", async (withComment) => {
     const h = await custodyHost(custodyConfig, {
       issues: [issue(1, PR_URL, DIRECTIVE)], comments: withComment ? [comment(1, DIRECTIVE)] : [],

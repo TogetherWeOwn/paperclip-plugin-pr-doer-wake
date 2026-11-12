@@ -592,9 +592,7 @@ export class CustodyRuntime {
           }
           guard();
           const previous = await this.ctx.issues.documents.get(target, "pr-custody", config.companyId);
-          let evidence = previous?.body.includes(`Key: ${trigger.key}\n`) ? previous.body : `${previous?.body ?? ""}\n${this.evidence(pr, trigger)}`;
-          // Pending retries may retain guidance written by an older version.
-          if (!evidence.includes(this.dispositionGuidance())) evidence += `\n${this.dispositionGuidance()}\n`;
+          const evidence = previous?.body.includes(`Key: ${trigger.key}\n`) ? previous.body : `${previous?.body ?? ""}\n${this.evidence(pr, trigger)}`;
           if (evidence.length > 250_000) throw new Error("evidence_capacity");
           guard();
           spend();
@@ -646,7 +644,7 @@ export class CustodyRuntime {
   }
 
   private dispositionGuidance(): string {
-    return "Record a PR-specific disposition in a comment on the source card using one line: `PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD` (choose one action and replace the placeholders). For a closed unmerged PR, also record `Closed unmerged: <reason>; source owner/repo#number` in a source-card comment, and put the closure rationale on the PR.";
+    return "Record a PR-specific disposition in a comment on the source card using one line: `PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD` (choose one action and replace the placeholders). For a closed unmerged PR, also record `Closed unmerged: <reason>; source owner/repo#number` in a source-card comment, and record `Closed unmerged: <duplicate of|superseded by|need lost|mismatch|burden> <reason>` in a PR comment (choose one category and replace the placeholders).";
   }
 
   private evidence(pr: CustodyPull, trigger: Trigger): string {
