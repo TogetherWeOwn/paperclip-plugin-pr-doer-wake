@@ -526,10 +526,10 @@ export class CiWakeRuntime {
     const key = `${companyId}:${repo}:${prNumber}`;
     const existing = ledger.prHeadPending[key];
     if (existing && existing.newSha === newSha) { if (draft) trackDraft(existing, true, this.now()); return; }
-    // Seed draft tracking from the PR read that observed the change, so a
+    // Seed draft tracking from the PR read that observed the new head, so a
     // draft that turns ready before the entry's first poll still gets grace.
-    const sawDraft = draft || existing?.sawDraft === true;
-    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now(), ...(sawDraft ? { sawDraft: true } : {}) };
+    // The old head's draft state is not carried over.
+    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now(), ...(draft ? { sawDraft: true } : {}) };
   }
 
   /** Exact work-product match for one PR; mirrors custody's work_product tier. */
@@ -753,6 +753,8 @@ export class CiWakeRuntime {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
             entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
+            // The new head carries only its own draft state.
+            delete entry.sawDraft; delete entry.readySince;
             trackDraft(entry, current.draft, this.now());
             await this.save(ledger); continue;
           }

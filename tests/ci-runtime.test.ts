@@ -866,6 +866,21 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ newSha: THIRD_HEAD, readySince: START + 3_610_000 });
     });
 
+    it("does not carry an old head's draft state to a new head registered ready", async () => {
+      const THIRD_HEAD = "c".repeat(40);
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, draft: true }));
+      await h.runtime.register({ ...registration, headSha: NEXT_HEAD }, run);
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ sawDraft: true });
+      github.pull.mockResolvedValue(pull({ headSha: THIRD_HEAD, draft: false }));
+      await h.runtime.register({ ...registration, headSha: THIRD_HEAD }, run);
+      const entry = Object.values(h.ledger().prHeadPending ?? {})[0];
+      expect(entry).toMatchObject({ newSha: THIRD_HEAD });
+      expect(entry).not.toHaveProperty("sawDraft");
+    });
+
     it("does not re-wake the same (card, SHA) whose dedupe record exists", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
