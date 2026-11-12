@@ -44,6 +44,9 @@ export interface Wait extends Registration {
   finishedAt?: number;
   lastAttemptAt?: number;
   reason?: string;
+  /** Draft tracking for missing-check grace; see trackDraft. */
+  sawDraft?: boolean;
+  readySince?: number;
 }
 interface Audit { at: number; operation: string; runId?: string; companyId?: string; waitId?: string; outcome: string; detail?: string }
 /**
@@ -64,6 +67,8 @@ export interface PrHeadPending {
   newSha: string;
   observedAt: number;
   shadowLogged?: string[];
+  sawDraft?: boolean;
+  readySince?: number;
 }
 interface Ledger {
   version: 1;
@@ -95,6 +100,20 @@ const REFUSAL_CODES = new Set([
   "invalid_ledger", "registration_refused",
 ]);
 
+/**
+ * Records the first ready observation after a draft one, so checks that only
+ * run on ready PRs get a fresh missing-check grace. Returns true on change.
+ */
+function trackDraft(entry: { sawDraft?: boolean; readySince?: number }, draft: boolean, now: number): boolean {
+  if (draft) {
+    const changed = !entry.sawDraft || entry.readySince !== undefined;
+    entry.sawDraft = true; delete entry.readySince;
+    return changed;
+  }
+  if (!entry.sawDraft || entry.readySince !== undefined) return false;
+  entry.readySince = now;
+  return true;
+}
 function refusalCode(error: unknown): string {
   if (error instanceof CiGithubError) return `github_${error.code}`;
   if (error instanceof Error && REFUSAL_CODES.has(error.message)) return error.message;
@@ -628,7 +647,8 @@ export class CiWakeRuntime {
         const samples = ledger.samples[`${wait.companyId}:${wait.repo}`] ?? [];
         const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
-        const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
+        if (trackDraft(wait, pr.draft, this.now())) await this.save(ledger);
+        const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft, readySince: wait.readySince });
         if (verdict.kind === "pending") continue;
         await this.checkBinding(wait);
         const freshConfig = await this.config(wait.companyId);
@@ -732,7 +752,8 @@ export class CiWakeRuntime {
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
           const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
-          const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
+          if (trackDraft(entry, current.draft, this.now())) await this.save(ledger);
+          const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft, readySince: entry.readySince });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
           if (verdict.kind === "pending") continue;
           // Mirror the CI path: re-read the live PR after the readiness

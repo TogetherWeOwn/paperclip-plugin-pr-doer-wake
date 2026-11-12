@@ -101,6 +101,8 @@ export interface CiReadinessTiming {
   registeredAt: number;
   medianMs: number;
   draft?: boolean;
+  /** When the PR was first seen ready after being seen as a draft. */
+  readySince?: number;
 }
 export interface CiReadiness {
   kind: "pending" | "pass" | "fail";
@@ -799,7 +801,7 @@ export function relevantSuites(snapshot: CiSnapshot): CiSnapshot["suites"] {
 
 /** Pure, conservative readiness: no network, wall clock, branch fallback, or PR body policy. */
 export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTiming): CiReadiness {
-  if (![timing.now, timing.registeredAt, timing.medianMs].every(Number.isFinite) || timing.medianMs <= 0) {
+  if (![timing.now, timing.registeredAt, timing.medianMs, timing.readySince ?? 0].every(Number.isFinite) || timing.medianMs <= 0) {
     throw new CiGithubError("input");
   }
   const runs = latest(snapshot.runs, (run) => JSON.stringify([run.name, run.appId]));
@@ -811,8 +813,11 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   const completions = suites.flatMap((suite) => suite.status === "completed" && suite.completedAt !== null ? [suite.completedAt] : []);
   const lastSuiteCompletedAt = completions.length ? Math.max(...completions) : null;
   // A partial set of completions cannot start grace while another suite may still register checks.
-  const missingSince = suites.length === 0 ? timing.registeredAt
+  const settledSince = suites.length === 0 ? timing.registeredAt
     : completions.length === suites.length ? lastSuiteCompletedAt : null;
+  // Checks that only run on ready PRs register after the draft flips, so
+  // missing-check grace restarts when the PR was last seen leaving draft.
+  const missingSince = settledSince === null ? null : Math.max(settledSince, timing.readySince ?? settledSince);
   const missingFailAt = missingSince === null ? null : missingSince + 2 * timing.medianMs;
   const failed: string[] = [];
   const missing: string[] = [];
@@ -827,17 +832,18 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   if (snapshot.required.length) {
     for (const required of snapshot.required) {
       const matchingRuns = runs.filter((run) => run.name === required.context && (required.appId === null || run.appId === required.appId));
-      // A creator's user ID is not an app ID; only a verified app lookup counts.
-      const matchingStatuses = required.appId === null ? statuses.filter((status) => status.context === required.context)
-        : latest(snapshot.statuses.filter((status) => status.context === required.context && status.verifiedAppId === required.appId), (status) => status.context);
-      // A failed lookup is not proof of a different app, even when a matching
-      // run exists. Ignore superseded statuses from the same creator only.
-      const unverified = required.appId !== null && latest(
-        snapshot.statuses.filter((status) => status.context === required.context),
-        (status) => (status.creatorLogin ?? "").toLowerCase(),
-      ).some((status) => status.verifiedAppId === null);
+      // A context's state is its latest status, whoever set it. An app-bound
+      // requirement counts only that status, and only when a verified app
+      // lookup proves the required app set it: an older success from the
+      // required app never outlives a newer status from anyone else.
+      const current = statuses.find((status) => status.context === required.context);
+      const matchingStatuses = current && (required.appId === null || current.verifiedAppId === required.appId) ? [current] : [];
+      // A failed lookup is not proof of a different app, even when a matching run exists.
+      const unverified = required.appId !== null && current?.verifiedAppId === null;
+      // GitHub refuses the merge while another source holds the current status.
+      const foreign = required.appId !== null && current !== undefined && !unverified && !matchingStatuses.length;
       if (unverified) pending.push(label(required));
-      if (!matchingRuns.length && !matchingStatuses.length && !unverified) missing.push(label(required));
+      if (foreign || !matchingRuns.length && !matchingStatuses.length && !unverified) missing.push(label(required));
       for (const run of matchingRuns) {
         // An active suite can hide a required rerun not yet materialized. Only
         // positive current-attempt job evidence permits same-suite optional work.

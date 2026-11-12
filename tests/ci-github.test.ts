@@ -231,10 +231,12 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"] });
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["build [app 7]"], failed: [] });
     input.runs.push(run(1, { status: "queued", conclusion: null }));
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: ["build [app 7]"] });
+    input.statuses = [];
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", missing: [] });
   });
 
-  it("does not pass over a current unverified status, but ignores superseded creator history", () => {
+  it("judges only the current status: unverified defers, another source never passes", () => {
     const input = snapshot({
       required: [{ context: "build", appId: 7 }], runs: [run()],
       statuses: [{ id: 2, context: "build", state: "failure", creatorLogin: "app[bot]", verifiedAppId: null }],
@@ -245,7 +247,26 @@ describe("evaluateReadiness", () => {
     input.statuses.push({ id: 4, context: "build", state: "error", creatorLogin: "other[bot]", verifiedAppId: null });
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"] });
     input.statuses.push({ id: 5, context: "build", state: "success", creatorLogin: "other[bot]", verifiedAppId: 8 });
-    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [] });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", pending: [], missing: ["build [app 7]"] });
+    input.statuses.push({ id: 6, context: "build", state: "success", creatorLogin: "app[bot]", verifiedAppId: 7 });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pass", pending: [], missing: [] });
+  });
+
+  it.each([
+    ["another app", "failure", { creatorLogin: "other[bot]", verifiedAppId: 999 }],
+    ["another app", "success", { creatorLogin: "other[bot]", verifiedAppId: 999 }],
+    ["a human", "failure", { creatorLogin: "octocat" }],
+    ["a human", "success", { creatorLogin: "octocat" }],
+  ] as const)("never passes an older required-app success under a newer status from %s (%s)", (_source, state, creator) => {
+    const input = snapshot({
+      required: [{ context: "Devin Review", appId: 811515 }],
+      statuses: [
+        { id: 10, context: "Devin Review", state: "success", creatorLogin: "devin-ai-integration[bot]", verifiedAppId: 811515 },
+        { id: 11, context: "Devin Review", state, ...creator },
+      ],
+    });
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["Devin Review [app 811515]"] });
+    expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["Devin Review [app 811515]"] });
   });
 
   it("keeps latest runs separately per app, including unbound context collisions", () => {
@@ -253,6 +274,18 @@ describe("evaluateReadiness", () => {
     expect(evaluateReadiness(snapshot({ runs }), timing).kind).toBe("fail");
     expect(evaluateReadiness(snapshot({ runs, required: [{ context: "build", appId: 8 }] }), timing).kind).toBe("pass");
     expect(evaluateReadiness(snapshot({ runs, required: [{ context: "build", appId: null }] }), timing).kind).toBe("fail");
+  });
+
+  it("restarts missing-check grace when a draft is first seen ready", () => {
+    const input = snapshot({ required: [{ context: "build", appId: 7 }] });
+    const stale = { ...timing, registeredAt: 0, now: 10_000 };
+    expect(evaluateReadiness(input, stale)).toMatchObject({ kind: "fail", missing: ["build [app 7]"] });
+    expect(evaluateReadiness(input, { ...stale, readySince: 9_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"], missingSince: 9_000 });
+    expect(evaluateReadiness(input, { ...stale, readySince: 9_000, now: 9_000 + 2 * stale.medianMs })).toMatchObject({ kind: "fail" });
+    input.runs.push(run(1, { conclusion: "failure" }));
+    input.required.push({ context: "lint", appId: 7 });
+    expect(evaluateReadiness(input, { ...stale, readySince: 9_000 })).toMatchObject({ kind: "pending", failed: ["build [app 7]"] });
+    expect(() => evaluateReadiness(input, { ...stale, readySince: Number.NaN })).toThrow();
   });
 
   it("keeps missing draft checks pending but reports real failures", () => {
@@ -403,8 +436,8 @@ describe("CiGithub REST reads", () => {
     const { fetch, calls } = fixtures((url) => {
       if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "Devin Review", app_id: 811515 }] });
       if (url.pathname.endsWith("statuses")) return response([
-        { id: 1, context: "Devin Review", state: "success", creator: { login: "devin-ai-integration[bot]" } },
-        { id: 2, context: "Devin Review", state: "success", creator: { login: "other[bot]" } },
+        { id: 1, context: "Devin Review", state: "success", creator: { login: "other[bot]" } },
+        { id: 2, context: "Devin Review", state: "success", creator: { login: "devin-ai-integration[bot]" } },
       ]);
       if (url.pathname === "/apps/devin-ai-integration") return response({ id: 811515 });
       if (url.pathname === "/apps/other") return response({ id: 123 });
@@ -425,9 +458,9 @@ describe("CiGithub REST reads", () => {
     const { fetch } = fixtures((url) => {
       if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "review", app_id: 7 }] });
       if (url.pathname.endsWith("statuses")) return response([
-        { id: 1, context: "review", state: "success", creator: { login: "unknown[bot]" } },
-        { id: 2, context: "review", state: "success", creator: { login: "verified[bot]" } },
-        { id: 3, context: "review", state: "success", creator: { login: "wrong[bot]" } },
+        { id: 1, context: "review", state: "success", creator: { login: "verified[bot]" } },
+        { id: 2, context: "review", state: "success", creator: { login: "wrong[bot]" } },
+        { id: 3, context: "review", state: "success", creator: { login: "unknown[bot]" } },
       ]);
       if (url.pathname === "/apps/unknown") return response({ message: "Resource not accessible by integration" }, status);
       if (url.pathname === "/apps/verified") return response({ id: 7 });

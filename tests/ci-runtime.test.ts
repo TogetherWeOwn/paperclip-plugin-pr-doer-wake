@@ -613,6 +613,29 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe(failure ? "woken" : "open");
   });
 
+  it("gives ready-only checks fresh grace after a draft is first seen ready", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START,
+      required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.pull.mockResolvedValue(pull({ draft: true }));
+    h.advance(24 * 3_600_000);
+    await h.runtime.poll();
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", sawDraft: true });
+    github.pull.mockResolvedValue(pull({ draft: false }));
+    h.advance(60_000);
+    await h.runtime.poll();
+    const readyAt = START + 24 * 3_600_000 + 60_000;
+    expect(h.ledger().waits[0]).toMatchObject({ status: "open", readySince: readyAt });
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    h.advance(120_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().waits[0]?.status).toBe("woken");
+  });
+
   it("does not wake a ready PR when required status identity is unverified", async () => {
     const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
