@@ -215,12 +215,13 @@ export class DependencyWakeRuntime {
     // audited, left unreceipted and retried next tick, but it does not suppress another blocker's
     // established settlement — an unknown older completion never invalidates separate evidence
     // for a newer one. A live blocker run still defers the whole dependent (workspace-finalize
-    // policy), and a truncated window is treated as an unknown bound for that blocker alone.
+    // policy), and so does a full run window: it cannot rule out a hidden live run on that
+    // blocker, so it is a dependent-wide deferral, not merely an unknown bound.
     const settledAt = new Map<string, number>();
     for (const b of fresh) {
       const blocker = await this.liveRun(tick, b.id);
       if (blocker.live) return;
-      if (blocker.truncated) { tick.audit("blocker_window_truncated", issue.id); continue; }
+      if (blocker.truncated) { tick.audit("blocker_window_truncated", issue.id); return; }
       const done = doneAt.get(b.id)!;
       let malformed = false;
       let span = -Infinity;

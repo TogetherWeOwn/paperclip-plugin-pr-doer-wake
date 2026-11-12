@@ -354,16 +354,18 @@ describe("dependency wake", () => {
     expect(h.ledger()?.receipts).toEqual({});
   });
 
-  it("treats a truncated blocker window as unbounded for that blocker only", async () => {
+  it("defers the whole dependent on a truncated blocker window: a hidden live run may exist", async () => {
+    // Settlement unknown is per-blocker, but a full 100-run window cannot prove no older run is
+    // still live, so it defers the dependent even when another blocker is settled.
     const h = harness();
     h.runs[BLK] = Array.from({ length: 100 }, (_, i) => ({ id: `b${i}`, issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 40 * MIN + i * 1_000), startedAt: iso(START - 40 * MIN + i * 1_000), finishedAt: iso(START - 40 * MIN + i * 1_000 + 500) }));
     h.issues[BLK2] = { id: BLK2, companyId: COMPANY, status: "done", completedAt: iso(START - 15 * MIN) };
     h.runs[BLK2] = [{ id: "b2", issueId: BLK2, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN), startedAt: iso(START - 20 * MIN), finishedAt: iso(START - 15 * MIN) }];
     h.relations[DEP]!.push({ id: BLK2, identifier: "TWO-2", status: "done" });
     await h.runtime.poll();
-    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("blocker_window_truncated");
-    expect(h.ledger()?.receipts[rk(DEP, BLK2, START - 15 * MIN)]?.outcome).toBe("woken");
+    expect(h.ledger()?.receipts).toEqual({});
   });
 
   it("uses the latest finish among multiple runs spanning the completion epoch", async () => {
