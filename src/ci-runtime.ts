@@ -497,7 +497,7 @@ export class CiWakeRuntime {
           .filter((w) => w.companyId === run.companyId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.issueId === registration.issueId)
           .sort((a, b) => b.registeredAt - a.registeredAt)[0];
         if (prior) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior.headSha, registration.headSha);
-        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
+        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open", ...(pr.draft ? { sawDraft: true } : {}) });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
         return { content: "CI wait registered", data: { waitId, status: "open", expiresAt: now + LIMITS.waitMs, dryRun: config.dryRun } };
@@ -640,6 +640,8 @@ export class CiWakeRuntime {
           }
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
+        // Record draft state from every valid PR read, before fallible snapshot reads.
+        if (trackDraft(wait, pr.draft, this.now())) await this.save(ledger);
         const identity = `${wait.companyId}:${authIdentity(config)}`;
         let appIds = appIdsByIdentity.get(identity);
         if (!appIds) { appIds = new Map(); appIdsByIdentity.set(identity, appIds); }
@@ -647,7 +649,6 @@ export class CiWakeRuntime {
         const samples = ledger.samples[`${wait.companyId}:${wait.repo}`] ?? [];
         const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
-        if (trackDraft(wait, pr.draft, this.now())) await this.save(ledger);
         const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft, readySince: wait.readySince });
         if (verdict.kind === "pending") continue;
         await this.checkBinding(wait);
@@ -748,11 +749,11 @@ export class CiWakeRuntime {
             entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
             await this.save(ledger); continue;
           }
+          if (trackDraft(entry, current.draft, this.now())) await this.save(ledger);
           const snapshot = await github.snapshot(entry.repo, entry.newSha, current.baseBranch);
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
           const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
-          if (trackDraft(entry, current.draft, this.now())) await this.save(ledger);
           const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft, readySince: entry.readySince });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
           if (verdict.kind === "pending") continue;
