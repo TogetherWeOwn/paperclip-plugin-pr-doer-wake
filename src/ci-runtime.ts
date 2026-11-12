@@ -166,8 +166,10 @@ function refusalDetail(error: unknown): { code: string; reason: string; auditDet
 }
 
 // The last stretch before a wait or pending head expires never consults the
-// timeline, so an unrecovered timeline error cannot outlive the entry.
-const TIMELINE_EXPIRY_MARGIN_MS = 60 * 60_000;
+// timeline, so an unrecovered timeline error cannot outlive the entry. Two
+// hours outlasts a throttle up to GitHub's hourly primary rate-limit reset
+// plus two 15-minute polls, so a fallback poll still runs before expiry.
+const TIMELINE_EXPIRY_MARGIN_MS = 2 * 60 * 60_000;
 
 function transientTimelineError(error: unknown): boolean {
   if (!(error instanceof CiGithubError)) return false;
