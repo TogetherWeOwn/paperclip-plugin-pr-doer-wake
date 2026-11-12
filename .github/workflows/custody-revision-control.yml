@@ -68,7 +68,7 @@ jobs:
           test "$(git hash-object LICENSE)" = a63594a5150d0ae00c3ddc36b61fa8f708c3ca8c
           node -e 'const p=require("./package.json"); if(p.name!=="paperclip" || p.packageManager!=="pnpm@9.15.4") process.exit(1)'
           printf 'source=%s package=%s lock=%s server=%s sdk=%s license=MIT\n' "$SOURCE" "$PACKAGE" "$LOCK" "$SERVER" "$SDK"
-          sha256sum ../control/qualification/custody-revision/sequential-control.test.ts
+          sha256sum ../control/qualification/custody-revision/sequential-control.test.ts ../control/qualification/custody-revision/manager-boundaries.test.ts ../control/qualification/custody-revision/manager-worker.mjs
       - name: Install and prepare pinned source
         working-directory: upstream
         run: |
@@ -77,6 +77,8 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           cp ../control/qualification/custody-revision/sequential-control.test.ts server/src/__tests__/custody-revision-control.test.ts
+          cp ../control/qualification/custody-revision/manager-boundaries.test.ts server/src/__tests__/custody-manager-boundaries.test.ts
+          cp ../control/qualification/custody-revision/manager-worker.mjs server/src/__tests__/custody-manager-worker.mjs
       - name: Run mandatory sequential control
         working-directory: upstream
         env:
@@ -84,6 +86,20 @@ jobs:
         run: |
           set -euo pipefail
           pnpm exec vitest run server/src/__tests__/custody-revision-control.test.ts --reporter=verbose 2>&1 | tee "$RUNNER_TEMP/custody-control.log"
+      - name: Run candidate manager boundary controls
+        if: matrix.expectation == 'candidate'
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          pnpm exec vitest run server/src/__tests__/custody-manager-boundaries.test.ts --reporter=verbose 2>&1 | tee "$RUNNER_TEMP/custody-manager.log"
+      - name: Retain manager output
+        if: always() && matrix.expectation == 'candidate'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: custody-manager-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/custody-manager.log
+          if-no-files-found: warn
+          retention-days: 7
       - name: Retain control output
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
