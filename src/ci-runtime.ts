@@ -165,6 +165,8 @@ function refusalDetail(error: unknown): { code: string; reason: string; auditDet
   return { code, reason, auditDetail };
 }
 
+const TIMELINE_RETRY_MS = 60 * 60_000;
+
 function transientTimelineError(error: unknown): boolean {
   if (!(error instanceof CiGithubError)) return false;
   if (["network", "timeout", "backoff", "auth"].includes(error.code)) return true;
@@ -561,16 +563,18 @@ export class CiWakeRuntime {
    * Checks that only run on ready PRs register after the draft flips. Only a
    * missing-check-only failure on a ready PR consults the timeline, so its
    * grace restarts at the latest ready_for_review event. Null: retry later.
-   * Only transient timeline errors retry; a repeatable one (page cap, budget,
-   * malformed body, 4xx) would retry until the wait expires, so it falls back
-   * to the un-graced verdict: at worst one early wake, never a lost one.
+   * Only transient timeline errors retry, and only for TIMELINE_RETRY_MS past
+   * the un-graced fail point; a repeatable one (page cap, budget, malformed
+   * body, 4xx) or a transient one that outlasts that window would otherwise
+   * retry until the wait expires, so it falls back to the un-graced verdict:
+   * at worst one early wake, never a lost one.
    */
   private async readyGrace(github: CiGithub, repo: string, prNumber: number, draft: boolean, snapshot: CiSnapshot, timing: CiReadinessTiming): Promise<{ verdict: CiReadiness; consulted: boolean } | null> {
     const verdict = evaluateReadiness(snapshot, timing);
     if (verdict.kind !== "fail" || verdict.failed.length || !verdict.missing.length || draft) return { verdict, consulted: false };
     let readySince: number | undefined;
     try { readySince = await github.readySince(repo, prNumber); } catch (error) {
-      if (transientTimelineError(error)) return null;
+      if (transientTimelineError(error) && verdict.missingFailAt !== null && timing.now < verdict.missingFailAt + TIMELINE_RETRY_MS) return null;
       readySince = undefined;
     }
     return { verdict: readySince === undefined ? verdict : evaluateReadiness(snapshot, { ...timing, readySince }), consulted: true };
