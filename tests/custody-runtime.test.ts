@@ -84,6 +84,8 @@ describe("custody native effects", () => {
     expect(h.ctx.issues.create).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ reason: "pr_disposition_due", idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
     expect(h.docs.get(ISSUE).body).toContain("Head: " + "a".repeat(40));
+    expect(h.docs.get(ISSUE).body).toContain("disposition in a comment on the source card");
+    expect(h.docs.get(ISSUE).body).toContain("closure rationale belongs in a source-card comment and on the PR");
     await h.restart().poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.ledger().report.complete).toBe(true);

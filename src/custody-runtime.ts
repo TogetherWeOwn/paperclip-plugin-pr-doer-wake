@@ -644,7 +644,7 @@ export class CustodyRuntime {
   }
 
   private evidence(pr: CustodyPull, trigger: Trigger): string {
-    return `# PR disposition due\n\nPR: ${prUrl(pr)}\nHead: ${pr.headSha}\nTrigger: ${trigger.kind}\nEpoch: ${trigger.epoch}\nKey: ${trigger.key}\n\nChoose finish, rework, defer or close using current evidence and existing review/release gates. Idle age is a trigger, never a verdict. Preserve valid supersession and unique work. Record a PR-specific disposition on the source card; closure rationale belongs on both the card and PR. This job never closes, reopens or merges PRs.\n`;
+    return `# PR disposition due\n\nPR: ${prUrl(pr)}\nHead: ${pr.headSha}\nTrigger: ${trigger.kind}\nEpoch: ${trigger.epoch}\nKey: ${trigger.key}\n\nChoose finish, rework, defer or close using current evidence and existing review/release gates. Idle age is a trigger, never a verdict. Preserve valid supersession and unique work. Record a PR-specific disposition in a comment on the source card; closure rationale belongs in a source-card comment and on the PR. This job never closes, reopens or merges PRs.\n`;
   }
 
   private async child(config: CustodyConfig, originId: string, title: string, body: string, card: CustodyCard | null, guard: () => void, audit: (operation: string, outcome: string, key?: string) => void, save: () => Promise<void>, receipt: Receipt, spend: () => void): Promise<string> {
