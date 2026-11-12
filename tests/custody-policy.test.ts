@@ -18,7 +18,7 @@ export function card(patch: Partial<CustodyCard> = {}): CustodyCard {
 }
 const projects = () => new Map([[PROJECT, new Set(["example/project"])]]);
 const map = (pr: CustodyPull, cards: CustodyCard[], registrations: Parameters<typeof mapCustodyCard>[2] = []) => mapCustodyCard(pr, cards, registrations, projects(), COMPANY);
-const directive = (action: string, revisit: string, at: number) => ({ body: `PR disposition: example/project#42 ${action}; next actor contributor; revisit ${revisit}`, at, ownership: true });
+const directive = (action: string, revisit: string, at: number) => ({ id: "comment:1", body: `PR disposition: example/project#42 ${action}; next actor contributor; revisit ${revisit}`, at, ownership: true });
 
 describe("custody ownership is conservative and ordered", () => {
   it("uses registration before branch/text, deduplicating repeated waits", () => {
@@ -133,6 +133,19 @@ describe("PR-specific trigger policy", () => {
     expect(latestDisposition(owner, pull())?.revisit).toBe(Date.parse(revisit));
     expect(custodyTriggers(pull(), owner, now - 8 * DAY, null, now)).toEqual([]);
   });
+  it.each(["title", "description", "document:1", undefined])("ignores disposition evidence from %s", (id) => {
+    const owner = card({ texts: [{ ...directive("defer", "2026-10-21T12:00:00Z", NOW - DAY), id }] });
+    expect(latestDisposition(owner, pull())).toBeNull();
+    expect(trigger(owner).map((t) => t.kind)).toEqual(["idle"]);
+  });
+  it("uses the latest comment disposition even when newer non-comment text contains a directive", () => {
+    const owner = card({ texts: [
+      directive("rework", "event", NOW - 8 * DAY),
+      { ...directive("defer", "2026-10-21T12:00:00Z", NOW - DAY), id: "description" },
+      { ...directive("finish", "event", NOW - 7 * DAY), id: "comment:2" },
+    ] });
+    expect(latestDisposition(owner, pull())).toMatchObject({ action: "finish", at: NOW - 7 * DAY });
+  });
   it("does not apply another PR's disposition to this PR", () => {
     expect(latestDisposition(card({ texts: [{ ...directive("defer", "2026-10-21T12:00:00Z", NOW), body: directive("defer", "2026-10-21T12:00:00Z", NOW).body.replace("#42", "#43") }] }), pull())).toBeNull();
   });
@@ -145,7 +158,7 @@ describe("PR-specific trigger policy", () => {
   });
   it("requires closure rationale on both the mapped card and PR", () => {
     const pr = pull({ state: "closed", closedAt: NOW - DAY });
-    const owner = card({ texts: [{ body: "Closed unmerged: superseded by example/project#99; source example/project#42; unique work: kept", at: NOW, ownership: true }] });
+    const owner = card({ texts: [{ id: "comment:1", body: "Closed unmerged: superseded by example/project#99; source example/project#42; unique work: kept", at: NOW, ownership: true }] });
     const closure = ["Closed unmerged: superseded by #99; unique work: kept"];
     expect(custodyTriggers(pr, owner, null, closure, NOW)).toEqual([]);
     expect(custodyTriggers(pr, owner, null, [], NOW)).toHaveLength(1);
@@ -153,8 +166,22 @@ describe("PR-specific trigger policy", () => {
     expect(custodyTriggers({ ...pr, merged: true }, card(), null, [], NOW)).toEqual([]);
     expect(custodyTriggers(pr, card(), null, null, NOW)).toEqual([]);
   });
+  it.each(["title", "description", "document:1", undefined])("ignores closure evidence from %s", (id) => {
+    const pr = pull({ state: "closed", closedAt: NOW - DAY });
+    const owner = card({ texts: [{ id, body: "Closed unmerged: burden; source example/project#42", at: NOW, ownership: true }] });
+    expect(hasCardClosure(owner, pr)).toBe(false);
+    expect(custodyTriggers(pr, owner, null, ["Closed unmerged: burden"], NOW).map((t) => t.kind)).toEqual(["closed"]);
+  });
+  it("accepts card closure from a comment even alongside non-comment evidence", () => {
+    const body = "Closed unmerged: burden; source example/project#42";
+    const owner = card({ texts: [
+      { id: "document:1", body, at: NOW, ownership: true },
+      { id: "comment:1", body, at: NOW - DAY, ownership: false },
+    ] });
+    expect(hasCardClosure(owner, pull())).toBe(true);
+  });
   it("attributes card closure to the source, not its successor", () => {
-    const owner = card({ texts: [{ body: "Closed unmerged: superseded by example/project#42; source example/project#43", at: NOW, ownership: true }] });
+    const owner = card({ texts: [{ id: "comment:1", body: "Closed unmerged: superseded by example/project#42; source example/project#43", at: NOW, ownership: true }] });
     expect(hasCardClosure(owner, pull({ number: 43 }))).toBe(true);
     expect(hasCardClosure(owner, pull())).toBe(false);
   });
@@ -164,7 +191,7 @@ describe("PR-specific trigger policy", () => {
     "<https://github.com/example/project/pull/42>",
     "[PR](https://github.com/example/project/pull/42)",
   ])("accepts an explicit, unique source %s", (source) => {
-    expect(hasCardClosure(card({ texts: [{ body: `Closed unmerged: superseded by example/project#43; source ${source}; unique work: kept`, at: NOW, ownership: true }] }), pull())).toBe(true);
+    expect(hasCardClosure(card({ texts: [{ id: "comment:1", body: `Closed unmerged: superseded by example/project#43; source ${source}; unique work: kept`, at: NOW, ownership: true }] }), pull())).toBe(true);
   });
   it.each([
     "Closed unmerged: superseded by example/project#42",
@@ -181,10 +208,10 @@ describe("PR-specific trigger policy", () => {
     "Closed unmerged: burden; source https://github.com/example/project/pull/420",
     "> Closed unmerged: burden; source example/project#42",
   ])("rejects missing, ambiguous or invalid card sources: %s", (body) => {
-    expect(hasCardClosure(card({ texts: [{ body, at: NOW, ownership: true }] }), pull())).toBe(false);
+    expect(hasCardClosure(card({ texts: [{ id: "comment:1", body, at: NOW, ownership: true }] }), pull())).toBe(false);
   });
   it("does not borrow card rationale from a different PR or quotes", () => {
-    expect(hasCardClosure(card({ texts: [{ body: "Closed unmerged: superseded by example/project#43", at: NOW, ownership: true }] }), pull())).toBe(false);
+    expect(hasCardClosure(card({ texts: [{ id: "comment:1", body: "Closed unmerged: superseded by example/project#43", at: NOW, ownership: true }] }), pull())).toBe(false);
     expect(hasPrClosure(["> Closed unmerged: superseded by #99"])).toBe(false);
   });
 });

@@ -5,7 +5,7 @@ import { CustodyGithub } from "../src/custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
 import { CUSTODY_ORIGIN, DAY } from "../src/custody-policy.js";
-vi.mock("../src/custody-reader.js", () => ({ loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
+vi.mock("../src/custody-reader.js", () => ({ custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const ISSUE = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -291,6 +291,7 @@ describe("coverage, summary and cursor controls", () => {
     const h = fixture();
     await h.runtime.poll();
     expect(loadCustodyTexts).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(loadCustodyTexts).mock.calls[0]![4]).toBe(vi.mocked(loadCustodyCards).mock.calls[0]![3]);
     const selected = vi.mocked(loadCustodyTexts).mock.calls[0]![3];
     expect(selected.map((c) => c.id)).toEqual([ISSUE]);
     expect(h.ledger().report.complete).toBe(true);
@@ -827,7 +828,7 @@ describe("coverage, summary and cursor controls", () => {
   });
   it.each([false, true])("compacts settled history without losing clocks or replaying effects (uncertain wake: %s)", async (uncertain) => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
-    const owner = card({ texts: [{ id: "description", body, at: NOW - 10 * DAY, ownership: true }] });
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
     const prs = [pull()];
     const h = fixture({ cards: [owner], open: prs });
     if (uncertain) h.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("reply lost"));

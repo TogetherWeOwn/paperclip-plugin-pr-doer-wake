@@ -49,12 +49,7 @@ export interface CustodyCard {
 //      bounded by the PR count, not the company card count, so the 64 MiB
 //      ceiling is no longer reachable at company scale.
 //
-// Peak memory is two independent 64 MiB phase budgets, so up to ~128 MiB if
-// both phases saturate in one tick (the previous single-total design capped
-// the peak at 64 MiB; per-row, per-body and row-count caps are unchanged).
-// Each phase still fails closed at its own ceiling, and the phase-2 set is
-// bounded by PR count, so the combined peak is not reachable from company
-// history size alone.
+// Both phases share one 64 MiB acquisition budget per snapshot.
 //
 // Comment/document URL text is no longer an ownership tier: proving a
 // comment-URL claim unique or absent requires the full-company history
@@ -158,7 +153,7 @@ export function parseWorkProductBindings(raw: unknown): WorkProductBinding[] | n
   return out;
 }
 
-function byteBudget() {
+export function custodyByteBudget() {
   let totalBytes = 0;
   return (body: string): void => {
     const bytes = Buffer.byteLength(body, "utf8");
@@ -176,10 +171,9 @@ function byteBudget() {
  * by loadCustodyTexts, never by a full-company scan.
  */
 export async function loadCustodyCards(
-  ctx: PluginContext, companyId: string, guard: () => void,
+  ctx: PluginContext, companyId: string, guard: () => void, budget: ReturnType<typeof custodyByteBudget>,
 ): Promise<CustodyCard[]> {
   id(companyId);
-  const budget = byteBudget();
   async function rows(table: Table, columns: string, cap: number, visit: (row: Row) => void, issueIds?: string[]): Promise<void> {
     let count = 0;
     let cursor: string | null = null;
@@ -251,7 +245,7 @@ export async function loadCustodyCards(
  * PRs as UNKNOWN, never as evidence-free.
  */
 export async function loadCustodyTexts(
-  ctx: PluginContext, companyId: string, guard: () => void, cards: CustodyCard[],
+  ctx: PluginContext, companyId: string, guard: () => void, cards: CustodyCard[], budget: ReturnType<typeof custodyByteBudget>,
 ): Promise<CustodyCard[]> {
   id(companyId);
   if (!cards.length) return cards;
@@ -261,7 +255,6 @@ export async function loadCustodyTexts(
     if (byId.has(card.id)) continue;
     byId.set(card.id, card);
   }
-  const budget = byteBudget();
   const issueIds = [...byId.keys()];
   async function rows(table: Table, columns: string, cap: number, visit: (row: Row) => void): Promise<void> {
     let count = 0;

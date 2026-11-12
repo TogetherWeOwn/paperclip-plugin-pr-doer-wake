@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { CUSTODY_READ_LIMITS, loadCustodyCards, loadCustodyTexts, parseWorkProductBindings } from "../src/custody-reader.js";
+import { CUSTODY_READ_LIMITS, custodyByteBudget, loadCustodyCards, loadCustodyTexts, parseWorkProductBindings } from "../src/custody-reader.js";
 
 // Full evidence for a candidate set: metadata for the company, then
 // comments for the selected cards only (TWO-5928 scale fix; documents are
 // never read, per the TWO-6426 comments-only directive decision).
 async function loadAll(ctx: PluginContext, guard: () => void) {
-  const cards = await loadCustodyCards(ctx, COMPANY, guard); // helper keeps metadata phase
-  return loadCustodyTexts(ctx, COMPANY, guard, cards);
+  const budget = custodyByteBudget();
+  const cards = await loadCustodyCards(ctx, COMPANY, guard, budget);
+  return loadCustodyTexts(ctx, COMPANY, guard, cards, budget);
 }
 
 type Row = Record<string, unknown>;
@@ -289,6 +290,33 @@ describe("loadCustodyCards", () => {
     expect(h.query).toHaveBeenCalledTimes(1 + Math.ceil(count / 200));
   });
 
+  it.each([0, 1])("shares the acquisition budget across metadata and comments at limit + %i bytes", async (extra) => {
+    const body = "a".repeat(128_000);
+    const cardCount = 256;
+    const commentCount = 268;
+    const remaining = CUSTODY_READ_LIMITS.totalBytes - (cardCount + commentCount) * body.length;
+    // Include a multibyte character so the boundary is measured in UTF-8 bytes.
+    const lastBody = "é" + "a".repeat(remaining - 2 + extra);
+    const h = host({
+      cards: Array.from({ length: cardCount }, (_, i) => card(i + 1, { title: body, description: null })),
+      comments: [
+        ...Array.from({ length: commentCount }, (_, i) => comment(i + 1, { body })),
+        comment(commentCount + 1, { body: lastBody }),
+      ],
+    });
+    const budget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    expect(cards).toHaveLength(cardCount);
+    const result = loadCustodyTexts(h.ctx, COMPANY, h.guard, cards, budget);
+    if (extra === 0) {
+      const loaded = await result;
+      expect(loaded[0]!.texts).toHaveLength(commentCount + 2);
+      expect(loaded[0]!.texts.at(-1)?.body).toBe(lastBody);
+    } else {
+      await expect(result).rejects.toThrow("UNKNOWN custody snapshot: total byte budget exceeded");
+    }
+  });
+
   it.each([1, 2])("runs guard immediately before host RPC %s and stops if it throws", async (stopAt) => {
     const h = host({ comments: [comment()] });
     let count = 0;
@@ -313,14 +341,14 @@ describe("loadCustodyCards", () => {
 
   it("rejects an invalid company before any RPC", async () => {
     const h = host();
-    await expect(loadCustodyCards(h.ctx, "invalid", h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
+    await expect(loadCustodyCards(h.ctx, "invalid", h.guard, custodyByteBudget())).rejects.toThrow("UNKNOWN custody snapshot");
     expect(h.guard).not.toHaveBeenCalled();
     expect(h.query).not.toHaveBeenCalled();
   });
 
   it("reads card metadata only, never company-wide comments or documents (TWO-5928)", async () => {
     const h = host({ comments: [comment()], documents: [document()] });
-    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard);
+    const result = await loadCustodyCards(h.ctx, COMPANY, h.guard, custodyByteBudget());
     expect(result[0]!.texts.map((t) => t.id)).toEqual(["title", "description"]);
     expect(h.query).toHaveBeenCalledTimes(1);
     expect(h.query.mock.calls[0]![0]).toContain("FROM public.issues");
@@ -329,9 +357,10 @@ describe("loadCustodyCards", () => {
 
   it("loads texts only for the selected candidate cards, with no RPCs for an empty set", async () => {
     const h = host({ cards: [card(1), card(2)], comments: [comment(1), comment(2, { issue_id: uuid(2) })] });
-    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard);
-    expect(await loadCustodyTexts(h.ctx, COMPANY, h.guard, [])).toEqual([]);
-    const selected = await loadCustodyTexts(h.ctx, COMPANY, h.guard, [cards[0]!]);
+    const budget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    expect(await loadCustodyTexts(h.ctx, COMPANY, h.guard, [], budget)).toEqual([]);
+    const selected = await loadCustodyTexts(h.ctx, COMPANY, h.guard, [cards[0]!], budget);
     expect(selected[0]!.texts.map((t) => t.id)).toContain(`comment:${uuid(1)}`);
     expect(selected[0]!.texts.map((t) => t.id)).not.toContain(`comment:${uuid(2)}`);
     const textQueries = h.query.mock.calls.filter(([, params]) => Array.isArray(params) && params.length === 4);
