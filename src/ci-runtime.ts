@@ -783,10 +783,14 @@ export class CiWakeRuntime {
             if (issue.workProducts !== undefined) {
               if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
             } else {
+              // The card's most recent registration on any PR in this repo is its
+              // current link (ties go to ledger order); an older PR it has moved
+              // on from is not woken.
               const latest = ledger.waits
-                .filter((w) => w.companyId === entry.companyId && w.issueId === issueId && w.repo === entry.repo && w.prNumber === entry.prNumber && w.reason !== "binding_changed")
-                .sort((a, b) => b.registeredAt - a.registeredAt)[0];
-              if (!latest) continue;
+                .map((w, index) => ({ w, index }))
+                .filter(({ w }) => w.companyId === entry.companyId && w.issueId === issueId && w.repo === entry.repo && w.reason !== "binding_changed")
+                .sort((a, b) => (b.w.registeredAt - a.w.registeredAt) || (b.index - a.index))[0]?.w;
+              if (!latest || latest.prNumber !== entry.prNumber) continue;
               try { await this.checkBinding(latest); }
               catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
             }

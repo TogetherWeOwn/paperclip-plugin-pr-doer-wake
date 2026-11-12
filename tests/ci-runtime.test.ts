@@ -758,6 +758,25 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup).not.toHaveBeenCalled();
     });
 
+    it("does not wake a card for an older PR after it registered a newer PR in the same workspace", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      delete (h.issue as { workProducts?: unknown }).workProducts;
+      await movedHead(h);
+      await h.runtime.poll();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      // The same card later registers PR 18 in the same workspace (it now works on #18).
+      const seeded = h.ledger();
+      const old = seeded.waits[0]!;
+      seeded.waits.push({ ...old, waitId: "00000000-0000-4000-8000-000000000018", prNumber: 18, headSha: NEXT_HEAD,
+        status: "open", reason: undefined, finishedAt: undefined, registeredAt: old.registeredAt + 1, aliases: [] });
+      h.seed(seeded);
+      github.pull.mockImplementation(async (_repo: string, n: number) => pull(n === 18 ? { number: 18, headSha: NEXT_HEAD } : { headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.filter((c) => String((c[2] as { reason?: string }).reason).includes("#17"))).toHaveLength(0);
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
