@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import { startWorkerRpcHost } from "@paperclipai/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import manifest from "../src/manifest.js";
+import { CUSTODY_READ_LIMITS } from "../src/custody-reader.js";
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const OTHER = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -29,7 +30,9 @@ type HostCall = { method: string; params: Record<string, unknown> };
  * resolveRequiredCompanyId refuses it during scheduled (proactive, company-less)
  * job invocations. No SDK mock, no host/core, and no network are involved.
  */
-async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig) {
+type InventoryFixture = { issues: Record<string, unknown>[]; comments: Record<string, unknown>[] };
+
+async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig, inventory?: InventoryFixture) {
   // One worker process per plugin: reset the module so each test gets a
   // fresh worker with no captured company carried over from the last test.
   vi.resetModules();
@@ -79,15 +82,45 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
             state.set(keyOf(params), params.value);
             reply(id, null);
             return;
-          case "db.query":
+          case "db.query": {
+            if (!inventory) { reply(id, []); return; }
+            const sql = String(params.sql);
+            const args = params.params as [string, string | null, number, string?];
+            const rows = sql.includes("public.issue_comments") ? inventory.comments
+              : sql.includes("public.issues") ? inventory.issues : null;
+            if (!rows) { replyError(id, "unexpected custody table"); return; }
+            const candidates = args[3]?.slice(1, -1).split(",");
+            reply(id, rows.filter((row) => row.company_id === args[0]
+              && (args[1] === null || String(row.id) > args[1])
+              && (!candidates || candidates.includes(String(row.issue_id)))).slice(0, args[2]));
+            return;
+          }
+          case "projects.get":
+            reply(id, { id: PROJECT, companyId: COMPANY });
+            return;
+          case "projects.listWorkspaces":
             reply(id, []);
+            return;
+          case "issues.get":
+            reply(id, { id: params.issueId, companyId: COMPANY, workProducts: [] });
             return;
           case "secrets.resolve":
             reply(id, TOKEN);
             return;
-          case "http.fetch":
-            reply(id, { status: 200, headers: {}, body: "[]" });
+          case "http.fetch": {
+            const url = new URL(String(params.url));
+            let body: unknown[] = [];
+            if (inventory && url.pathname === "/orgs/example/repos") body = [{ id: 1, full_name: "example/project", archived: false }];
+            if (inventory && url.pathname === "/repos/example/project/pulls" && url.searchParams.get("state") === "closed") body = [{
+              number: 42, user: { login: "contributor", type: "User" },
+              head: { ref: "feature", sha: "a".repeat(40), repo: { full_name: "example/project" } },
+              base: { repo: { full_name: "example/project" } }, title: "Example", body: null, state: "closed",
+              created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-10T00:00:00Z",
+              closed_at: "2026-10-10T00:00:00Z", merged_at: "2026-10-10T00:00:00Z", merged: true,
+            }];
+            reply(id, { status: 200, headers: {}, body: JSON.stringify(body) });
             return;
+          }
           default:
             replyError(id, `synthetic host fixture refused ${method}`);
         }
@@ -103,10 +136,10 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
       pending.set(id, { resolve, reject });
       stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
-  const ledger = (): { report: { complete: boolean; rows: unknown[] } } | undefined => {
+  const ledger = (): { dispositions: Record<string, number>; report: { complete: boolean; rows: unknown[]; unknown: string[]; effects: number; failure?: string } } | undefined => {
     for (const [key, value] of state.entries()) {
       if (key.startsWith("company:") && key.includes("pr-custody-v1")) {
-        return value as { report: { complete: boolean; rows: unknown[] } };
+        return value as ReturnType<typeof ledger>;
       }
     }
     return undefined;
@@ -117,7 +150,72 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
 const initialize = { manifest, config: {}, apiVersion: 1, instanceInfo: { instanceId: "11111111-1111-4111-8111-111111111111", hostVersion: "0.0.0-fixture" } };
 const runJob = { job: { jobKey: "pr-custody", runId: "dddddddd-0000-4000-8000-000000000001", trigger: "schedule", scheduledAt: SCHEDULED_AT } };
 
+const fixtureId = (n: number) => `eeeeeeee-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
+const PR_URL = "https://github.com/example/project/pull/42";
+const DIRECTIVE = "PR disposition: example/project#42 defer; next actor contributor; revisit 2099-01-01";
+const issue = (n: number, title: string, description: string | null, projectId: string | null = null) => ({
+  id: fixtureId(n), company_id: COMPANY, project_id: projectId, identifier: null, title, description,
+  status: "in_progress", status_version: 1, assignee_agent_id: null, assignee_user_id: null,
+  origin_kind: "manual", conversation_agent_id: null, conversation_user_id: null, conversation_state: null,
+  updated_at: "2026-10-10T00:00:00Z", completed_at: null, cancelled_at: null,
+});
+const comment = (n: number, body: string) => ({
+  id: fixtureId(n), company_id: COMPANY, issue_id: fixtureId(1), body,
+  author_agent_id: null, author_user_id: "human", author_type: "user", deleted_at: null,
+  updated_at: "2026-10-11T00:00:00Z",
+});
+
 describe("scheduled pr-custody job over the real SDK/host contract", () => {
+  it.each([false, true])("records disposition clocks from comments only (comment present: %s)", async (withComment) => {
+    const h = await custodyHost(custodyConfig, {
+      issues: [issue(1, PR_URL, DIRECTIVE)], comments: withComment ? [comment(1, DIRECTIVE)] : [],
+    });
+    try {
+      await h.send("initialize-inventory", "initialize", initialize);
+      await h.send("config-inventory", "configChanged", { config: custodyConfig, companyId: COMPANY });
+      await h.send("job-inventory", "runJob", runJob);
+
+      expect(h.ledger()?.report).toMatchObject({ complete: true, unknown: [], effects: 0, rows: [
+        { pr: "example/project#42", state: "closed", cardId: fixtureId(1), mapping: "url", triggers: [] },
+      ] });
+      expect(Object.values(h.ledger()!.dispositions)).toEqual(withComment ? [Date.parse("2026-10-11T00:00:00Z")] : []);
+      const queries = h.calls.filter((c) => c.method === "db.query");
+      expect(queries.some((c) => String(c.params.sql).includes("public.issue_comments"))).toBe(true);
+      expect(queries.some((c) => String(c.params.sql).includes("issue_documents"))).toBe(false);
+    } finally { h.stop(); }
+  });
+
+  it.each([0, 1])("shares the metadata and mapped comment budget at the ceiling + %i byte", async (extra) => {
+    // Individually valid bodies, with metadata and comments each below the
+    // ceiling but their combined size exactly at it (or one byte over).
+    const issues = Array.from({ length: 400 }, (_, i) => issue(i + 1, i === 0 ? PR_URL : "x", "m".repeat(128_000), i === 0 ? null : PROJECT));
+    const metadataBytes = 400 * 128_000 + Buffer.byteLength(PR_URL) + 399;
+    let remaining = CUSTODY_READ_LIMITS.totalBytes - metadataBytes + extra;
+    const comments: Record<string, unknown>[] = [];
+    while (remaining > 0) {
+      const bytes = Math.min(128_000, remaining);
+      comments.push(comment(comments.length + 1, "c".repeat(bytes)));
+      remaining -= bytes;
+    }
+    const h = await custodyHost(custodyConfig, { issues, comments });
+    try {
+      await h.send("initialize-budget", "initialize", initialize);
+      await h.send("config-budget", "configChanged", { config: custodyConfig, companyId: COMPANY });
+      const job = h.send("job-budget", "runJob", runJob);
+      if (extra) await expect(job).rejects.toThrow("total byte budget exceeded");
+      else await job;
+      if (extra) {
+        expect(h.ledger()?.report).toMatchObject({ complete: false, unknown: ["inventory"], effects: 0, failure: "UNKNOWN custody snapshot: total byte budget exceeded", rows: [] });
+      } else {
+        expect(h.ledger()?.report).toMatchObject({ complete: true, unknown: [], effects: 0, rows: [
+          { pr: "example/project#42", cardId: fixtureId(1), mapping: "url", triggers: [] },
+        ] });
+      }
+      const commentsQuery = h.calls.find((c) => c.method === "db.query" && String(c.params.sql).includes("public.issue_comments"));
+      expect((commentsQuery?.params.params as unknown[])[3]).toBe(`{${fixtureId(1)}}`);
+      expect(h.calls.some((c) => c.method === "db.query" && String(c.params.sql).includes("issue_documents"))).toBe(false);
+    } finally { h.stop(); }
+  }, 60_000);
   it("completes one inventory tick with every config read explicitly company-scoped", async () => {
     const h = await custodyHost();
     try {
