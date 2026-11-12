@@ -228,7 +228,9 @@ describe("evaluateReadiness", () => {
       required: [{ context: "build", appId: 7 }], runs: [run(99, { appId: 8 })],
       statuses: [{ id: 100, context: "build", state: "success" }],
     });
-    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "fail", failed: ["build [app 7]"], missing: [] });
+    // Another source alone is not a report from app 7: the check is still missing.
+    expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"], failed: [] });
+    expect(evaluateReadiness(input, { ...timing, draft: true })).toMatchObject({ kind: "pending", missing: ["build [app 7]"], failed: [] });
     input.statuses = [];
     expect(evaluateReadiness(input, { ...timing, now: 2_000 })).toMatchObject({ kind: "pending", missing: ["build [app 7]"] });
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "fail", missing: ["build [app 7]"], failed: [] });
@@ -456,7 +458,7 @@ describe("CiGithub REST reads", () => {
     const actual = await github.snapshot(REPO, SHA, "main", cycle);
     expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", missing: [] });
     expect(evaluateReadiness({ ...actual, statuses: actual.statuses.filter((status) => status.verifiedAppId !== 811515) }, timing))
-      .toMatchObject({ kind: "fail", failed: ["Devin Review [app 811515]"], missing: [] });
+      .toMatchObject({ kind: "fail", missing: ["Devin Review [app 811515]"], failed: [] });
     await github.snapshot(REPO, SHA, "main", cycle);
     expect(calls.filter(({ url }) => url.pathname.startsWith("/apps/"))).toHaveLength(2);
     await github.snapshot(REPO, SHA, "main");
@@ -482,7 +484,7 @@ describe("CiGithub REST reads", () => {
       .toMatchObject({ kind: "pending", pending: ["review [app 7]"], missing: [] });
     const wrong = actual.statuses.filter((item) => item.creatorLogin === "wrong[bot]");
     expect(evaluateReadiness({ ...actual, statuses: wrong }, timing))
-      .toMatchObject({ kind: "fail", failed: ["review [app 7]"], missing: [] });
+      .toMatchObject({ kind: "fail", missing: ["review [app 7]"], failed: [] });
   });
 
   it.each([401, 429, 500])("does not turn app lookup HTTP %i into a missing check", async (status) => {

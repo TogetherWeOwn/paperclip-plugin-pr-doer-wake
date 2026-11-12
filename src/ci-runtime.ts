@@ -664,7 +664,11 @@ export class CiWakeRuntime {
         await this.checkBinding(wait);
         const revalidated = await this.config(wait.companyId);
         if (!revalidated.allowedRepos.includes(wait.repo) || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
-        if (current.draft !== pr.draft) continue;
+        if (current.draft !== pr.draft) {
+          // The draft flipped during this poll: keep the observation so a later ready poll restarts grace.
+          if (current.number === wait.prNumber && trackDraft(wait, current.draft, this.now())) await this.save(ledger);
+          continue;
+        }
         if (current.number !== wait.prNumber || current.headSha !== wait.headSha || current.state !== "open" || current.merged || current.baseBranch !== pr.baseBranch || current.headRepo?.toLowerCase() !== wait.repo) {
           if (current.number === wait.prNumber && current.state === "open" && !current.merged && current.headSha !== wait.headSha && current.headRepo?.toLowerCase() === wait.repo) {
             this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, current.headSha);
@@ -768,7 +772,10 @@ export class CiWakeRuntime {
             entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
             await this.save(ledger); continue;
           }
-          if (checked.draft !== current.draft) continue;
+          if (checked.draft !== current.draft) {
+            if (trackDraft(entry, checked.draft, this.now())) await this.save(ledger);
+            continue;
+          }
           if (checked.baseBranch !== current.baseBranch) {
             // Base-only edit: the head the reviewer last saw is unchanged, so
             // keep oldSha/newSha (never collapse them into a meaningless
