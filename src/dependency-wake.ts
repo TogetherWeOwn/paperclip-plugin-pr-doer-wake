@@ -211,13 +211,16 @@ export class DependencyWakeRuntime {
     // runs with startedAt <= B <= finishedAt): runs that started after B can never have produced
     // this completion, so they must not advance the watermark (the separate live-run check above
     // still defers a currently-live one). Malformed or inconsistent run timestamps, or no
-    // qualifying interval at all, mean the bound cannot be established: audit and wait rather
-    // than guess. A live run or a truncated window is also a wait: a full window may have
-    // dropped the spanning run.
+    // qualifying interval at all, mean the bound cannot be established for that blocker: it is
+    // audited, left unreceipted and retried next tick, but it does not suppress another blocker's
+    // established settlement — an unknown older completion never invalidates separate evidence
+    // for a newer one. A live blocker run still defers the whole dependent (workspace-finalize
+    // policy), and a truncated window is treated as an unknown bound for that blocker alone.
     const settledAt = new Map<string, number>();
     for (const b of fresh) {
       const blocker = await this.liveRun(tick, b.id);
-      if (blocker.live || blocker.truncated) { if (blocker.truncated) tick.audit("blocker_window_truncated", issue.id); return; }
+      if (blocker.live) return;
+      if (blocker.truncated) { tick.audit("blocker_window_truncated", issue.id); continue; }
       const done = doneAt.get(b.id)!;
       let malformed = false;
       let span = -Infinity;
@@ -229,11 +232,11 @@ export class DependencyWakeRuntime {
         if (!Number.isFinite(finished) || finished < started) { malformed = true; break; }
         if (started <= done && finished >= done) span = Math.max(span, finished);
       }
-      if (malformed || !Number.isFinite(span)) { tick.audit("blocker_settlement_unknown", issue.id); return; }
+      if (malformed || !Number.isFinite(span)) { tick.audit("blocker_settlement_unknown", issue.id); continue; }
       settledAt.set(b.id, Math.max(done, span));
     }
     // Only blockers that settled after the dependent's last run started; an earlier one was seen by that run.
-    const triggers = fresh.filter((b) => settledAt.get(b.id)! > lastRun);
+    const triggers = fresh.filter((b) => settledAt.has(b.id) && settledAt.get(b.id)! > lastRun);
     if (!triggers.length) return;
     // A full window may have dropped an assignee run that started after a trigger: unknown, so no wake.
     if (dependent.truncated) { tick.audit("run_window_truncated", issue.id); return; }

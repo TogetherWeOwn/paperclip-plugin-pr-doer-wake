@@ -311,6 +311,61 @@ describe("dependency wake", () => {
     expect(h.ledger()?.receipts).toEqual({});
   });
 
+  it("does not let an older blocker whose settlement is unbounded suppress a newer settled one", async () => {
+    // A completed T-30m but no run spans its epoch (bound unknown); B completed T-15m with a
+    // valid spanning run. The dependent's assignee last ran at T-20m, so only B qualifies —
+    // the wake fires for B alone and A stays unreceipted, retried on later ticks.
+    const h = harness();
+    h.runs[BLK] = [{ id: "b1", issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 45 * MIN), startedAt: iso(START - 45 * MIN), finishedAt: iso(START - 35 * MIN) }];
+    h.issues[BLK2] = { id: BLK2, companyId: COMPANY, status: "done", completedAt: iso(START - 15 * MIN) };
+    h.runs[BLK2] = [{ id: "b2", issueId: BLK2, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN), startedAt: iso(START - 20 * MIN), finishedAt: iso(START - 15 * MIN) }];
+    h.relations[DEP]!.push({ id: BLK2, identifier: "TWO-2", status: "done" });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    const [, , options] = h.ctx.issues.requestWakeup.mock.calls[0] as unknown as [string, string, { reason: string }];
+    expect(options.reason).toContain("TWO-2 done");
+    expect(options.reason).not.toContain("TWO-1 done");
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("blocker_settlement_unknown");
+    expect(h.ledger()?.receipts[rk(DEP, BLK, DONE)]).toBeUndefined();
+    expect(h.ledger()?.receipts[rk(DEP, BLK2, START - 15 * MIN)]?.outcome).toBe("woken");
+    // A's epoch was never consumed: once its interval is bounded it still qualifies, so a
+    // later tick wakes once for it as a distinct (dependent, blocker, epoch) event.
+    h.runs[BLK]![0]!.finishedAt = iso(START - 30 * MIN);
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    const [, , options2] = h.ctx.issues.requestWakeup.mock.calls[1] as unknown as [string, string, { reason: string }];
+    expect(options2.reason).toContain("TWO-1 done");
+    // A dependent run started after A settled sees the completion and no further wake fires.
+    h.runs[DEP]!.push({ id: "r2", issueId: DEP, agentId: AGENT, status: "succeeded", createdAt: iso(START - 10 * MIN), startedAt: iso(START - 10 * MIN), finishedAt: iso(START - 8 * MIN) });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("still defers the whole dependent on a live run of an unrelated blocker", async () => {
+    // Settlement unknown is per-blocker, but a live blocker run is the workspace-finalize
+    // signal: it defers the dependent even when another blocker is settled.
+    const h = harness();
+    h.runs[BLK] = [{ id: "b1", issueId: BLK, agentId: REVIEWER, status: "running", createdAt: iso(START - 5 * MIN), startedAt: iso(START - 5 * MIN), finishedAt: null }];
+    h.issues[BLK2] = { id: BLK2, companyId: COMPANY, status: "done", completedAt: iso(START - 15 * MIN) };
+    h.runs[BLK2] = [{ id: "b2", issueId: BLK2, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN), startedAt: iso(START - 20 * MIN), finishedAt: iso(START - 15 * MIN) }];
+    h.relations[DEP]!.push({ id: BLK2, identifier: "TWO-2", status: "done" });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger()?.receipts).toEqual({});
+  });
+
+  it("treats a truncated blocker window as unbounded for that blocker only", async () => {
+    const h = harness();
+    h.runs[BLK] = Array.from({ length: 100 }, (_, i) => ({ id: `b${i}`, issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 40 * MIN + i * 1_000), startedAt: iso(START - 40 * MIN + i * 1_000), finishedAt: iso(START - 40 * MIN + i * 1_000 + 500) }));
+    h.issues[BLK2] = { id: BLK2, companyId: COMPANY, status: "done", completedAt: iso(START - 15 * MIN) };
+    h.runs[BLK2] = [{ id: "b2", issueId: BLK2, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 20 * MIN), startedAt: iso(START - 20 * MIN), finishedAt: iso(START - 15 * MIN) }];
+    h.relations[DEP]!.push({ id: BLK2, identifier: "TWO-2", status: "done" });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger()?.audits.map((a) => a.outcome)).toContain("blocker_window_truncated");
+    expect(h.ledger()?.receipts[rk(DEP, BLK2, START - 15 * MIN)]?.outcome).toBe("woken");
+  });
+
   it("uses the latest finish among multiple runs spanning the completion epoch", async () => {
     // Two runs overlap done-at T-30m and finish at T-28m and T-24m: settlement is T-24m, so a
     // dependent run started at T-26m (before the envelope closed) saw only a partial window and
