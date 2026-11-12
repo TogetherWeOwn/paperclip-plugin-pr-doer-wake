@@ -232,9 +232,11 @@ This delta (allowlist + caps + four webhook events) requires fresh Security delt
 
 Operator sets `dryRun: true` or `enabled: false`, disables the tool profile, and removes secret bindings if needed. The owner disables/deletes the optional webhook. Keep card backstops and reconcile `unconfirmed` waits against actual host run records; never blindly replay them. A rollback must not reinstall the unsafe ownership heuristic without a separate decision. Do not delete the state ledger to retry a wake. Review threats and residual host limits in [THREAT-MODEL.md](THREAT-MODEL.md).
 
-## Hourly PR custody (separate opt-in)
+## PR custody (unavailable)
 
-`pr-custody` runs at `17 * * * *` without an LLM. It inventories every **credential-visible** non-archived repository in one configured organization, using fully paginated REST repository/pulls listings, never search. All open PRs are read. Closed PRs are read by descending update time back to an inclusive stored cursor, including PRs opened and closed between ticks. On first use the Operator must explicitly choose `custodyClosedSince`; no coverage before that boundary is claimed. Partial, denied, malformed or over-cap evidence is **UNKNOWN**, never a zero count or absence of ownership.
+**Custody is unavailable pending a safe cutover.** The job has no declared schedule, its manual handler rejects with `custody_unavailable`, and custody event handlers are disconnected. Setting `custodyEnabled` or `custodyDryRun` cannot enable it. This source change is not installed containment. The following describes the prior design and potential future qualification, not an available rollout procedure.
+
+The prior `pr-custody` design ran at `17 * * * *` without an LLM. It inventories every **credential-visible** non-archived repository in one configured organization, using fully paginated REST repository/pulls listings, never search. All open PRs are read. Closed PRs are read by descending update time back to an inclusive stored cursor, including PRs opened and closed between ticks. On first use the Operator must explicitly choose `custodyClosedSince`; no coverage before that boundary is claimed. Partial, denied, malformed or over-cap evidence is **UNKNOWN**, never a zero count or absence of ownership.
 
 ### Configuration
 
@@ -242,8 +244,8 @@ Custody is independent of `enabled`, `dryRun` and the CI registration `allowedRe
 
 | Config | Default | Meaning |
 | --- | --- | --- |
-| `custodyEnabled` | `false` | Opt in to the hourly job. |
-| `custodyDryRun` | `true` | State/report/log only; no card, document or wake effects. |
+| `custodyEnabled` | `false` | Retained configuration; does not enable the unavailable job. |
+| `custodyDryRun` | `true` | Retained configuration; does not enable a dry run. |
 | `custodyCompanyId` | unset | Exactly one company's card evidence and native effects. |
 | `custodyOrg` | unset | Exact GitHub organization; all its visible non-archived repos. |
 | `custodySummaryAgentId` | unset | Accountable recipient of the daily unmapped/bot summary and unassigned-source follow-ups. |
@@ -277,7 +279,9 @@ Durable creation/wake intent precedes each effect. Restart/ambiguous wake replie
 
 State namespace `pr-custody-v1`, company scope, key `<org>:dry` or `<org>:live` stores cursor/receipt/head observations, a latest inventory report, and 1,000 safe audit records retained at most 30 days. Reports project only PR identifiers, card IDs, mapping source, trigger keys and UNKNOWN scopes, never raw API/card bodies or credentials. The hot receipt and disposition-clock maps each cap at 20,000. Near capacity, each tick moves at most 128 settled (`woken`/`cleared`) receipts and 128 clocks into separate exact-key archive entries in the same namespace/scope/mode: `<org>:<mode>:receipt:<sha256(trigger)>` or `<org>:<mode>:disposition:<sha256(fingerprint)>`. Archive writes must succeed before hot eviction; hot misses must read/validate the archive before a new effect or clock is allowed. Read/write failure is UNKNOWN, never absence. Archives do not expire: lifetime history uses durable storage rather than exhausting the hot maps or erasing dedupe. Storage therefore grows with distinct settled triggers/directives, with bounded writes per tick; target-host capacity/durability must be accepted. Pending/attempting/unconfirmed receipts stay hot and are never automatically removed; if unresolved work alone fills the cap, new effects fail closed pending manual reconciliation. Preserve both hot ledger and archives on backup/restore/rollback; never delete either to retry a wake. Head observations cap at 10,000; complete repository/open snapshots retire observations no longer monitored/open, preserving clocks of still-open PRs. Reopened/re-visible PRs are re-observed as first observations and seeded from head-bound evidence, so an already-idle reopened PR can trigger on discovery. Per tick: 1,200 attempted HTTP requests, 20,000 host-read admissions and four minutes. Card snapshot caps are 20,000 cards, 100,000 comments, 10,000 documents and 64 MiB text; per-body limits and HTTP page/byte/cache/time limits also apply. These are refusal budgets, never silent truncation. No cloud resources or spend reservations exist, so TTL/auto-teardown of provider resources is not applicable.
 
-### Custody rollout gate
+### Future custody rollout gate
+
+Do not execute this rollout against the unavailable job. A replacement must first be implemented and reviewed; these are necessary qualification steps, not an authorization to enable custody now.
 
 1. Native Security sign-off on exact source/artifact, expanded capabilities, core-read/privacy boundary, GitHub grant, single-worker state and host transport; then QA using exact-head Actions evidence.
 2. Operator installs the reviewed package with custody disabled, binds the existing approved credential, chooses the one company/org/summary recipient and initial closure boundary, then enables **dry run first**. Creating/rotating/widening a credential is a separate authority decision.

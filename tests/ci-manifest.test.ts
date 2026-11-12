@@ -19,7 +19,8 @@ describe("stock manifest and config contract", () => {
       "events.subscribe", "issue.interactions.read", "issues.orchestration.read",
     ]));
     expect(manifest.database?.coreReadTables).toEqual(["issues", "issue_comments", "issue_documents"]);
-    expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")?.schedule).toBe("17 * * * *");
+    expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")).toMatchObject({ jobKey: "pr-custody" });
+    expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")?.schedule).toBeUndefined();
     expect(manifest.jobs?.find((job) => job.jobKey === "gates-status-sweep")?.schedule).toBe("*/4 * * * *");
     expect(manifest.tools?.map((tool) => tool.name)).toEqual(["ci_wait_register"]);
     expect(manifest.jobs?.[0]?.schedule).toBe("*/15 * * * *");

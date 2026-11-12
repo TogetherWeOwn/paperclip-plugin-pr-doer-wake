@@ -33,7 +33,7 @@ const manifest: PaperclipPluginManifestV1 = {
   apiVersion: 1,
   version: "0.3.0",
   displayName: "CI wake and PR custody",
-  description: "Explicit CI completion waits plus opt-in hourly organization PR custody. Independent dry-run defaults, bounded native wakes and disposition cards; no automatic PR mutation.",
+  description: "Explicit CI completion waits. PR custody is unavailable pending a safe cutover; manual custody jobs are rejected.",
   author: "TogetherWeOwn",
   categories: ["automation"],
   capabilities: [
@@ -49,7 +49,7 @@ const manifest: PaperclipPluginManifestV1 = {
   jobs: [
     { jobKey: "ci-wake-poll", displayName: "CI wait poll", description: "Backstop recheck of registered open waits without an LLM; webhooks are the primary trigger. Retires moved heads and expired waits.", schedule: "*/15 * * * *" },
     { jobKey: "gates-status-sweep", displayName: "Gates status sweep", description: "Publish paperclip/gates commit statuses from RM merge confirmations. Ships disabled; shadow mode logs only.", schedule: "*/4 * * * *" },
-    { jobKey: "pr-custody", displayName: "PR custody", description: "Inventory organization PRs and request a disposition once per trigger. Separate opt-in and dry-run; incomplete evidence is UNKNOWN.", schedule: "17 * * * *" },
+    { jobKey: "pr-custody", displayName: "PR custody", description: "Unavailable pending a safe cutover; manual runs are rejected." },
     { jobKey: "dependency-wake", displayName: "Dependency wake", description: "Wake in_review/in_progress dependents once per (dependent, blocker completion) after every blocker is done for 10 minutes, the assignee has not run since, and no run is live. Ships disabled and shadow-only; dryRun forces shadow.", schedule: "*/5 * * * *" },
   ],
   webhooks: [{ endpointKey: "github-ci", displayName: "GitHub CI hint", description: "Phase two (push mode): signed check_suite, check_run, workflow_run and pull_request events only. Disabled until explicitly configured; payloads never authorize a wake, they trigger a fresh GitHub recheck of an already-registered wait." }],
