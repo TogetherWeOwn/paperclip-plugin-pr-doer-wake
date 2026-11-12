@@ -14,15 +14,10 @@ import { retryableBeforeQueue } from "./native-wake.js";
  */
 export const DEPENDENCY_WAKE_LIMITS = {
   graceMs: 600_000, lookbackMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000,
-  // hostReads 805 is the 800 cap plus the five reads a supported full-fan-in
-  // candidate needs after the all-blocker liveness barrier was added (a
-  // candidate's blocker summaries are now read even when every blocker is
-  // already receipted or outside the lookback).
+  // hostReads 805 is the 800 cap plus the five reads a full-fan-in candidate needs now that every blocker summary is read for the barrier.
   maxPerStatus: 1_000, hostReads: 805, wakesPerTick: 10, tickMs: 120_000, audits: 500,
-  // Supported fan-in: a candidate with more than 400 blockers cannot be
-  // verified inside one tick's read budget (relation + per-blocker issue reads
-  // + dependent and per-blocker summaries + the pre-effect config re-read), so
-  // it is audited, deferred and reported incomplete rather than half-examined.
+  // Supported fan-in: more than 400 blockers per candidate cannot be verified in one
+  // tick's read budget, so it is audited, deferred and reported incomplete.
   maxBlockers: 400,
   // Storage bound. A receipt whose blocker is still inside the lookback is the
   // dedupe record and is never evicted; when such receipts fill the cap the job
@@ -194,9 +189,8 @@ export class DependencyWakeRuntime {
     const blockers = (await tick.read(() => this.ctx.issues.relations.get(issue.id, companyId))).blockedBy as Blocker[];
     // Any open (or cancelled) blocker: core treats it as unresolved, and so do we.
     if (!blockers.length || blockers.some((b) => b.status !== "done")) return;
-    // Fan-in beyond the supported bound cannot be verified within one tick's
-    // read budget: audit and defer (tick reported incomplete) instead of
-    // examining part of the set and quietly passing.
+    // Fan-in beyond the supported bound cannot be verified in one tick's read
+    // budget: audit and defer (tick reported incomplete), never a quiet pass.
     if (blockers.length > L.maxBlockers) { tick.audit("blocker_fan_in", issue.id); tick.deferred = true; return; }
     const doneAt = new Map<string, number>();
     for (const b of blockers) {
@@ -214,14 +208,11 @@ export class DependencyWakeRuntime {
     if (!fresh.length) return;
     const dependent = await this.liveRun(tick, issue.id, issue.assigneeAgentId);
     if (dependent.live || dependent.budgetBlocked) return;
-    // Liveness barrier over EVERY blocker, regardless of receipt, lookback or
-    // settlement eligibility: a live run or an unbounded window on any blocker —
-    // including one whose epoch already fired or is too old to trigger — means a
-    // finalizing run may still be hiding, so the dependent defers as a whole
-    // (no receipt, no effect). A failed summary read propagates and retries the
-    // candidate next tick; each summary is read once here and reused for
-    // settlement below. The 400-blocker fan-in bound and the 805-read tick cap
-    // are sized so a supported candidate always fits a fresh budget.
+    // Liveness barrier over EVERY blocker, regardless of receipt, lookback or settlement
+    // eligibility: a live or budget-blocked run, or an unbounded run window, on any blocker —
+    // including one whose epoch already fired or is too old to trigger — defers the dependent
+    // as a whole (no receipt, no effect). A failed summary read propagates and retries the
+    // candidate next tick; each summary is read once and reused for settlement below.
     const views = new Map<string, Awaited<ReturnType<DependencyWakeRuntime["liveRun"]>>>();
     for (const b of blockers) {
       const view = await this.liveRun(tick, b.id);
@@ -242,10 +233,8 @@ export class DependencyWakeRuntime {
     // qualifying interval at all, mean the bound cannot be established for that blocker: it is
     // audited, left unreceipted and retried next tick, but it does not suppress another blocker's
     // established settlement — an unknown older completion never invalidates separate evidence
-    // for a newer one. A live blocker run or a full run window on ANY blocker already
-    // deferred the whole dependent in the barrier above (workspace-finalize policy): a
-    // full window cannot rule out a hidden live run, so it is a dependent-wide
-    // deferral there, not merely an unknown bound here.
+    // for a newer one. A live blocker run or a full window on ANY blocker already
+    // deferred the whole dependent in the barrier above (workspace-finalize policy).
     const settledAt = new Map<string, number>();
     for (const b of fresh) {
       const blocker = views.get(b.id)!;
