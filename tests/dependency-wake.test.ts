@@ -368,7 +368,8 @@ describe("dependency wake", () => {
     expect(h.ledger()?.receipts).toEqual({});
   });
 
-  const excluded = (h: ReturnType<typeof harness>) => { h.seed({ version: 1, audits: [], receipts: { [rk(DEP, BLK, DONE)]: { at: START - 25 * MIN, outcome: "woken", blockerDoneAt: DONE } } }); h.issues[BLK]!.completedAt = iso(START - 8 * 1_440 * MIN); };
+  const receipted = (h: ReturnType<typeof harness>) => h.seed({ version: 1, audits: [], receipts: { [rk(DEP, BLK, DONE)]: { at: START - 25 * MIN, outcome: "woken", blockerDoneAt: DONE } } });
+  const stale = (h: ReturnType<typeof harness>) => { h.issues[BLK]!.completedAt = iso(START - 8 * 1_440 * MIN); };
   const liveRun = (h: ReturnType<typeof harness>) => { h.runs[BLK]!.push({ id: "rv", issueId: BLK, agentId: REVIEWER, status: "running", createdAt: iso(START - 5 * MIN), startedAt: iso(START - 5 * MIN), finishedAt: null }); };
   const truncRun = (h: ReturnType<typeof harness>) => { h.runs[BLK] = Array.from({ length: 100 }, (_, i) => ({ id: `b${i}`, issueId: BLK, agentId: REVIEWER, status: "succeeded", createdAt: iso(START - 40 * MIN + i * 1_000), startedAt: iso(START - 40 * MIN + i * 1_000), finishedAt: iso(START - 40 * MIN + i * 1_000 + 500) })); };
   const addTrigger = (h: ReturnType<typeof harness>) => { h.issues[BLK2] = { id: BLK2, companyId: COMPANY, status: "done", completedAt: iso(START - 15 * MIN) };
@@ -384,9 +385,9 @@ describe("dependency wake", () => {
     }
   };
   it("defers an eligible epoch while an excluded blocker is live or unbounded", async () => {
-    for (const m of [liveRun, truncRun]) { // a live run, then an unbounded window
+    for (const m of [liveRun, truncRun]) for (const exclude of [receipted, stale]) { // each exclusion mode x live / unbounded window
       const h = harness();
-      m(h); excluded(h); addTrigger(h); await h.runtime.poll();
+      m(h); exclude(h); addTrigger(h); await h.runtime.poll();
       expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
       expect(h.ledger()?.receipts[rk(DEP, BLK2, START - 15 * MIN)]).toBeUndefined();
       if (m !== liveRun) continue; // excluded live run finishes -> deferred epoch wakes once
@@ -411,8 +412,7 @@ describe("dependency wake", () => {
   });
   it("retries a candidate that ran out of the shared budget on a fresh tick", async () => {
     const h = harness();
-    // An id-sorted-earlier candidate consumes the whole tick: 400 blockers that pass
-    // the barrier but all settled before its own last run (T-10m), no trigger.
+    // An id-sorted-earlier candidate consumes the tick: 400 blockers settled before its last run, no trigger.
     const early = filler(0);
     h.issues[early] = { id: early, companyId: COMPANY, status: "in_review", assigneeAgentId: AGENT, activeRun: null };
     h.runs[early] = [{ id: "e1", issueId: early, agentId: AGENT, status: "succeeded", createdAt: iso(START - 10 * MIN), startedAt: iso(START - 10 * MIN), finishedAt: iso(START - 9 * MIN) }];
