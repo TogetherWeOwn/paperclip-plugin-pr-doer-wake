@@ -153,6 +153,18 @@ describe("CustodyGithub REST enumeration", () => {
     expect(calls[0]!.url.searchParams.get("direction")).toBe("desc");
   });
 
+  it("keeps reading closed pages past a row just below the cursor when the sort inverts", async () => {
+    // Page 1 ends one second below the cursor; page 2 still holds a PR updated after it.
+    const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
+      ? [...Array.from({ length: 99 }, (_, index) => closed(index + 1, RECENT)), closed(100, "2026-01-02T23:59:59Z")]
+      : [closed(101, "2026-01-03T00:00:01Z")]));
+    const values = await client.pulls(REPO, "closed", Date.parse(RECENT));
+    expect(calls).toHaveLength(2);
+    expect(values.map((value) => value.number)).toContain(101);
+    expect(values.map((value) => value.number)).not.toContain(100);
+    expect(values).toHaveLength(100);
+  });
+
   it("requires a bounded bootstrap or stored cursor for closed pulls", async () => {
     const { client, calls } = fixtures();
     await expect(client.pulls(REPO, "closed")).rejects.toMatchObject({ code: "input" });
