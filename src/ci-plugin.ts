@@ -23,10 +23,6 @@ function readyGates(): GatesStatusRuntime {
   if (!gates) throw new Error("gates_not_initialized");
   return gates;
 }
-function readyCustody(): CustodyRuntime {
-  if (!custodyRuntime) throw new Error("custody_not_initialized");
-  return custodyRuntime;
-}
 
 export default definePlugin({
   async setup(ctx) {
@@ -36,13 +32,10 @@ export default definePlugin({
     custodyRuntime.setCustodyCompanyId(capturedCustodyCompanyId);
     dependencyRuntime = new DependencyWakeRuntime(ctx);
     dependencyRuntime.setCompanyId(capturedDependencyCompanyId);
-    // Dereference the module-level runtime at fire time so a setup re-run
-    // retargets the already-registered job instead of splitting it from the
-    // runtime that onConfigChanged mutates.
-    ctx.jobs.register("pr-custody", async () => readyCustody().poll());
-    // Keep the bounded PR->card index fresh between scheduled ticks. The
-    // scheduled job remains the reconciler; events only accelerate it.
-    const custodyEvent = async (event: { companyId: string; entityId?: string; eventType: string }) => readyCustody().onCustodyEvent(event);
+    // Keep custody disconnected until the ownership discovery contract is
+    // accepted. This applies to scheduled and manually triggered jobs alike.
+    ctx.jobs.register("pr-custody", async () => { throw new Error("custody_unavailable"); });
+    const custodyEvent = async () => {};
     ctx.events.on("issue.created", custodyEvent);
     ctx.events.on("issue.updated", custodyEvent);
     ctx.events.on("issue.comment.created", custodyEvent);
@@ -98,5 +91,5 @@ export default definePlugin({
     return errors.length ? { ok: false, errors } : { ok: true };
   },
   async onWebhook(input) { await ready().webhook(input); },
-  async onHealth() { return { status: "ok", message: "ci-wake ready; inspect wait audits and Actions/operational evidence separately" }; },
+  async onHealth() { return { status: "ok", message: "ci-wake ready; custody unavailable; inspect wait audits and Actions/operational evidence separately" }; },
 });

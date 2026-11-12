@@ -1,6 +1,6 @@
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
-import { startWorkerRpcHost } from "@paperclipai/plugin-sdk";
+import { startWorkerRpcHost, type PluginContext } from "@paperclipai/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import manifest from "../src/manifest.js";
 
@@ -33,6 +33,11 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
   // One worker process per plugin: reset the module so each test gets a
   // fresh worker with no captured company carried over from the last test.
   vi.resetModules();
+  const { CustodyRuntime } = await import("../src/custody-runtime.js");
+  const capture = vi.spyOn(CustodyRuntime.prototype, "setCustodyCompanyId");
+  const custodyEvent = vi.spyOn(CustodyRuntime.prototype, "onCustodyEvent");
+  const { GatesStatusRuntime } = await import("../src/gates-runtime.js");
+  const gatesEvent = vi.spyOn(GatesStatusRuntime.prototype, "handleIssueUpdated").mockResolvedValue(undefined);
   const { default: plugin } = await import("../src/ci-plugin.js");
   const stdin = new PassThrough();
   const stdout = new PassThrough();
@@ -72,6 +77,9 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
             if (!params.companyId) replyError(id, "company context is required");
             else reply(id, storedConfig);
             return;
+          case "events.subscribe":
+            reply(id, null);
+            return;
           case "state.get":
             reply(id, state.get(keyOf(params)) ?? null);
             return;
@@ -97,7 +105,7 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
     });
   });
   const host = startWorkerRpcHost({ plugin, stdin, stdout, rpcTimeoutMs: 10_000 });
-  const stop = () => { host.stop(); lines.close(); stdin.destroy(); stdout.destroy(); };
+  const stop = () => { host.stop(); lines.close(); stdin.destroy(); stdout.destroy(); capture.mockRestore(); custodyEvent.mockRestore(); gatesEvent.mockRestore(); };
   const send = (id: string, method: string, params: Record<string, unknown>) =>
     new Promise<unknown>((resolve, reject) => {
       pending.set(id, { resolve, reject });
@@ -111,26 +119,94 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
     }
     return undefined;
   };
-  return { send, stop, calls, ledger };
+  return { send, stop, calls, ledger, capture, custodyEvent, gatesEvent };
 }
 
 const initialize = { manifest, config: {}, apiVersion: 1, instanceInfo: { instanceId: "11111111-1111-4111-8111-111111111111", hostVersion: "0.0.0-fixture" } };
 const runJob = { job: { jobKey: "pr-custody", runId: "dddddddd-0000-4000-8000-000000000001", trigger: "schedule", scheduledAt: SCHEDULED_AT } };
 
-describe("scheduled pr-custody job over the real SDK/host contract", () => {
-  it("completes one inventory tick with every config read explicitly company-scoped", async () => {
+describe("custody interlock over the real SDK/host contract", () => {
+  for (const trigger of ["schedule", "manual"]) {
+    it(`rejects a ${trigger} job before any host read or effect`, async () => {
+      const h = await custodyHost();
+      try {
+        await h.send("initialize-interlock", "initialize", initialize);
+        await h.send("config-interlock", "configChanged", { config: custodyConfig, companyId: COMPANY });
+        h.calls.length = 0;
+        await expect(h.send("job-interlock", "runJob", {
+          job: { ...runJob.job, trigger },
+        })).rejects.toThrow("custody_unavailable");
+        expect(h.calls).toEqual([]);
+        expect(h.ledger()).toBeUndefined();
+      } finally { h.stop(); }
+    });
+  }
+});
+
+describe("custody event and health interlock over the real SDK", () => {
+  it("dispatches each event without custody reads or effects while retaining gates dispatch", async () => {
+    const h = await custodyHost();
+    try {
+      await h.send("initialize-events", "initialize", initialize);
+      await h.send("config-events", "configChanged", { config: custodyConfig, companyId: COMPANY });
+      h.calls.length = 0;
+      const eventTypes = ["issue.created", "issue.updated", "issue.comment.created", "issue.document.created", "issue.document.updated", "issue.relations.updated"];
+      for (const [index, eventType] of eventTypes.entries()) {
+        await h.send(`event-${index}`, "onEvent", { event: { eventType, companyId: COMPANY, entityId: PROJECT, payload: {} } });
+      }
+      expect(h.custodyEvent).not.toHaveBeenCalled();
+      expect(h.gatesEvent).toHaveBeenCalledTimes(1);
+      expect(h.calls).toEqual([]);
+      expect(h.ledger()).toBeUndefined();
+    } finally { h.stop(); }
+  });
+
+  it("reports worker health while explicitly marking custody unavailable", async () => {
+    const h = await custodyHost();
+    try {
+      await h.send("initialize-health", "initialize", initialize);
+      expect(await h.send("health", "health", {})).toEqual({
+        status: "ok",
+        message: expect.stringContaining("custody unavailable"),
+      });
+    } finally { h.stop(); }
+  });
+});
+
+describe("custody event interlock at the plugin registration boundary", () => {
+  it("disconnects all six custody callbacks without replacing the gates callback", async () => {
+    vi.resetModules();
+    const { CustodyRuntime } = await import("../src/custody-runtime.js");
+    const eventSpy = vi.spyOn(CustodyRuntime.prototype, "onCustodyEvent");
+    const { default: plugin } = await import("../src/ci-plugin.js");
+    const on = vi.fn<PluginContext["events"]["on"]>();
+    const ctx = {
+      jobs: { register: vi.fn() }, events: { on }, tools: { register: vi.fn() },
+      logger: { info: vi.fn() },
+    } as unknown as PluginContext;
+    try {
+      await plugin.definition.setup(ctx);
+      const eventTypes = ["issue.created", "issue.updated", "issue.comment.created", "issue.document.created", "issue.document.updated", "issue.relations.updated"] as const;
+      for (const eventType of eventTypes) {
+        const handlers = on.mock.calls.filter(([type]) => type === eventType);
+        expect(handlers).toHaveLength(eventType === "issue.updated" ? 2 : 1);
+        const callback = handlers[0]![1] as unknown as (event: unknown) => Promise<void>;
+        await callback({ eventType, companyId: COMPANY, entityId: PROJECT });
+      }
+      expect(eventSpy).not.toHaveBeenCalled();
+    } finally { eventSpy.mockRestore(); }
+  });
+});
+
+describe("custody company capture over the real SDK/host contract", () => {
+  it("captures the company supplied by a matching scoped delivery", async () => {
     const h = await custodyHost();
     try {
       await h.send("initialize-fixture", "initialize", initialize);
       // The loader replays stored company config here, before any job runs.
       await h.send("config-fixture", "configChanged", { config: custodyConfig, companyId: COMPANY });
-      await h.send("job-fixture", "runJob", runJob);
-
-      const configReads = h.calls.filter((c) => c.method === "config.get");
-      expect(configReads.length).toBeGreaterThan(0);
-      expect(configReads.every((c) => c.params.companyId === COMPANY)).toBe(true);
-      expect(h.ledger()?.report.complete).toBe(true);
-      expect(h.ledger()?.report.rows).toEqual([]);
+      expect(h.capture.mock.calls.map(([id]) => id)).toEqual([null, COMPANY]);
+      expect(h.calls.some((c) => c.method === "config.get")).toBe(false);
     } finally { h.stop(); }
   });
 
@@ -138,8 +214,9 @@ describe("scheduled pr-custody job over the real SDK/host contract", () => {
     const h = await custodyHost();
     try {
       await h.send("initialize-control", "initialize", initialize);
-      await h.send("job-control", "runJob", runJob);
+      await expect(h.send("job-control", "runJob", runJob)).rejects.toThrow("custody_unavailable");
 
+      expect(h.capture.mock.calls.map(([id]) => id)).toEqual([null]);
       expect(h.calls.some((c) => c.method === "config.get")).toBe(false);
       expect(h.ledger()).toBeUndefined();
     } finally { h.stop(); }
@@ -154,8 +231,9 @@ describe("scheduled pr-custody job over the real SDK/host contract", () => {
       // the capture must not adopt OTHER, and the tick must not read
       // config for the wrong company at all.
       await h.send("config-mismatch", "configChanged", { config: mismatched, companyId: COMPANY });
-      await h.send("job-mismatch", "runJob", runJob);
+      await expect(h.send("job-mismatch", "runJob", runJob)).rejects.toThrow("custody_unavailable");
 
+      expect(h.capture.mock.calls.map(([id]) => id)).toEqual([null]);
       const configReads = h.calls.filter((c) => c.method === "config.get");
       expect(configReads.some((c) => c.params.companyId === OTHER)).toBe(false);
       expect(configReads).toHaveLength(0);
@@ -168,10 +246,21 @@ describe("scheduled pr-custody job over the real SDK/host contract", () => {
     try {
       await h.send("initialize-unscoped", "initialize", initialize);
       await h.send("config-unscoped", "configChanged", { config: custodyConfig, companyId: null });
-      await h.send("job-unscoped", "runJob", runJob);
+      await expect(h.send("job-unscoped", "runJob", runJob)).rejects.toThrow("custody_unavailable");
 
+      expect(h.capture.mock.calls.map(([id]) => id)).toEqual([null]);
       expect(h.calls.some((c) => c.method === "config.get")).toBe(false);
       expect(h.ledger()).toBeUndefined();
+    } finally { h.stop(); }
+  });
+
+  it("clears the capture when its own company disables custody", async () => {
+    const h = await custodyHost();
+    try {
+      await h.send("initialize-disable", "initialize", initialize);
+      await h.send("config-enabled", "configChanged", { config: custodyConfig, companyId: COMPANY });
+      await h.send("config-disabled", "configChanged", { config: { ...custodyConfig, custodyEnabled: false }, companyId: COMPANY });
+      expect(h.capture.mock.calls.map(([id]) => id)).toEqual([null, COMPANY, null]);
     } finally { h.stop(); }
   });
 
@@ -187,12 +276,10 @@ describe("scheduled pr-custody job over the real SDK/host contract", () => {
       // it); the plugin's own binding then ignores it because the field
       // names COMPANY, not the delivering company.
       await h.send("config-b", "configChanged", { config: custodyConfig, companyId: OTHER });
-      await h.send("job-multicompany", "runJob", runJob);
-
-      const configReads = h.calls.filter((c) => c.method === "config.get");
-      expect(configReads.length).toBeGreaterThan(0);
-      expect(configReads.every((c) => c.params.companyId === COMPANY)).toBe(true);
-      expect(h.ledger()?.report.complete).toBe(true);
+      expect(h.capture.mock.calls.map(([id]) => id)).toEqual([null, COMPANY]);
+      await expect(h.send("job-multicompany", "runJob", runJob)).rejects.toThrow("custody_unavailable");
+      expect(h.calls.some((c) => c.method === "config.get")).toBe(false);
+      expect(h.ledger()).toBeUndefined();
     } finally { h.stop(); }
   });
 });
