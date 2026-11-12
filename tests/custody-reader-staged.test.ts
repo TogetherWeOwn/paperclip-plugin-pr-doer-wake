@@ -14,6 +14,7 @@ const AGENT = uuid(90_002);
 const AT = "2026-11-10T01:00:00.000Z";
 const MS = Date.parse(AT);
 const OWN = "plugin:togetherweown.pr-doer-wake:pr-custody";
+const EXPECTED_TOTAL_BYTES = 64 * 1024 * 1024;
 function card(n = 1, patch: Row = {}): Row {
   return {
     id: uuid(n), company_id: COMPANY, project_id: uuid(90_003), identifier: `TASK-${n}`,
@@ -209,7 +210,7 @@ describe("loadCustodyCards", () => {
   it.each([0, 1])("shares the metadata and comment byte limit (overflow %i)", async (overflow) => {
     const chunk = "a".repeat(128_000);
     const cards = Array.from({ length: 262 }, (_, i) => card(i + 1, { title: chunk, description: chunk }));
-    const remaining = CUSTODY_READ_LIMITS.totalBytes - 524 * chunk.length - 1;
+    const remaining = EXPECTED_TOTAL_BYTES - 524 * chunk.length - 1;
     const h = host({ cards, comments: [
       comment(1, { body: "x", issue_id: uuid(1) }),
       comment(2, { body: "界" + "a".repeat(remaining - 3 + overflow), issue_id: uuid(201) }),
@@ -322,15 +323,15 @@ describe("loadCustodyCards", () => {
   it("accepts exactly the shared byte limit and rejects one more byte", () => {
     const budget = createCustodyByteBudget();
     const chunk = "a".repeat(128_000);
-    const count = Math.floor(CUSTODY_READ_LIMITS.totalBytes / chunk.length);
+    const count = Math.floor(EXPECTED_TOTAL_BYTES / chunk.length);
     for (let i = 0; i < count; i++) budget(chunk);
-    budget("a".repeat(CUSTODY_READ_LIMITS.totalBytes - count * chunk.length));
+    budget("a".repeat(EXPECTED_TOTAL_BYTES - count * chunk.length));
     expect(() => budget("a")).toThrow("total byte budget");
   });
 
   it("rejects aggregate evidence bytes during pagination", async () => {
     const body = "a".repeat(128_000);
-    const count = Math.floor(CUSTODY_READ_LIMITS.totalBytes / body.length) + 1;
+    const count = Math.floor(EXPECTED_TOTAL_BYTES / body.length) + 1;
     const h = host({ comments: Array.from({ length: count }, (_, i) => comment(i + 1, { body })) });
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("total byte budget");
     // Reject while consuming the page crossing the byte budget.
