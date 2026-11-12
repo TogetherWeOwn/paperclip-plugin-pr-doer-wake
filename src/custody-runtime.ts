@@ -317,6 +317,7 @@ export class CustodyRuntime {
       // owner, so any such UNKNOWN bars ownership effects this tick (fail
       // closed): mapping and discovery persist, dispatch is deferred.
       let enrichmentUnknown = false;
+      let workProductTierUnavailable = false;
       for (const cardId of enrichIds) {
         const card = cardsById.get(cardId);
         if (!card) continue;
@@ -324,11 +325,17 @@ export class CustodyRuntime {
           guard();
           const fresh = await this.ctx.issues.get(cardId, config.companyId);
           if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
+          // The host omits workProducts from issue reads (Paperclip 1106). An
+          // omitted field means the tier is unavailable, not that ownership is
+          // unknown: map through the remaining tiers and stop the per-card fanout.
+          // A present but malformed field still fails closed.
+          if (!("workProducts" in fresh) || (fresh as { workProducts?: unknown }).workProducts === undefined) { workProductTierUnavailable = true; break; }
           const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
           if (bindings === null) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
           card.workProducts = bindings;
         } catch { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
       }
+      if (workProductTierUnavailable) audit("inventory", "work_product_tier_unavailable");
       const candidates = new Map<string, CustodyCard>();
       const seenPrs = new Set<string>();
       for (const [, inv] of inventories) {

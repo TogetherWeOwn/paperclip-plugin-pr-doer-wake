@@ -3,7 +3,8 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { CUSTODY_READ_LIMITS, loadCustodyCards, loadCustodyTexts, parseWorkProductBindings } from "../src/custody-reader.js";
 
 // Full evidence for a candidate set: metadata for the company, then
-// comments/documents for the selected cards only (TWO-5928 scale fix).
+// comments for the selected cards only (TWO-5928 scale fix; documents are
+// never read, per the TWO-6426 comments-only directive decision).
 async function loadAll(ctx: PluginContext, guard: () => void) {
   const cards = await loadCustodyCards(ctx, COMPANY, guard); // helper keeps metadata phase
   return loadCustodyTexts(ctx, COMPANY, guard, cards);
@@ -100,7 +101,7 @@ function host(data: { cards?: Row[]; comments?: Row[]; documents?: Row[] } = {})
 }
 
 describe("loadCustodyCards", () => {
-  it("scopes every read, resolves only document bodies through SDK, and guards every RPC", async () => {
+  it("scopes every read to the company and guards every RPC", async () => {
     const h = host({
       cards: [card(), card(2, { company_id: OTHER })],
       comments: [comment(), comment(2, { company_id: OTHER }), comment(3, { issue_id: uuid(2) })],
@@ -116,15 +117,24 @@ describe("loadCustodyCards", () => {
         { id: "title", body: "Fix https://github.com/acme/widgets/pull/7", at: MS, ownership: true },
         { id: "description", body: "Implementation owner", at: MS, ownership: true },
         { id: `comment:${uuid(1)}`, body: "https://github.com/acme/widgets/pull/8", at: MS + 3_600_000, ownership: true },
-        { id: `document:${uuid(100_001)}`, body: "https://github.com/acme/widgets/pull/9", at: MS + 7_200_000, ownership: true },
       ],
     }]);
-    expect(h.query).toHaveBeenCalledTimes(3);
-    expect(h.get).toHaveBeenCalledExactlyOnceWith(uuid(1), "plan-1", COMPANY);
-    expect(h.trace).toEqual(["guard", "query", "guard", "query", "guard", "query", "guard", "get"]);
-    const documentSql = h.query.mock.calls[2]![0];
-    expect(documentSql).toContain("document_id");
-    expect(documentSql).not.toMatch(/\bbody\b/);
+    expect(h.query).toHaveBeenCalledTimes(2);
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.trace).toEqual(["guard", "query", "guard", "query"]);
+  });
+
+  it("never reads documents, even an oversized linked body; comment directives still load", async () => {
+    const h = host({
+      comments: [comment(1, { body: "PR disposition: acme/widgets#8 defer" })],
+      documents: [document()],
+    });
+    h.get.mockResolvedValue({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "a".repeat(600_000), updatedAt: AT });
+    const result = await loadAll(h.ctx,  h.guard);
+    expect(result[0]!.texts.map((t) => t.body)).toContain("PR disposition: acme/widgets#8 defer");
+    expect(result[0]!.texts.some((t) => String(t.id).startsWith("document:"))).toBe(false);
+    expect(h.get).not.toHaveBeenCalled();
+    for (const [sql] of h.query.mock.calls) expect(sql).not.toContain("issue_documents");
   });
 
   it("retains all card statuses, null project/identifier, and unrelated plugin/routine origins", async () => {
@@ -154,13 +164,6 @@ describe("loadCustodyCards", () => {
     for (const [, params] of h.query.mock.calls.slice(1)) expect(params?.[3]).toBe(`{${uuid(6)}}`);
   });
 
-  it("excludes the generated document key before fetching its body", async () => {
-    const h = host({ documents: [document(1, { key: "pr-custody" }), document(2)] });
-    const result = await loadAll(h.ctx,  h.guard);
-    expect(h.get).toHaveBeenCalledExactlyOnceWith(uuid(1), "plan-2", COMPANY);
-    expect(result[0]!.texts).toHaveLength(3);
-  });
-
   it("only agent-authored live comments establish ownership; humans still supply dispositions", async () => {
     const h = host({ comments: [
       comment(1, { body: "agent" }),
@@ -182,16 +185,15 @@ describe("loadCustodyCards", () => {
     const h = host({
       cards: Array.from({ length: 201 }, (_, i) => card(i + 1)),
       comments: Array.from({ length: 201 }, (_, i) => comment(i + 1)),
-      documents: Array.from({ length: 201 }, (_, i) => document(i + 1)),
     });
     const result = await loadAll(h.ctx,  h.guard);
     expect(result).toHaveLength(201);
-    expect(result[0]!.texts).toHaveLength(404);
+    expect(result[0]!.texts).toHaveLength(203);
     const calls = h.query.mock.calls;
-    expect(calls).toHaveLength(6);
-    for (const index of [1, 3, 5]) expect(calls[index]![1]?.[1]).toBe(uuid(200));
-    expect(h.get).toHaveBeenCalledTimes(201);
-    expect(h.guard).toHaveBeenCalledTimes(207);
+    expect(calls).toHaveLength(4);
+    for (const index of [1, 3]) expect(calls[index]![1]?.[1]).toBe(uuid(200));
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.guard).toHaveBeenCalledTimes(4);
   });
 
   it("allows an exactly-at-cap card view only after an exhaustion probe", async () => {
@@ -206,7 +208,6 @@ describe("loadCustodyCards", () => {
   it.each([
     ["cards", CUSTODY_READ_LIMITS.cards + 1, card, "issues"],
     ["comments", CUSTODY_READ_LIMITS.comments + 1, comment, "issue_comments"],
-    ["documents", CUSTODY_READ_LIMITS.documents + 1, document, "issue_documents"],
   ] as const)("rejects %s cap exhaustion rather than returning a partial view", async (key, count, make, table) => {
     const h = host({ [key]: Array.from({ length: count }, (_, i) => make(i + 1)) });
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow(`UNKNOWN custody snapshot: ${table} row budget exceeded`);
@@ -215,20 +216,18 @@ describe("loadCustodyCards", () => {
     expect(relevant.length).toBeLessThanOrEqual(Math.ceil(count / 200) + 1);
   });
 
-  it.each(["issues", "issue_comments", "issue_documents"])("rejects a cross-company %s row even if the host violates its query scope", async (table) => {
+  it.each(["issues", "issue_comments"])("rejects a cross-company %s row even if the host violates its query scope", async (table) => {
     const h = host();
     if (table !== "issues") h.query.mockResolvedValueOnce([card()]);
-    if (table === "issue_documents") h.query.mockResolvedValueOnce([]);
-    h.query.mockResolvedValueOnce([{ ...(table === "issues" ? card() : table === "issue_comments" ? comment() : document()), company_id: OTHER }]);
+    h.query.mockResolvedValueOnce([{ ...(table === "issues" ? card() : comment()), company_id: OTHER }]);
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("cross-company");
     expect(h.get).not.toHaveBeenCalled();
   });
 
-  it.each(["issues", "issue_comments", "issue_documents"])("rejects duplicate %s row IDs", async (table) => {
+  it.each(["issues", "issue_comments"])("rejects duplicate %s row IDs", async (table) => {
     const h = host();
     if (table !== "issues") h.query.mockResolvedValueOnce([card()]);
-    if (table === "issue_documents") h.query.mockResolvedValueOnce([]);
-    const row = table === "issues" ? card() : table === "issue_comments" ? comment() : document();
+    const row = table === "issues" ? card() : comment();
     h.query.mockResolvedValueOnce([row, row]);
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate or unordered");
   });
@@ -240,35 +239,11 @@ describe("loadCustodyCards", () => {
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate or unordered");
   });
 
-  it.each([
-    [document(2, { key: "plan-1" })], [document(2, { document_id: uuid(100_001) })],
-  ])("rejects duplicate document identity metadata", async (duplicate) => {
-    const h = host({ documents: [document(), duplicate] });
-    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("duplicate document metadata");
-    expect(h.get).not.toHaveBeenCalled();
-  });
-
-  it.each(["issue_comments", "issue_documents"])("rejects %s linked to an unexpected issue", async (table) => {
+  it("rejects issue_comments linked to an unexpected issue", async () => {
     const h = host();
     h.query.mockResolvedValueOnce([card()]);
-    if (table === "issue_documents") h.query.mockResolvedValueOnce([]);
-    h.query.mockResolvedValueOnce([table === "issue_comments" ? comment(1, { issue_id: uuid(99) }) : document(1, { issue_id: uuid(99) })]);
+    h.query.mockResolvedValueOnce([comment(1, { issue_id: uuid(99) })]);
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("unexpected issue");
-  });
-
-  it.each([
-    { companyId: OTHER }, { issueId: uuid(99) }, { id: uuid(99) }, { key: "other" },
-    { body: null }, { updatedAt: "not-a-date" },
-  ])("rejects malformed or identity-mismatched document bodies: %j", async (patch) => {
-    const h = host({ documents: [document()] });
-    h.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "body", updatedAt: AT, ...patch });
-    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
-  });
-
-  it("rejects a document disappearing between metadata and body reads", async () => {
-    const h = host({ documents: [document()] });
-    h.get.mockResolvedValueOnce(null);
-    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
   it.each([
@@ -300,12 +275,9 @@ describe("loadCustodyCards", () => {
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("UNKNOWN custody snapshot");
   });
 
-  it("rejects oversized comments and document bodies without truncating them", async () => {
+  it("rejects oversized comment bodies without truncating them", async () => {
     const comments = host({ comments: [comment(1, { body: "a".repeat(128_001) })] });
     await expect(loadAll(comments.ctx,  comments.guard)).rejects.toThrow("UNKNOWN custody snapshot");
-    const docs = host({ documents: [document()] });
-    docs.get.mockResolvedValueOnce({ id: uuid(100_001), companyId: COMPANY, issueId: uuid(1), key: "plan-1", body: "界".repeat(90_000), updatedAt: AT });
-    await expect(loadAll(docs.ctx,  docs.guard)).rejects.toThrow("body budget");
   });
 
   it("rejects aggregate evidence bytes during pagination", async () => {
@@ -317,8 +289,8 @@ describe("loadCustodyCards", () => {
     expect(h.query).toHaveBeenCalledTimes(1 + Math.ceil(count / 200));
   });
 
-  it.each([1, 2, 3, 4])("runs guard immediately before host RPC %s and stops if it throws", async (stopAt) => {
-    const h = host({ documents: [document()] });
+  it.each([1, 2])("runs guard immediately before host RPC %s and stops if it throws", async (stopAt) => {
+    const h = host({ comments: [comment()] });
     let count = 0;
     h.guard.mockImplementation(() => { if (++count === stopAt) throw new Error("lease expired"); });
     await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("lease expired");
@@ -326,9 +298,10 @@ describe("loadCustodyCards", () => {
   });
 
   it("propagates host errors rather than returning cards already collected", async () => {
-    const h = host({ documents: [document()] });
-    h.get.mockRejectedValueOnce(new Error("SDK read failed"));
-    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("SDK read failed");
+    const h = host({ comments: [comment()] });
+    h.query.mockResolvedValueOnce([card()]);
+    h.query.mockRejectedValueOnce(new Error("host read failed"));
+    await expect(loadAll(h.ctx,  h.guard)).rejects.toThrow("host read failed");
   });
 
   it("returns an empty view without evidence RPCs when no cards remain", async () => {

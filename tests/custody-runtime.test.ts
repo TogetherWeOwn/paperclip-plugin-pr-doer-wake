@@ -1120,13 +1120,30 @@ describe("work-product discovery from a cold ledger", () => {
     await h.restart().poll();
     expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
   });
-  it("treats a missing workProducts field as UNKNOWN, never as proven-absent", async () => {
-    const h = fixture({ open: [pull({ headBranch: "feat/change" })] });
+  it("treats a missing workProducts field as tier-unavailable: one read, no UNKNOWN, effects not deferred", async () => {
+    // Paperclip 1106 omits workProducts from issue reads; plugins cannot read
+    // issue_work_products. The tier is skipped, lower tiers still map.
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const other = card({ id: "00000000-0000-4000-8000-0000000000aa", identifier: "TASK-43" });
+    const h = fixture({ cards: [urlCard, other] });
     h.ctx.issues.get.mockImplementation(async () => ({ id: ISSUE, companyId: COMPANY, projectId: PROJECT, identifier: "TASK-42", title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null }));
     await h.runtime.poll();
-    expect(h.ledger().report.rows[0]).toMatchObject({ mapping: "unmapped", cardId: null });
+    // Enrichment stops after the first tier-unavailable read: no per-card fanout.
+    expect(h.ctx.issues.get.mock.calls.filter((c: unknown[]) => c[0] === other.id)).toHaveLength(0);
+    expect(h.ledger().report.unknown.filter((u: string) => u.startsWith("work_product:"))).toEqual([]);
+    expect(h.ledger().audits).toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "work_product_tier_unavailable" }));
+    expect(h.ledger().audits).not.toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "unknown" }));
+    expect(h.ledger().report.rows[0]).toMatchObject({ cardId: ISSUE });
+  });
+  it.each([null, "not-an-array", { type: "pull_request" }])("fails closed on a present but malformed workProducts field: %j", async (malformed) => {
+    const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    const h = fixture({ cards: [urlCard] });
+    h.ctx.issues.get.mockImplementation(async () => ({ id: ISSUE, companyId: COMPANY, projectId: PROJECT, identifier: "TASK-42", title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null, workProducts: malformed }));
+    await h.runtime.poll();
     expect(h.ledger().report.unknown).toContain(`work_product:${ISSUE}`);
     expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.effects).toBe(0);
+    expect(h.ledger().audits).not.toContainEqual(expect.objectContaining({ outcome: "work_product_tier_unavailable" }));
   });
 });
 
