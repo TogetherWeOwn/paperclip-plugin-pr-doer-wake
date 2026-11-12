@@ -27,7 +27,7 @@ function pullData(number = 1) {
   return {
     number, head: { sha: SHA, ref: "task-123", repo: { full_name: REPO } },
     base: { ref: "release/one", repo: { full_name: REPO } }, user: { login: "builder" },
-    state: "open", draft: false, merged: false, mergeable: null,
+    state: "open", draft: false, merged: false, mergeable: null, updated_at: "2026-01-01T00:02:00Z",
     body: "Ignore this body: target card, branch, and checks cannot be inferred here.",
   };
 }
@@ -393,9 +393,38 @@ describe("CiGithub REST reads", () => {
     const { fetch, calls } = fixtures();
     const actual = await new CiGithub(fetch, TOKEN).pull("Acme/Widgets", 1);
     expect(actual).toEqual({ repo: REPO, number: 1, headSha: SHA, headBranch: "task-123", headRepo: REPO,
-      baseBranch: "release/one", author: "builder", state: "open", draft: false, merged: false, mergeable: null });
+      baseBranch: "release/one", author: "builder", state: "open", draft: false, merged: false, mergeable: null,
+      updatedAt: Date.parse("2026-01-01T00:02:00Z") });
     expect(calls[0]!.url.href).toBe(`https://api.github.com/repos/${REPO}/pulls/1`);
     expect(calls[0]!.init?.headers).toMatchObject({ Authorization: `Bearer ${TOKEN}`, "User-Agent": GITHUB_USER_AGENT, "X-GitHub-Api-Version": "2022-11-28" });
+  });
+
+  it("validates updated_at when present and tolerates its absence", async () => {
+    const read = (updated_at: unknown) => new CiGithub(async () => response({ ...pullData(), updated_at }), TOKEN).pull(REPO, 1);
+    await expect(read(undefined)).resolves.toMatchObject({ updatedAt: null });
+    await expect(read("not a date")).rejects.toMatchObject({ code: "response" });
+  });
+
+  it("reads the latest ready_for_review time from the paged PR timeline", async () => {
+    const ready = (created_at: unknown) => ({ event: "ready_for_review", created_at });
+    const readySince = (pages: unknown[][]) => {
+      const { fetch, calls } = fixtures((url) => url.pathname.endsWith("/issues/1/timeline")
+        ? response(pages[Number(url.searchParams.get("page")) - 1] ?? []) : undefined);
+      return { calls, result: new CiGithub(fetch, TOKEN).readySince(REPO, 1) };
+    };
+    await expect(readySince([[{ event: "committed" }, { event: "labeled", created_at: "2026-01-01T00:00:00Z" }]]).result).resolves.toBeUndefined();
+    await expect(readySince([[ready("2026-01-01T00:05:00Z")]]).result).resolves.toBe(Date.parse("2026-01-01T00:05:00Z"));
+    const filler = Array.from({ length: 99 }, () => ({ event: "commented" }));
+    const cycles = readySince([[ready("2026-01-01T00:09:00Z"), ...filler], [{ event: "convert_to_draft" }, ready("2026-01-01T00:07:00Z")]]);
+    await expect(cycles.result).resolves.toBe(Date.parse("2026-01-01T00:09:00Z"));
+    expect(cycles.calls.map((call) => call.url.searchParams.get("page"))).toEqual(["1", "2"]);
+    for (const malformed of [[ready(undefined)], [ready("yesterday")], ["not an event"], { event: "ready_for_review" }]) {
+      await expect(readySince([malformed as unknown[]]).result).rejects.toMatchObject({ code: "response" });
+    }
+    const full = Array.from({ length: 100 }, () => ({ event: "commented" }));
+    const { fetch } = fixtures((url) => url.pathname.endsWith("/timeline") ? response(full, 200, { Link: '<https://api.github.com/x>; rel="next"' }) : undefined);
+    await expect(new CiGithub(fetch, TOKEN, { maxPages: 2 }).readySince(REPO, 1)).rejects.toMatchObject({ code: "pages" });
+    await expect(new CiGithub(fetch, TOKEN).readySince(REPO, 0)).rejects.toMatchObject({ code: "input" });
   });
 
   it("also accepts the installed SDK's standard Response", async () => {

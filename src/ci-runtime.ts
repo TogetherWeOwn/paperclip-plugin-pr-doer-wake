@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { PluginContext, PluginWebhookInput, ToolRunContext, ToolResult } from "@paperclipai/plugin-sdk";
 import { parseCiConfig, parseRegistration, validateCiConfig, workspaceRepo, UUID, SHA, InvalidRegistrationError, type CiConfig, type Registration } from "./ci-config.js";
-import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness, relevantSuites } from "./ci-github.js";
+import { CiGithub, CiGithubCache, CiGithubError, evaluateReadiness, relevantSuites, type CiReadiness, type CiReadinessTiming, type CiSnapshot } from "./ci-github.js";
 import { CiAppAuth } from "./ci-auth.js";
 import { retryableBeforeQueue } from "./native-wake.js";
 import { parseWorkProductBindings } from "./custody-reader.js";
@@ -551,6 +551,19 @@ export class CiWakeRuntime {
     return authors.has(agent);
   }
 
+  /**
+   * Checks that only run on ready PRs register after the draft flips. Only a
+   * missing-check-only failure on a ready PR consults the timeline, so its
+   * grace restarts at the latest ready_for_review event. Null: retry later.
+   */
+  private async readyGrace(github: CiGithub, repo: string, prNumber: number, draft: boolean, snapshot: CiSnapshot, timing: CiReadinessTiming): Promise<{ verdict: CiReadiness; consulted: boolean } | null> {
+    const verdict = evaluateReadiness(snapshot, timing);
+    if (verdict.kind !== "fail" || verdict.failed.length || !verdict.missing.length || draft) return { verdict, consulted: false };
+    let readySince: number | undefined;
+    try { readySince = await github.readySince(repo, prNumber); } catch { return null; }
+    return { verdict: readySince === undefined ? verdict : evaluateReadiness(snapshot, { ...timing, readySince }), consulted: true };
+  }
+
   async poll(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
     if (this.pollInFlight) {
       if (!only && this.targetedPoll) this.fullPollRequested = true;
@@ -628,8 +641,9 @@ export class CiWakeRuntime {
         const samples = ledger.samples[`${wait.companyId}:${wait.repo}`] ?? [];
         const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
         const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[wait.repo] ?? 30 * 60_000;
-        const verdict = evaluateReadiness(snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
-        if (verdict.kind === "pending") continue;
+        const graced = await this.readyGrace(github, wait.repo, wait.prNumber, pr.draft, snapshot, { registeredAt: wait.registeredAt, now: this.now(), medianMs, draft: pr.draft });
+        if (!graced || graced.verdict.kind === "pending") continue;
+        const { verdict } = graced;
         await this.checkBinding(wait);
         const freshConfig = await this.config(wait.companyId);
         if (!freshConfig.allowedRepos.includes(wait.repo) || freshConfig.dryRun !== config.dryRun || authIdentity(freshConfig) !== authIdentity(config)) throw new Error("configuration_changed");
@@ -650,6 +664,8 @@ export class CiWakeRuntime {
           }
           wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
         }
+        // A draft/ready toggle after the timeline read changes updated_at.
+        if (graced.consulted && (current.updatedAt == null || current.updatedAt !== pr.updatedAt)) continue;
         if (!verdict.missing.length && !samples.some((s) => s.sha === wait.headSha)) {
           const suites = relevantSuites(snapshot);
           const starts = suites.map((s) => s.createdAt).filter((n): n is number => n !== null);
@@ -732,9 +748,10 @@ export class CiWakeRuntime {
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
           const sorted = samples.map((s) => s.ms).sort((a, b) => a - b);
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
-          const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
+          const graced = await this.readyGrace(github, entry.repo, entry.prNumber, current.draft, snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
-          if (verdict.kind === "pending") continue;
+          if (!graced || graced.verdict.kind === "pending") continue;
+          const { verdict } = graced;
           // Mirror the CI path: re-read the live PR after the readiness
           // snapshot and before any wake intent. A push during the snapshot
           // must retarget the entry, never wake for the stale SHA.
@@ -754,6 +771,7 @@ export class CiWakeRuntime {
             entry.observedAt = this.now();
             await this.save(ledger); continue;
           }
+          if (graced.consulted && (checked.updatedAt == null || checked.updatedAt !== current.updatedAt)) continue;
           // Revalidate binding, enablement, allowlist, pr-head flags, dry-run
           // and the credential identity immediately after the final GitHub
           // read: an operator rollback (dryRun: true, disable, revoke) made

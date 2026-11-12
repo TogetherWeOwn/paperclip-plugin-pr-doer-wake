@@ -88,6 +88,8 @@ export interface CiPull {
   draft: boolean;
   merged: boolean;
   mergeable: boolean | null;
+  /** Epoch ms of GitHub's updated_at; a draft/ready toggle changes it. Null only if GitHub omits it. */
+  updatedAt: number | null;
 }
 export const GATES_CONTEXT = "paperclip/gates";
 export type GatesStatusState = "success" | "failure" | "error" | "pending";
@@ -101,7 +103,7 @@ export interface CiReadinessTiming {
   registeredAt: number;
   medianMs: number;
   draft?: boolean;
-  /** When the PR was first seen ready after being seen as a draft. */
+  /** Latest ready_for_review event time from the PR timeline (CiGithub.readySince). */
   readySince?: number;
 }
 export interface CiReadiness {
@@ -156,6 +158,7 @@ const ENDPOINT_TEMPLATES: ReadonlyArray<readonly [RegExp, string]> = [
   [/^\/app\/installations\/[1-9][0-9]{0,15}\/access_tokens$/, "token_exchange"],
   [/^\/orgs\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/repos$/, "org_repos"],
   [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/issues\/[1-9][0-9]*\/comments$/, "repo_issue_comments"],
+  [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/issues\/[1-9][0-9]*\/timeline$/, "repo_issue_timeline"],
   [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/pulls(?:\/[1-9][0-9]*)?$/, "repo_pulls"],
   [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/commits\/[a-fA-F0-9]{40}\/(?:check-runs|check-suites)$/, "repo_checks"],
   [/^\/repos\/[a-zA-Z0-9][a-zA-Z0-9-]{0,38}\/[a-zA-Z0-9_.-]+\/check-suites\/[1-9][0-9]*$/, "repo_checks"],
@@ -400,7 +403,22 @@ export class CiGithub {
       headRepo: head.repo === null ? null : repoName(text(object(head.repo).full_name)),
       baseBranch: branchName(text(base.ref)), author: text(object(raw.user).login),
       state: raw.state, draft: raw.draft, merged: raw.merged, mergeable: raw.mergeable,
+      updatedAt: timestamp(raw.updated_at),
     };
+  }
+
+  /** Latest ready_for_review time from the PR timeline, or undefined if it never left draft. */
+  async readySince(repo: string, prNumber: number): Promise<number | undefined> {
+    repo = repoName(repo);
+    if (!Number.isSafeInteger(prNumber) || prNumber <= 0) throw new CiGithubError("input");
+    let since: number | undefined;
+    for (const value of await this.pages(`/repos/${repo}/issues/${prNumber}/timeline`)) {
+      const event = object(value);
+      if (event.event !== "ready_for_review") continue;
+      const at = timestamp(event.created_at) ?? invalid();
+      since = Math.max(since ?? at, at);
+    }
+    return since;
   }
 
   async snapshot(repo: string, sha: string, baseBranch: string, appIds = new Map<string, number | null>()): Promise<CiSnapshot> {
@@ -816,7 +834,7 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   const settledSince = suites.length === 0 ? timing.registeredAt
     : completions.length === suites.length ? lastSuiteCompletedAt : null;
   // Checks that only run on ready PRs register after the draft flips, so
-  // missing-check grace restarts when the PR was last seen leaving draft.
+  // missing-check grace restarts when the PR last left draft.
   const missingSince = settledSince === null ? null : Math.max(settledSince, timing.readySince ?? settledSince);
   const missingFailAt = missingSince === null ? null : missingSince + 2 * timing.medianMs;
   const failed: string[] = [];

@@ -10,6 +10,7 @@ const github = vi.hoisted(() => ({
   construct: vi.fn(),
   pull: vi.fn(),
   snapshot: vi.fn(),
+  readySince: vi.fn(),
   readiness: vi.fn(),
 }));
 
@@ -21,6 +22,7 @@ vi.mock("../src/ci-github.js", async (importOriginal) => {
       constructor(...args: unknown[]) { github.construct(...args); }
       pull(...args: unknown[]) { return github.pull(...args); }
       snapshot(...args: unknown[]) { return github.snapshot(...args); }
+      readySince(...args: unknown[]) { return github.readySince(...args); }
     },
     // The runtime may retain a token-free cache, but never a token-bearing client.
     CiGithubCache: class {},
@@ -184,7 +186,15 @@ beforeEach(() => {
   github.pull.mockResolvedValue(pull());
   github.snapshot.mockResolvedValue({ suites: [], fixture: "snapshot comes only from GitHub, never from webhook conclusions" });
   github.readiness.mockReturnValue(verdict("pending"));
+  github.readySince.mockResolvedValue(undefined);
 });
+// A ready PR whose only required check never registered (no suites).
+async function missingOnly(sha = HEAD) {
+  const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+  github.snapshot.mockResolvedValue({ repo: REPO, sha, baseBranch: "main", fetchedAt: START,
+    required: [{ context: "review", appId: 8 }], statuses: [], suites: [], runs: [] });
+  github.readiness.mockImplementation(actual.evaluateReadiness);
+}
 
 describe("native CI plugin entrypoint", () => {
   it("registers the native tool and job, and routes tool, poll and webhook handlers through one runtime", async () => {
@@ -613,6 +623,71 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe(failure ? "woken" : "open");
   });
 
+  it("gives ready-only checks fresh grace from the ready_for_review event, then wakes", async () => {
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
+    h.advance(24 * 3_600_000);
+    github.readySince.mockResolvedValue(h.clock() - 30_000);
+    await h.runtime.poll();
+    expect(github.readySince).toHaveBeenCalledWith(REPO, 17);
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    h.advance(90_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("required check missing: review [app 8]") });
+  });
+
+  it("stays pending when the timeline read fails, then wakes a never-draft PR as before", async () => {
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    github.pull.mockResolvedValue(pull({ updatedAt: 5 }));
+    h.advance(180_000);
+    github.readySince.mockRejectedValueOnce(new Error("timeline unavailable"));
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([[5, 6], [null, null]])("does not wake when updated_at moves (or is absent) across the final read (%s -> %s)", async (before, after) => {
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    await missingOnly();
+    h.advance(180_000);
+    // A draft/ready toggle after the timeline read keeps draft=false but bumps updated_at.
+    github.pull.mockResolvedValueOnce(pull({ updatedAt: before })).mockResolvedValueOnce(pull({ updatedAt: after }));
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]?.status).toBe("open");
+    // A draft on the final read is retried; the next ready read sees the newer ready event.
+    github.pull.mockResolvedValueOnce(pull({ updatedAt: 5 })).mockResolvedValueOnce(pull({ updatedAt: 5, draft: true }));
+    await h.runtime.poll();
+    github.pull.mockResolvedValue(pull({ updatedAt: 7 }));
+    github.readySince.mockResolvedValue(h.clock() - 10_000);
+    await h.runtime.poll();
+    expect(h.requestWakeup).not.toHaveBeenCalled();
+  });
+
+  it("still wakes a real failure immediately without reading the timeline", async () => {
+    const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
+    const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
+    await h.runtime.register(registration, run);
+    github.snapshot.mockResolvedValue({ repo: REPO, sha: HEAD, baseBranch: "main", fetchedAt: START, statuses: [], suites: [],
+      required: [{ context: "review", appId: 8 }, { context: "build", appId: 7 }],
+      runs: [{ id: 1, name: "build", appId: 7, suiteId: null, status: "completed", conclusion: "failure" }] });
+    github.readiness.mockImplementation(actual.evaluateReadiness);
+    github.readySince.mockResolvedValue(START);
+    h.advance(180_000);
+    await h.runtime.poll();
+    expect(github.readySince).not.toHaveBeenCalled();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("does not wake a ready PR when required status identity is unverified", async () => {
     const actual = await vi.importActual<typeof import("../src/ci-github.js")>("../src/ci-github.js");
     const h = setup({ repoMedianMs: { [REPO]: 60_000 } });
@@ -722,6 +797,42 @@ describe("CI runtime polling and durable wake outcomes", () => {
       });
       expect((wake as { reason: string }).reason).toContain(NEXT_HEAD.slice(0, 7));
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("gives a reviewer's new head fresh grace from the ready_for_review event", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await missingOnly(NEXT_HEAD);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: 5 }));
+      await h.runtime.poll();
+      h.advance(3_600_000);
+      github.readySince.mockResolvedValue(h.clock() - 30_000);
+      await h.runtime.poll();
+      expect(github.readySince).toHaveBeenCalledWith(REPO, 17);
+      github.readySince.mockRejectedValueOnce(new Error("timeline unavailable"));
+      h.advance(90_000);
+      await h.runtime.poll();
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: 5 })).mockResolvedValueOnce(pull({ headSha: NEXT_HEAD, updatedAt: 6 }));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.values(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("CI fail") });
+    });
+
+    it("does not let a ready event older than the new head delay the reviewer wake", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false, repoMedianMs: { [REPO]: 60_000 } });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await missingOnly(NEXT_HEAD);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD, updatedAt: 5 }));
+      github.readySince.mockResolvedValue(START - 3_600_000);
+      await h.runtime.poll();
+      h.advance(120_000);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     });
 
     it("does not re-wake the same (card, SHA) whose dedupe record exists", async () => {
