@@ -69,6 +69,7 @@ tiers:
     - "tests/*auth*.test.ts"
     - "tests/ci-github.test.ts"
     - "tests/custody-config.test.ts"
+    - "tests/custody-github.test.ts"
     - "tests/gates-github.test.ts"
     - "tests/custody-policy.test.ts"
     - "tests/gates-decision.test.ts"
