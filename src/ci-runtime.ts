@@ -474,8 +474,10 @@ export class CiWakeRuntime {
         // records the change itself when the most recent prior wait for this
         // card/PR was for a different head (the live PR head was verified
         // above, so a differing prior head means the PR really moved).
+        // Later ledger entries win when registrations share a timestamp.
         const prior = ledger.waits
           .filter((w) => w.companyId === run.companyId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.issueId === registration.issueId)
+          .reverse()
           .sort((a, b) => b.registeredAt - a.registeredAt)[0];
         if (prior) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior.headSha, registration.headSha);
         ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });

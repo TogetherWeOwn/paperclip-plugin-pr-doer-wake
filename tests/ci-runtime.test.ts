@@ -891,6 +891,62 @@ describe("CI runtime polling and durable wake outcomes", () => {
       }
     });
 
+    it("retargets equal-time registrations after an ambiguous retry", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      github.readiness.mockReturnValue(verdict("pass"));
+      let sequence = 0;
+      async function registerHead(headSha: string) {
+        const runId = `33333333-3333-4333-8333-${String(++sequence).padStart(12, "0")}`;
+        h.ownership.runId = runId;
+        github.pull.mockResolvedValue(pull({ headSha }));
+        const result = await h.runtime.register({ ...registration, headSha }, { ...run, runId });
+        expect(waitData(result).status).toBe("open");
+      }
+      await registerHead(HEAD);
+      await registerHead(NEXT_HEAD);
+      Object.assign(h.issue, { workProducts: [prWorkProduct, null] });
+      await h.runtime.poll();
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
+      Object.assign(h.issue, { workProducts: [prWorkProduct] });
+      await registerHead(HEAD);
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ oldSha: NEXT_HEAD, newSha: HEAD });
+      await h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+      const calls = h.requestWakeup.mock.calls.filter((call) =>
+        String((call[2] as { reason: string }).reason).startsWith("pr_head_changed:"));
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![2]).toMatchObject({ reason: `pr_head_changed: ${REPO}#17 observed head ${NEXT_HEAD.slice(0, 7)} -> ${HEAD.slice(0, 7)}; CI pass` });
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("characterizes a second card registering while an ambiguous head is pending", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const secondIssue = "00000000-0000-4000-8000-000000000099";
+      h.assertCheckoutOwner.mockImplementation(async () => {});
+      h.issueGet.mockImplementation(async (id: string) => ({
+        ...clone(h.issue), id, workProducts: id === ISSUE ? [prWorkProduct, null] : [prWorkProduct],
+      }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      let sequence = 0;
+      async function registerHead(issueId: string, headSha: string) {
+        h.advance(1);
+        const runId = `33333333-3333-4333-8333-${String(++sequence).padStart(12, "0")}`;
+        github.pull.mockResolvedValue(pull({ headSha }));
+        const result = await h.runtime.register({ ...registration, issueId, headSha }, { ...run, runId });
+        expect(waitData(result).status).toBe("open");
+      }
+      await registerHead(ISSUE, HEAD);
+      await registerHead(ISSUE, NEXT_HEAD);
+      await h.runtime.poll();
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
+      await registerHead(secondIssue, "c".repeat(40));
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
+      const fourthHead = "d".repeat(40);
+      await registerHead(secondIssue, fourthHead);
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ oldSha: NEXT_HEAD, newSha: fourthHead });
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
