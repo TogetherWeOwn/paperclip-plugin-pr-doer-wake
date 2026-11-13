@@ -24,7 +24,8 @@ def validate(images, reference):
     image_id = image["Id"]
     if not isinstance(image_id, str) or not IMAGE_ID.fullmatch(image_id):
         raise ValueError("invalid image ID")
-    if reference not in (image["RepoDigests"] or []):
+    digests = image["RepoDigests"]
+    if not isinstance(digests, list) or reference not in digests:
         raise ValueError("image does not carry the expected registry digest")
     if image["Os"] != "linux" or image["Architecture"] != "amd64":
         raise ValueError("unexpected image platform")

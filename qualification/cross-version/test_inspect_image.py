@@ -17,6 +17,14 @@ class InspectImageTest(unittest.TestCase):
     def test_accepts_exact_digest_and_returns_id(self):
         self.assertEqual(module.validate([self.image], self.reference), self.image["Id"])
 
+    def test_rejects_malformed_digest_collection_and_substring_entry(self):
+        for digests in (self.reference, "prefix" + self.reference + "suffix",
+                        ["prefix" + self.reference + "suffix"], None, {}):
+            with self.subTest(digests=digests), self.assertRaises(ValueError):
+                image = copy.deepcopy(self.image)
+                image["RepoDigests"] = digests
+                module.validate([image], self.reference)
+
     def test_rejects_unpinned_reference(self):
         for reference in ("node:24", "node@sha256:short", "NODE@sha256:" + "a" * 64):
             with self.subTest(reference=reference), self.assertRaises(ValueError):
