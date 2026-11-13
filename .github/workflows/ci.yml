@@ -34,6 +34,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - run: node --test tests/package-artifact.test.mjs
+      # Disconnected model only; this does not run retained packages or a controller.
+      - run: node --test qualification/synthetic-fence/fence.test.mjs
       - name: Pack and validate installable package
         run: node scripts/retain-package.mjs "$RUNNER_TEMP/ci-wake-artifact"
         env:
