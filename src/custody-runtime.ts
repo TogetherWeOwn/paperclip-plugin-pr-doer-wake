@@ -295,33 +295,15 @@ export class CustodyRuntime {
       // Phase B: explicit-tier mapping over metadata only, then bounded
       // evidence loads for mapped candidates only.
       const cardsById = new Map(cards.map((c) => [c.id, c]));
-      // Enrich work-product bindings for every card in a project that owns
-      // at least one inventoried repo, plus any card the index already
-      // knows. A card bound to a PR only by a work product (a dormant/done
-      // card with no registration, workspace branch, URL text or tracker
-      // identifier) is discoverable only through this tier, so enrichment
-      // must reach cards the cold ledger has never seen — restricting it
-      // to index-known cards would leave such cards unmapped forever
-      // while the tick still reports complete=true. Every eligible card
-      // is enriched each tick, bounded by the existing host-read and tick
-      // budgets (guard throws fail closed as a surfaced inventory
-      // failure); event subscriptions only accelerate discovery between
-      // ticks. A missing/unreadable workProducts field is UNKNOWN, never
-      // treated as proven-absent (see parseWorkProductBindings). Projectless
-      // cards are enriched too: the work-product tier itself has no project
-      // gate, so skipping them would leave projectless work-product-only
-      // cards unmapped while the tick reports complete=true.
-      const enrichIds = new Set<string>(Object.values(ledger.prToCards));
-      for (const card of cards) {
-        if (card.projectId === null) enrichIds.add(card.id);
-        else if ([...(reposByProject.get(card.projectId) ?? [])].some((repo) => monitored.has(repo))) enrichIds.add(card.id);
-      }
+      // Work-product ownership has no project restriction. Every company card
+      // must be read within the existing host/time budgets before ownership
+      // effects can be trusted.
+      const enrichIds = new Set(cards.map((card) => card.id));
       // A failed/absent enrichment read could hide the true work-product
       // owner, so any such UNKNOWN bars ownership effects this tick (fail
       // closed): mapping and discovery persist, dispatch is deferred.
       let enrichmentUnknown = false;
       const omitted: string[] = [];
-      let tierServed = false;
       for (const cardId of enrichIds) {
         const card = cardsById.get(cardId);
         if (!card) continue;
@@ -333,21 +315,17 @@ export class CustodyRuntime {
           // data, exactly like an omitted field, so it joins the tier decision below.
           if (fresh === null) { omitted.push(cardId); continue; }
           if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
-          // The host omits workProducts from issue reads (Paperclip 1106); see
-          // the tier decision after this loop. A present but malformed field fails closed.
           if (!("workProducts" in fresh) || (fresh as { workProducts?: unknown }).workProducts === undefined) { omitted.push(cardId); continue; }
-          tierServed = true;
           const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
           if (bindings === null) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
           card.workProducts = bindings;
-        } catch { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
+        } catch (error) {
+          unknown(`work_product:${cardId}`); enrichmentUnknown = true;
+          if (error instanceof Error && error.message === "custody_tick_budget") break;
+        }
       }
-      // Omitted or unreadable on every read: the tier is unavailable, so map
-      // through the remaining tiers. Served on some reads: an unread binding
-      // could outrank a lower-tier match, so those cards are UNKNOWN and
-      // effects are deferred.
-      if (omitted.length && tierServed) for (const cardId of omitted) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
-      else if (omitted.length) audit("inventory", "work_product_tier_unavailable");
+      // Universal omission cannot prove that a higher-tier owner is absent.
+      for (const cardId of omitted) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
       const candidates = new Map<string, CustodyCard>();
       const seenPrs = new Set<string>();
       for (const [, inv] of inventories) {
@@ -582,6 +560,8 @@ export class CustodyRuntime {
           guard();
           const fresh = await this.ctx.issues.get(card.id, config.companyId);
           if (!fresh || fresh.companyId !== config.companyId || fresh.projectId !== card.projectId || fresh.status !== card.status || fresh.assigneeAgentId !== card.assigneeAgentId || fresh.assigneeUserId !== card.assigneeUserId) throw new Error("card_changed");
+          const freshBindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
+          if (!freshBindings || JSON.stringify(freshBindings) !== JSON.stringify(card.workProducts)) throw new Error("card_ownership_changed");
           guard();
           const relations = await this.ctx.issues.relations.get(card.id, config.companyId);
           const eligible = ["todo", "in_progress", "in_review"].includes(fresh.status) && fresh.assigneeAgentId && !fresh.assigneeUserId && !relations.blockedBy.some((b) => b.status !== "done");

@@ -5,7 +5,7 @@ import { CustodyGithub } from "../src/custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
 import { CUSTODY_ORIGIN, DAY, hasCardClosure, hasPrClosure, latestDisposition } from "../src/custody-policy.js";
-vi.mock("../src/custody-reader.js", () => ({ custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
+vi.mock("../src/custody-reader.js", async (importOriginal) => ({ ...await importOriginal<typeof import("../src/custody-reader.js")>(), custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn() }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const ISSUE = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -1087,6 +1087,27 @@ describe("coverage, summary and cursor controls", () => {
 });
 
 describe("work-product discovery from a cold ledger", () => {
+  it("fails closed on malformed ownership with the real reader", async () => {
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42" };
+    const h = fixture({ cards: [card({ workProducts: [binding, null] as any })], open: [pull({ headBranch: "feature/change" })] });
+    const real = await vi.importActual<typeof import("../src/custody-reader.js")>("../src/custody-reader.js");
+    vi.mocked(loadCustodyCards).mockImplementation(real.loadCustodyCards);
+    vi.mocked(loadCustodyTexts).mockImplementation(real.loadCustodyTexts);
+    const query = vi.fn(async (sql: string) => sql.includes("FROM public.issues") ? [{
+      id: ISSUE, company_id: COMPANY, project_id: PROJECT, identifier: "TASK-42", title: "Change",
+      description: null, status: "in_progress", status_version: 2, assignee_agent_id: ISSUE,
+      assignee_user_id: null, origin_kind: "manual", conversation_agent_id: null, conversation_user_id: null,
+      conversation_state: null, updated_at: new Date(NOW), completed_at: null, cancelled_at: null,
+    }] : []);
+    Object.assign(h.ctx, { db: { query } });
+    await h.runtime.poll();
+    expect(query).toHaveBeenCalled();
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.unknown).toContain(`work_product:${ISSUE}`);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+  });
   it("maps a work-product-only card in one tick from an empty ledger", async () => {
     // A dormant card bound to its PR only by a native work product: no
     // registration, workspace-branch, title/description URL or tracker
@@ -1109,6 +1130,57 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: "example/project#42", mapping: "work_product", cardId: ISSUE })]);
     expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
     expect(h.ledger().report.complete).toBe(true);
+  });
+  it("finds a work-product owner outside the repository project", async () => {
+    const otherProject = "cccccccc-0000-4000-8000-000000000002";
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: null, status: null };
+    const owner = card({ projectId: otherProject, workProducts: [binding] });
+    const h = fixture({ cards: [owner], open: [pull({ headBranch: "feature/change" })] });
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId) => projectId === otherProject ? [] : [{ projectId, repoUrl: "https://github.com/example/project" }]);
+    await h.runtime.poll();
+    expect(h.ctx.issues.get).toHaveBeenCalledWith(ISSUE, COMPANY);
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ mapping: "work_product", cardId: ISSUE })]);
+  });
+  it.each([true, false])("stops native effects and cursor advancement when enrichment exhausts the real guard (mapped: %s)", async (mapped) => {
+    const second = card({ id: "00000000-0000-4000-8000-0000000000aa", projectId: null });
+    const h = fixture({ cards: [card(), second], open: [pull({ headBranch: mapped ? `work/${ISSUE}` : "feature/unmapped" })] });
+    const get = h.ctx.issues.get.getMockImplementation()!;
+    h.ctx.issues.get.mockImplementation(async (id) => {
+      const result = await get(id);
+      h.advance(240_000);
+      return result;
+    });
+    const real = await vi.importActual<typeof import("../src/custody-reader.js")>("../src/custody-reader.js");
+    vi.mocked(loadCustodyTexts).mockImplementation(real.loadCustodyTexts);
+    if (mapped) await expect(h.runtime.poll()).rejects.toThrow("custody_tick_budget");
+    else await h.runtime.poll();
+    expect(h.ctx.issues.get).toHaveBeenCalledTimes(1);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.unknown).toContain(`work_product:${second.id}`);
+    expect(h.ledger().prToCards).toEqual(mapped ? { "example/project#42": ISSUE } : {});
+    expect(h.ctx.state.set).toHaveBeenCalled();
+    expect(h.ledger().heads).toEqual({});
+    expect(h.ledger().attempted).toEqual(mapped ? {} : { "example/project": NOW + 240_000 });
+    expect(h.ledger().cursors).toEqual({});
+    expect(h.ledger().receipts).toEqual({});
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+  });
+  it.each([undefined, [null], [{ type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42" }]])("defers dispatch when ownership changes or becomes unreadable at revalidation: %j", async (workProducts) => {
+    const h = fixture();
+    const get = h.ctx.issues.get.getMockImplementation()!;
+    let reads = 0;
+    h.ctx.issues.get.mockImplementation(async (id) => {
+      const result = await get(id);
+      return ++reads === 1 ? result : { ...result!, workProducts };
+    });
+    await h.runtime.poll();
+    expect(reads).toBe(2);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
   it("defers all effects when a work-product enrichment read fails", async () => {
     // A failed enrichment could hide the true work-product owner, so a
@@ -1148,9 +1220,8 @@ describe("work-product discovery from a cold ledger", () => {
     await h.restart().poll();
     expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
   });
-  it("treats workProducts omitted on every read as tier-unavailable: no UNKNOWN, effects not deferred", async () => {
-    // Paperclip 1106 omits workProducts from issue reads; plugins cannot read
-    // issue_work_products. The tier is skipped, lower tiers still map.
+  it("defers effects when workProducts is omitted on every read", async () => {
+    // Universal omission cannot prove the absence of a higher-tier owner.
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
     const other = card({ id: "00000000-0000-4000-8000-0000000000aa", identifier: "TASK-43" });
     const h = fixture({ cards: [urlCard, other] });
@@ -1158,10 +1229,11 @@ describe("work-product discovery from a cold ledger", () => {
     await h.runtime.poll();
     // Every candidate is still read: one omission is not proof for the others.
     expect(h.ctx.issues.get.mock.calls.filter((c: unknown[]) => c[0] === other.id)).toHaveLength(1);
-    expect(h.ledger().report.unknown.filter((u: string) => u.startsWith("work_product:"))).toEqual([]);
-    expect(h.ledger().audits).toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "work_product_tier_unavailable" }));
-    expect(h.ledger().audits).not.toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "unknown" }));
+    expect(h.ledger().report.unknown).toEqual(expect.arrayContaining([`work_product:${ISSUE}`, `work_product:${other.id}`]));
+    expect(h.ledger().report.complete).toBe(false);
     expect(h.ledger().report.rows[0]).toMatchObject({ cardId: ISSUE });
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
   });
   it("fails closed when workProducts is omitted on some reads but served on others", async () => {
     // A lower-tier title URL must not claim a PR while an unread binding could outrank it.
@@ -1186,12 +1258,11 @@ describe("work-product discovery from a cold ledger", () => {
     const base = { companyId: COMPANY, projectId: PROJECT, title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null };
     h.ctx.issues.get.mockImplementation(async (id: string) => id === hidden.id ? null : { ...base, id, identifier: "TASK-42" });
     await h.runtime.poll();
-    expect(h.ledger().report.unknown.filter((u: string) => u.startsWith("work_product:"))).toEqual([]);
-    expect(h.ledger().audits).toContainEqual(expect.objectContaining({ operation: "inventory", outcome: "work_product_tier_unavailable" }));
+    expect(h.ledger().report.unknown).toEqual(expect.arrayContaining([`work_product:${ISSUE}`, `work_product:${hidden.id}`]));
     expect(h.ledger().report.rows[0]).toMatchObject({ cardId: ISSUE });
-    // Dispatch is not gated: the idle PR's owner card is woken.
-    expect(h.ledger().report.complete).toBe(true);
-    expect(h.ledger().report.effects).toBeGreaterThan(0);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.effects).toBe(0);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
   it("fails closed on an unreadable card when another read serves the tier", async () => {
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
@@ -1204,7 +1275,7 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().report.complete).toBe(false);
     expect(h.ledger().report.effects).toBe(0);
   });
-  it.each([null, "not-an-array", { type: "pull_request" }])("fails closed on a present but malformed workProducts field: %j", async (malformed) => {
+  it.each([null, "not-an-array", { type: "pull_request" }, [null], [{}], [{ type: "pull_request", provider: "github", metadata: { number: "42" } }]])("fails closed on a present but malformed workProducts field: %j", async (malformed) => {
     const urlCard = card({ texts: [{ id: "title", body: "see https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
     const h = fixture({ cards: [urlCard] });
     h.ctx.issues.get.mockImplementation(async () => ({ id: ISSUE, companyId: COMPANY, projectId: PROJECT, identifier: "TASK-42", title: "Change", description: null, status: "in_progress", statusVersion: 2, assigneeAgentId: ISSUE, assigneeUserId: null, updatedAt: NOW - 10 * DAY, completedAt: null, cancelledAt: null, workProducts: malformed }));

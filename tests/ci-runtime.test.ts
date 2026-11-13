@@ -777,6 +777,21 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup.mock.calls.filter((c) => String((c[2] as { reason?: string }).reason).includes("#17"))).toHaveLength(0);
     });
 
+    it.each([
+      null, {}, { type: "pull_request", provider: "github", metadata: { number: "17" } },
+      { type: "pull_request", provider: "github", metadata: { repo: REPO } },
+      { type: "pull_request", provider: "github", url: `https://github.com/${REPO}/pull/17`, metadata: { repo: REPO, number: 18 } },
+    ])("does not wake when supplied work products contain an unclassifiable entry: %j", async (malformed) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      Object.assign(h.issue, { workProducts: [prWorkProduct, malformed] });
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().reviewerWakes ?? {})).toHaveLength(0);
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);

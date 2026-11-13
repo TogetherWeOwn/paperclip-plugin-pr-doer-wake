@@ -382,9 +382,7 @@ describe("loadCustodyCards", () => {
   });
 
   it("parses only explicit GitHub pull-request work-product bindings", () => {
-    // A missing field is null (fail-closed UNKNOWN), never a silent []: the
-    // host detail route always returns an array, so absence means the field
-    // was not supplied and no proven "no bindings" claim can be made.
+    // Missing fields cannot prove the absence of an ownership binding.
     expect(parseWorkProductBindings(undefined)).toBeNull();
     expect(parseWorkProductBindings(null)).toBeNull();
     expect(parseWorkProductBindings("nope")).toBeNull();
@@ -393,8 +391,25 @@ describe("loadCustodyCards", () => {
       { type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 }, externalId: "acme/widgets#7", status: "ready_for_review" },
       { type: "branch", provider: "github", url: null, metadata: null },
       { type: "pull_request", provider: "vercel", url: "x", metadata: null },
-      null, "junk", 42,
     ]);
     expect(parsed).toEqual([{ type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 7 }, externalId: "acme/widgets#7", status: "ready_for_review" }]);
+    for (const binding of [
+      { url: "https://github.com/Acme/widgets/pull/7", metadata: { repo: "acme/widgets" } },
+      { url: null, metadata: { repo: "acme/widgets", number: 7 } },
+      { url: "https://github.com/acme/widgets/pull/7", metadata: null },
+    ]) expect(parseWorkProductBindings([{ type: "pull_request", provider: "github", ...binding }])).toHaveLength(1);
+  });
+
+  it.each([
+    null, "junk", 42, {}, { type: "pull_request" },
+    { type: "pull_request", provider: "github", url: 42 },
+    { type: "pull_request", provider: "github", metadata: [] },
+    { type: "pull_request", provider: "github", metadata: { repo: 7 } },
+    { type: "pull_request", provider: "github", metadata: { number: "7" } },
+    { type: "pull_request", provider: "github", metadata: { repo: "acme/widgets" } },
+    { type: "pull_request", provider: "github", metadata: { number: 7 } },
+    { type: "pull_request", provider: "github", url: "https://github.com/acme/widgets/pull/7", metadata: { repo: "acme/widgets", number: 8 } },
+  ])("treats an unclassifiable work product as unknown: %j", (entry) => {
+    expect(parseWorkProductBindings([entry])).toBeNull();
   });
 });
