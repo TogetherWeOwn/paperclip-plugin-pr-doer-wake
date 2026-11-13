@@ -122,9 +122,7 @@ it("observes the pinned worker-to-host sequential revision contract", async () =
     }
     const saved = await handlers["issues.documents.get"]({ companyId, issueId, key: "plan" }, { invocationScope: { companyId } } as any);
     expect(saved).toMatchObject({ key: "plan", body: process.env.CUSTODY_EXPECTATION === "candidate" ? "v2" : "v1", latestRevisionNumber: process.env.CUSTODY_EXPECTATION === "candidate" ? 2 : 1 });
-    if (process.env.CUSTODY_EXPECTATION === "candidate") {
-      expect(saved!.latestRevisionId).toBe(updatedRevisionId);
-    }
+    if (process.env.CUSTODY_EXPECTATION === "candidate") expect(saved?.latestRevisionId).toBe(updatedRevisionId);
     console.info("sequential-control", JSON.stringify({ expectation: process.env.CUSTODY_EXPECTATION, created: { key: created.key, body: created.body, revision: created.latestRevisionId }, saved: { key: saved?.key, body: saved?.body, revision: saved?.latestRevisionId }, forwardedRevision: forwarded[1]?.baseRevisionId ?? null }));
     if (process.env.CUSTODY_EXPECTATION === "candidate") {
       startedCases.add("invalid-base-writes");
