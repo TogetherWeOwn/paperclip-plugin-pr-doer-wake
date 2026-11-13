@@ -1,0 +1,94 @@
+name: custody revision sequential control
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/custody-revision-control.yml'
+      - 'qualification/custody-revision/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custody-control-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sequential-control:
+    name: sequential control (${{ matrix.expectation }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - expectation: baseline
+            source: d69631b01b9c658f80bf8bed389863dce82643e1
+            package: 95a615e405dd5cb78c9f1fb507ba21609c1f019f
+            lock: 95c28f080c25654038e6e4ed641a017835f7eea4
+            server: 3181ae0f200be6cc017d175792a93332b1ebcee6
+            sdk: 1dd9473bdc6296126230ffd9320d480e0ae596b8
+          - expectation: candidate
+            source: b16659aa154cd6aa7f0f2ec97bae3ebb6154200f
+            package: 16132aeaae27c4e4ea0db36ad5a53f8d7cc98ae3
+            lock: 88daa34971ee35ec7e86d749cf3e90fc9e28ea7f
+            server: e7d9b3f6102bc45a1a21c86a60d2fab4feaf4f05
+            sdk: 3b216adea1b2e1f5a2e3a01bf6680cc6aee66ad4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: paperclipai/paperclip
+          ref: ${{ matrix.source }}
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Verify source and fixture identities
+        working-directory: upstream
+        env:
+          SOURCE: ${{ matrix.source }}
+          PACKAGE: ${{ matrix.package }}
+          LOCK: ${{ matrix.lock }}
+          SERVER: ${{ matrix.server }}
+          SDK: ${{ matrix.sdk }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+          test "$(git hash-object package.json)" = "$PACKAGE"
+          test "$(git hash-object pnpm-lock.yaml)" = "$LOCK"
+          test "$(git hash-object server/package.json)" = "$SERVER"
+          test "$(git hash-object packages/plugins/sdk/package.json)" = "$SDK"
+          test "$(git hash-object LICENSE)" = a63594a5150d0ae00c3ddc36b61fa8f708c3ca8c
+          node -e 'const p=require("./package.json"); if(p.name!=="paperclip" || p.packageManager!=="pnpm@9.15.4") process.exit(1)'
+          printf 'source=%s package=%s lock=%s server=%s sdk=%s license=MIT\n' "$SOURCE" "$PACKAGE" "$LOCK" "$SERVER" "$SDK"
+          sha256sum ../control/qualification/custody-revision/sequential-control.test.ts
+      - name: Install and prepare pinned source
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          cp ../control/qualification/custody-revision/sequential-control.test.ts server/src/__tests__/custody-revision-control.test.ts
+      - name: Run mandatory sequential control
+        working-directory: upstream
+        env:
+          CUSTODY_EXPECTATION: ${{ matrix.expectation }}
+        run: |
+          set -euo pipefail
+          pnpm exec vitest run server/src/__tests__/custody-revision-control.test.ts --reporter=verbose 2>&1 | tee "$RUNNER_TEMP/custody-control.log"
+      - name: Retain control output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: custody-control-${{ matrix.expectation }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/custody-control.log
+          if-no-files-found: warn
+          retention-days: 7
