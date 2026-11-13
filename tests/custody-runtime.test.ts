@@ -4,8 +4,8 @@ import type { CustodyPull } from "../src/custody-github.js";
 import { CustodyGithub } from "../src/custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
-import { CUSTODY_ORIGIN, DAY } from "../src/custody-policy.js";
-vi.mock("../src/custody-reader.js", () => ({ loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
+import { CUSTODY_ORIGIN, DAY, hasCardClosure, hasPrClosure, latestDisposition } from "../src/custody-policy.js";
+vi.mock("../src/custody-reader.js", () => ({ custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const ISSUE = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -84,9 +84,32 @@ describe("custody native effects", () => {
     expect(h.ctx.issues.create).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ reason: "pr_disposition_due", idempotencyKey: `example/project#42|idle|${NOW - 8 * DAY}` }));
     expect(h.docs.get(ISSUE).body).toContain("Head: " + "a".repeat(40));
+    expect(h.docs.get(ISSUE).body).toContain("disposition in a comment on the source card");
+    expect(h.docs.get(ISSUE).body).toContain("PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD");
+    expect(h.docs.get(ISSUE).body).toContain("Closed unmerged: <reason>; source owner/repo#number");
     await h.restart().poll();
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.ledger().report.complete).toBe(true);
+  });
+  it("provides directives that the policy accepts when placeholders are filled", async () => {
+    const h = fixture();
+    await h.runtime.poll();
+    const guidance = h.docs.get(ISSUE).body as string;
+    const directive = guidance.match(/`(PR disposition:[^`]+)`/)![1]!
+      .replace("owner/repo#number", "example/project#42")
+      .replace("finish|rework|defer|close", "defer")
+      .replace("<actor>", "reviewer")
+      .replace("YYYY-MM-DD", "2026-11-01");
+    const closure = guidance.match(/`(Closed unmerged:[^`]+)`/)![1]!
+      .replace("<reason>", "superseded")
+      .replace("owner/repo#number", "example/project#42");
+    const source = card({ texts: [{ id: "comment:1", body: `${directive}\n${closure}`, at: NOW, ownership: false }] });
+    expect(latestDisposition(source, pull())).toEqual(expect.objectContaining({ action: "defer", revisit: Date.parse("2026-11-01T00:00:00Z") }));
+    expect(hasCardClosure(source, pull())).toBe(true);
+    const prClosure = guidance.match(/`(Closed unmerged: <duplicate of\|[^`]+)`/)![1]!
+      .replace("<duplicate of|superseded by|need lost|mismatch|burden>", "superseded by")
+      .replace("<reason>", "another PR");
+    expect(hasPrClosure([prClosure])).toBe(true);
   });
   it.each(["done", "cancelled", "backlog", "blocked"])("creates explicit todo child and wake for %s source", async (status) => {
     const h = fixture({ cards: [card({ status })] });
@@ -141,7 +164,9 @@ describe("custody native effects", () => {
     const h = fixture();
     h.ctx.issues.requestWakeup.mockRejectedValue(new Error("synthetic-provider-token must never be logged"));
     await h.runtime.poll();
+    h.docs.set(ISSUE, { body: "Legacy guidance" });
     await h.restart().poll();
+    expect(h.docs.get(ISSUE).body).toBe("Legacy guidance");
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "unconfirmed" })]);
     expect(JSON.stringify([...h.state.values()])).not.toContain("synthetic-provider-token");
@@ -291,6 +316,7 @@ describe("coverage, summary and cursor controls", () => {
     const h = fixture();
     await h.runtime.poll();
     expect(loadCustodyTexts).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(loadCustodyTexts).mock.calls[0]![4]).toBe(vi.mocked(loadCustodyCards).mock.calls[0]![3]);
     const selected = vi.mocked(loadCustodyTexts).mock.calls[0]![3];
     expect(selected.map((c) => c.id)).toEqual([ISSUE]);
     expect(h.ledger().report.complete).toBe(true);
@@ -827,7 +853,7 @@ describe("coverage, summary and cursor controls", () => {
   });
   it.each([false, true])("compacts settled history without losing clocks or replaying effects (uncertain wake: %s)", async (uncertain) => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
-    const owner = card({ texts: [{ id: "description", body, at: NOW - 10 * DAY, ownership: true }] });
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
     const prs = [pull()];
     const h = fixture({ cards: [owner], open: prs });
     if (uncertain) h.ctx.issues.requestWakeup.mockRejectedValueOnce(new Error("reply lost"));
