@@ -50,8 +50,8 @@ interface Audit { at: number; operation: string; runId?: string; companyId?: str
  * A settled-candidate head change for a PR that still owes reviewer wakes.
  * Persisted so an unsettled head observed in one tick is rechecked (and
  * woken) on a later tick even after every wait for the old head retired.
- * `oldSha` is the head the reviewer last saw; `newSha` is the head now
- * awaiting settlement. `shadowLogged` records the candidate cards already
+ * `oldSha` is a previously observed head, not a per-reviewer last-seen head;
+ * `newSha` is the head now awaiting settlement. `shadowLogged` records cards already
  * shadow-logged for this entry, so a candidate that becomes eligible later
  * is still logged once. A legacy `true` (pre-per-candidate ledger) is
  * migrated to `["*"]` — no candidate is re-logged for that old entry.
@@ -723,8 +723,8 @@ export class CiWakeRuntime {
           const current = await github.pull(entry.repo, entry.prNumber);
           if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
           if (current.headSha !== entry.newSha) {
-            // Newer push superseded the pending head: re-target, keeping the
-            // oldest oldSha the reviewer last saw.
+            // Newer push superseded the pending head: record the previously
+            // observed head and retarget without claiming per-reviewer history.
             entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
             await this.save(ledger); continue;
           }
@@ -741,15 +741,15 @@ export class CiWakeRuntime {
           const checked = await github.pull(entry.repo, entry.prNumber);
           if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
           if (checked.headSha !== entry.newSha) {
-            // Newer push superseded the pending head: re-target, keeping the
-            // oldest oldSha the reviewer last saw.
+            // Newer push superseded the pending head: record the previously
+            // observed head and retarget without claiming per-reviewer history.
             entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
             await this.save(ledger); continue;
           }
           if (checked.draft !== current.draft) continue;
           if (checked.baseBranch !== current.baseBranch) {
-            // Base-only edit: the head the reviewer last saw is unchanged, so
-            // keep oldSha/newSha (never collapse them into a meaningless
+            // Base-only edit: the observed head is unchanged, so keep
+            // oldSha/newSha (never collapse them into a meaningless
             // same-SHA wake) and retry against the new base next tick.
             entry.observedAt = this.now();
             await this.save(ledger); continue;
@@ -797,7 +797,7 @@ export class CiWakeRuntime {
               catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
             }
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
-            const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
+            const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} observed head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
               entry.shadowLogged ??= [];
               if (!entry.shadowLogged.includes(issueId) && !entry.shadowLogged.includes("*")) {

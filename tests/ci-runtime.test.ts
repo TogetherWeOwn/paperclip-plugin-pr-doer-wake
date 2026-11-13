@@ -820,6 +820,36 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
+    it.each(["first", "second"])("reports observed heads after an ambiguous candidate and a %s-read retarget", async (read) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const unknownId = "00000000-0000-4000-8000-000000000099";
+      let repaired = false;
+      h.issueGet.mockImplementation(async (id: string) => ({
+        ...clone(h.issue), id, workProducts: id === unknownId && !repaired ? [prWorkProduct, null] : [prWorkProduct],
+      }));
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [ISSUE, unknownId].map((issueId) => ({ companyId: COMPANY, repo: REPO, prNumber: 17, issueId, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" })) as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.map((call) => call[0])).toEqual([ISSUE]);
+      const thirdHead = "c".repeat(40);
+      if (read === "second") github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD }));
+      github.pull.mockResolvedValue(pull({ headSha: thirdHead }));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      repaired = true;
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.map((call) => call[0])).toEqual([ISSUE, ISSUE, unknownId]);
+      for (const call of h.requestWakeup.mock.calls.slice(1)) {
+        expect(call[2]).toMatchObject({ reason: `pr_head_changed: ${REPO}#17 observed head ${NEXT_HEAD.slice(0, 7)} -> ${thirdHead.slice(0, 7)}; CI pass` });
+      }
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
