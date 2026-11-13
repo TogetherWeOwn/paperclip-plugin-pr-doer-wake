@@ -69,7 +69,7 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   if (workspace) return workspace;
   // Explicit native work-product PR bindings (host-supplied issue_work_products
   // via Issue.workProducts). Revalidated exactly: a binding matches only when
-  // its URL is a token-exact match for this PR, or when metadata carries
+  // its URL identifies this PR exactly, or when metadata carries
   // BOTH repo and number, both equal to this PR. Partial metadata (empty
   // object, repo-only, number-only) with no matching URL never matches, so
   // one malformed binding cannot claim an unrelated PR. A URL naming a
@@ -78,7 +78,7 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   // retained on the binding; they play no role in identity matching.
   const workProduct = pick("work_product", eligible.filter((c) => (c.workProducts ?? []).some((w) => {
     if (w.type !== "pull_request" || w.provider !== "github") return false;
-    const urlOk = w.url !== null && containsPrUrl(w.url, pr);
+    const urlOk = w.url !== null && prRefFromUrl(w.url) === prIndexRef(pr);
     if (w.url !== null && !urlOk) return false;
     const meta = w.metadata;
     const metaRepo = meta && typeof meta.repo === "string" ? meta.repo : null;

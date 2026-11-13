@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CustodyCard } from "../src/custody-reader.js";
+import { parseWorkProductBindings, type CustodyCard } from "../src/custody-reader.js";
 import type { CustodyPull } from "../src/custody-github.js";
 import { containsPrUrl, custodyTriggers, DAY, hasCardClosure, hasPrClosure, latestDisposition, mapCustodyCard } from "../src/custody-policy.js";
 import { parseCustodyConfig, validateCustodyConfig } from "../src/custody-config.js";
@@ -72,6 +72,13 @@ describe("custody ownership is conservative and ordered", () => {
     const ambiguous = map(pr, [card({ workProducts: [binding] }), card({ id: PROJECT, workProducts: [binding] })]);
     expect(ambiguous.card).toBeNull();
     expect(ambiguous.source).toBe("work_product");
+  });
+  it("normalizes a parsed work-product PR number before selecting a lower-tier URL owner", () => {
+    const bindings = parseWorkProductBindings([{ type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/042" }]);
+    expect(bindings).not.toBeNull();
+    const owner = card({ workProducts: bindings! });
+    const other = card({ id: PROJECT, texts: [{ id: "title", body: "https://github.com/example/project/pull/42", at: NOW, ownership: true }] });
+    expect(map(pull({ headBranch: "feat/change" }), [owner, other])).toMatchObject({ source: "work_product", card: owner });
   });
   it("rejects partial work-product metadata with no matching URL (empty, repo-only, number-only)", () => {
     const pr = pull({ headBranch: "feat/change" });

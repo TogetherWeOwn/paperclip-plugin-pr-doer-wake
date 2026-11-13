@@ -30,7 +30,7 @@ type HostCall = { method: string; params: Record<string, unknown> };
  * resolveRequiredCompanyId refuses it during scheduled (proactive, company-less)
  * job invocations. No SDK mock, no host/core, and no network are involved.
  */
-type InventoryFixture = { issues: Record<string, unknown>[]; comments: Record<string, unknown>[]; open?: boolean };
+type InventoryFixture = { issues: Record<string, unknown>[]; comments: Record<string, unknown>[]; open?: boolean; workProducts?: Record<string, unknown> };
 
 async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig, inventory?: InventoryFixture) {
   // One worker process per plugin: reset the module so each test gets a
@@ -101,9 +101,19 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
           case "projects.listWorkspaces":
             reply(id, []);
             return;
-          case "issues.get":
-            reply(id, { id: params.issueId, companyId: COMPANY, workProducts: [] });
+          case "issues.get": {
+            const products = inventory?.workProducts;
+            const value = products && String(params.issueId) in products ? products[String(params.issueId)] : [];
+            const row = inventory?.issues.find((item) => item.id === params.issueId);
+            reply(id, { id: params.issueId, companyId: COMPANY, projectId: row?.project_id ?? null, status: row?.status,
+              assigneeAgentId: row?.assignee_agent_id ?? null, assigneeUserId: row?.assignee_user_id ?? null,
+              ...(value === undefined ? {} : { workProducts: value }) });
             return;
+          }
+          case "issues.relations.get": reply(id, { blockedBy: [], blocks: [] }); return;
+          case "issues.documents.get": reply(id, null); return;
+          case "issues.documents.upsert": reply(id, {}); return;
+          case "issues.requestWakeup": reply(id, { queued: true, runId: fixtureId(9) }); return;
           case "secrets.resolve":
             reply(id, TOKEN);
             return;
@@ -131,14 +141,14 @@ async function custodyHost(storedConfig: Record<string, unknown> = custodyConfig
               } } } }) });
               return;
             }
-            if (inventory && url.pathname === "/repos/example/project/pulls" && url.searchParams.get("state") === (inventory.open ? "open" : "closed")) body = [{
+            if (inventory && ((url.pathname === "/repos/example/project/pulls" && url.searchParams.get("state") === (inventory.open ? "open" : "closed")) || url.pathname === "/repos/example/project/pulls/42")) body = [{
               number: 42, user: { login: "contributor", type: "User" },
               head: { ref: "feature", sha: "a".repeat(40), repo: { full_name: "example/project" } },
-              base: { repo: { full_name: "example/project" } }, title: "Example", body: null, state: inventory.open ? "open" : "closed",
+              base: { ref: "main", repo: { full_name: "example/project" } }, title: "Example", body: null, state: inventory.open ? "open" : "closed", draft: false, mergeable: true,
               created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-10T00:00:00Z",
               closed_at: inventory.open ? null : "2026-10-10T00:00:00Z", merged_at: inventory.open ? null : "2026-10-10T00:00:00Z", merged: !inventory.open,
             }];
-            reply(id, { status: 200, headers: {}, body: JSON.stringify(body) });
+            reply(id, { status: 200, headers: {}, body: JSON.stringify(url.pathname.endsWith("/pulls/42") ? body[0] : body) });
             return;
           }
           default:
@@ -186,6 +196,34 @@ const comment = (n: number, body: string) => ({
 });
 
 describe("scheduled pr-custody job over the real SDK/host contract", () => {
+  it.each(["valid", "malformed", "omitted"])("applies ownership evidence through the synthetic worker host: %s", async (scenario) => {
+    const products = scenario === "valid" ? [{ type: "pull_request", provider: "github", url: PR_URL }] : scenario === "malformed" ? [null] : undefined;
+    const liveConfig = { ...custodyConfig, custodyDryRun: false };
+    const h = await custodyHost(liveConfig, {
+      open: true, issues: [issue(1, PR_URL, null), { ...issue(2, "Higher tier", null), assignee_agent_id: PROJECT }], comments: [],
+      workProducts: { [fixtureId(2)]: products },
+    });
+    try {
+      await h.send("initialize-ownership", "initialize", initialize);
+      await h.send("config-ownership", "configChanged", { config: liveConfig, companyId: COMPANY });
+      await h.send("job-ownership", "runJob", runJob);
+      const report = h.ledger()!.report;
+      expect(report.rows[0]).toMatchObject(scenario === "valid"
+        ? { cardId: fixtureId(2), mapping: "work_product" }
+        : { cardId: fixtureId(1), mapping: "url" });
+      if (scenario === "valid") expect(report.unknown).toEqual([]);
+      else expect(report.unknown).toContain(`work_product:${fixtureId(2)}`);
+      const effects = h.calls.filter((c) => ["issues.create", "issues.requestWakeup", "issues.documents.upsert"].includes(c.method));
+      if (scenario === "valid") {
+        expect(effects.map((c) => c.method)).toEqual(["issues.documents.upsert", "issues.requestWakeup"]);
+        expect(effects.every((c) => c.params.issueId === fixtureId(2))).toBe(true);
+        expect(report.effects).toBeGreaterThan(0);
+      } else {
+        expect(report.effects).toBe(0);
+        expect(effects).toEqual([]);
+      }
+    } finally { h.stop(); }
+  });
   it.each([false, true])("only a comment defer suppresses an open idle PR (comment present: %s)", async (withComment) => {
     const h = await custodyHost(custodyConfig, {
       open: true, issues: [issue(1, PR_URL, DIRECTIVE)], comments: withComment ? [comment(1, DIRECTIVE)] : [],

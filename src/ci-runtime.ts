@@ -511,9 +511,9 @@ export class CiWakeRuntime {
   }
 
   /** Exact work-product match for one PR; mirrors custody's work_product tier. */
-  private hasPrWorkProduct(issue: { workProducts?: unknown }, repo: string, prNumber: number): boolean {
+  private hasPrWorkProduct(issue: { workProducts?: unknown }, repo: string, prNumber: number): boolean | null {
     const bindings = parseWorkProductBindings(issue.workProducts);
-    if (!bindings) return false;
+    if (!bindings) return null;
     const ref = `${repo.toLowerCase()}#${prNumber}`;
     for (const w of bindings) {
       if (w.url !== null && prRefFromUrl(w.url) !== ref) continue;
@@ -781,7 +781,9 @@ export class CiWakeRuntime {
             // workspace and repository; a historical registration alone is not a link.
             // A supplied work-product list must still name this PR.
             if (issue.workProducts !== undefined) {
-              if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
+              const match = this.hasPrWorkProduct(issue, entry.repo, entry.prNumber);
+              if (match === null) { outstanding = true; continue; }
+              if (!match) continue;
             } else {
               // The card's most recent registration on any PR in this repo is its
               // current link (ties go to ledger order); an older PR it has moved
