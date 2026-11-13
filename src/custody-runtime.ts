@@ -6,7 +6,7 @@ import { workspaceRepo, UUID } from "./ci-config.js";
 import { parseCustodyConfig, type CustodyConfig } from "./custody-config.js";
 import { CustodyAppAuth } from "./custody-auth.js";
 import { CustodyGithub, type CustodyPull } from "./custody-github.js";
-import { loadCustodyCards, loadCustodyTexts, parseWorkProductBindings, type CustodyCard } from "./custody-reader.js";
+import { custodyByteBudget, loadCustodyCards, loadCustodyTexts, parseWorkProductBindings, type CustodyCard } from "./custody-reader.js";
 import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prIndexRef, prReference, prRefFromUrl, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
 
 // A 100-PR listing page carries full PR bodies; long bodies push it past the
@@ -212,7 +212,8 @@ export class CustodyRuntime {
       await compact("receipt", ledger.receipts);
       await compact("disposition", ledger.dispositions);
       await save();
-      const cards = await loadCustodyCards(this.ctx, config.companyId, guard);
+      const budget = custodyByteBudget();
+      const cards = await loadCustodyCards(this.ctx, config.companyId, guard, budget);
       const reposByProject = new Map<string, Set<string>>();
       for (const projectId of new Set(cards.map((c) => c.projectId).filter((id): id is string => id !== null))) {
         guard();
@@ -360,7 +361,7 @@ export class CustodyRuntime {
         }
       }
       for (const ref of Object.keys(ledger.prToCards)) if (!seenPrs.has(ref)) delete ledger.prToCards[ref];
-      if (candidates.size) await loadCustodyTexts(this.ctx, config.companyId, guard, [...candidates.values()]);
+      if (candidates.size) await loadCustodyTexts(this.ctx, config.companyId, guard, [...candidates.values()], budget);
       for (const repo of sortedRepos) {
         try {
           const inv = inventories.get(repo);
@@ -642,8 +643,12 @@ export class CustodyRuntime {
     if (!current || JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("custody_configuration_changed");
   }
 
+  private dispositionGuidance(): string {
+    return "Record a PR-specific disposition in a comment on the source card using one line: `PR disposition: owner/repo#number finish|rework|defer|close; next actor <actor>; revisit YYYY-MM-DD` (choose one action and replace the placeholders). For a closed unmerged PR, also record `Closed unmerged: <reason>; source owner/repo#number` in a source-card comment, and record `Closed unmerged: <duplicate of|superseded by|need lost|mismatch|burden> <reason>` in a PR comment (choose one category and replace the placeholders).";
+  }
+
   private evidence(pr: CustodyPull, trigger: Trigger): string {
-    return `# PR disposition due\n\nPR: ${prUrl(pr)}\nHead: ${pr.headSha}\nTrigger: ${trigger.kind}\nEpoch: ${trigger.epoch}\nKey: ${trigger.key}\n\nChoose finish, rework, defer or close using current evidence and existing review/release gates. Idle age is a trigger, never a verdict. Preserve valid supersession and unique work. Record a PR-specific disposition on the source card; closure rationale belongs on both the card and PR. This job never closes, reopens or merges PRs.\n`;
+    return `# PR disposition due\n\nPR: ${prUrl(pr)}\nHead: ${pr.headSha}\nTrigger: ${trigger.kind}\nEpoch: ${trigger.epoch}\nKey: ${trigger.key}\n\nChoose finish, rework, defer or close using current evidence and existing review/release gates. Idle age is a trigger, never a verdict. Preserve valid supersession and unique work. ${this.dispositionGuidance()} This job never closes, reopens or merges PRs.\n`;
   }
 
   private async child(config: CustodyConfig, originId: string, title: string, body: string, card: CustodyCard | null, guard: () => void, audit: (operation: string, outcome: string, key?: string) => void, save: () => Promise<void>, receipt: Receipt, spend: () => void): Promise<string> {
