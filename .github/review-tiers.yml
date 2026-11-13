@@ -1,0 +1,71 @@
+# Risk-tier map for tiered review.
+#
+# A PR's tier is the highest tier of any changed file; sensitive wins on
+# overlap and unmatched paths default to sensitive. Globs are POSIX,
+# case-sensitive, minimatch-style: * matches within a path segment and **
+# matches across segments (including zero). Renames consider both paths.
+#
+# Content triggers escalate to sensitive regardless of path: new/changed
+# endpoints or input parsing; auth/authz/session, crypto/keys, secrets or
+# credentials; permissions, tenant isolation or personal data; SQL, schema
+# or migrations; dependencies/lockfiles or CI/workflows; weakened assertions,
+# deleted tests/snapshots or lowered test gates. Low test paths are for
+# additive tests only, never permission to weaken coverage or a guard.
+#
+# Review: low -> QA; ordinary -> QA; sensitive/unclassified -> Security -> QA.
+# QA verifies the routing tier and may escalate any PR. This map is always
+# sensitive. Routing tiers do not replace the template's T0/T1/T2 risk_tier
+# attestation; a PR changing this map declares T0, never docs-only T2.
+
+version: 1
+default_tier: sensitive
+
+tiers:
+  low:
+    # Descriptive copy only; security/acceptance/operational docs stay sensitive.
+    - "README.md"
+    - "LICENSE"
+    # Additive unit tests only. Helpers, fixtures and qualification controls
+    # stay unmatched/sensitive; content triggers above always take precedence.
+    - "tests/*.test.ts"
+    - "tests/*.test.mjs"
+  # No ordinary modules admitted: every current source module participates in
+  # configuration/permissions, GitHub/auth, custody, gate or wake machinery.
+  # Future entries require a module audit and justification in the adding PR.
+  ordinary: []
+  sensitive:
+    # Review policy, workflows and governance (including nested instructions).
+    - ".github/review-tiers.yml"
+    - ".github/**"
+    - "**/CODEOWNERS"
+    - "**/AGENTS.md"
+    - "**/CLAUDE.md"
+    - "**/CONTRIBUTING.md"
+    - "**/SECURITY.md"
+    - "**/REVIEW.md"
+    - ".claude/**"
+    - "**/skills/**"
+    # Dependency manifests, lockfiles, build/install scripts and test config.
+    - "**/package.json"
+    - "**/package-lock.json"
+    - "**/pnpm-lock.yaml"
+    - "**/yarn.lock"
+    - "**/.npmrc"
+    - "scripts/**"
+    - "tsconfig*.json"
+    - "vitest.config.ts"
+    # This package is security-sensitive automation throughout: HTTP/GitHub,
+    # credentials, input/config validation, plugin permissions, custody,
+    # readiness/gate decisions, native wakes and their entrypoints/exports.
+    - "src/**"
+    # State, installation/security acceptance and protected qualification.
+    - "migrations/**"
+    - "custody-migrations/**"
+    - "custody-migrations/README.md"
+    - "THREAT-MODEL.md"
+    - "ACCEPTANCE.md"
+    - "qualification/**"
+    # Auth/credential and policy tests never become low via the test globs.
+    - "tests/*auth*.test.ts"
+    - "tests/custody-policy.test.ts"
+    - "tests/gates-decision.test.ts"
