@@ -777,6 +777,49 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup.mock.calls.filter((c) => String((c[2] as { reason?: string }).reason).includes("#17"))).toHaveLength(0);
     });
 
+    it.each([
+      null, {}, { type: "pull_request", provider: "github", metadata: { number: "17" } },
+      { type: "pull_request", provider: "github", metadata: { repo: REPO } },
+      { type: "pull_request", provider: "github", url: `https://github.com/${REPO}/pull/17`, metadata: { repo: REPO, number: 18 } },
+    ])("does not wake when supplied work products contain an unclassifiable entry: %j", async (malformed) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      Object.assign(h.issue, { workProducts: [prWorkProduct, malformed] });
+      await movedHead(h);
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().reviewerWakes ?? {})).toHaveLength(0);
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      Object.assign(h.issue, { workProducts: [prWorkProduct] });
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("retries an unknown candidate without repeating a successful candidate's wake", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const unknownId = "00000000-0000-4000-8000-000000000099";
+      let repaired = false;
+      h.issueGet.mockImplementation(async (id: string) => ({
+        ...clone(h.issue), id, workProducts: id === unknownId && !repaired ? [prWorkProduct, null] : [prWorkProduct],
+      }));
+      const ledger = h.ledger() ?? { version: 1 as const, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [ISSUE, unknownId].map((issueId) => ({ companyId: COMPANY, repo: REPO, prNumber: 17, issueId, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" })) as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.map((call) => call[0])).toEqual([ISSUE]);
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      repaired = true;
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.map((call) => call[0])).toEqual([ISSUE, unknownId]);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);

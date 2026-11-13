@@ -5,7 +5,7 @@ import { CustodyGithub } from "../src/custody-github.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
 import { CUSTODY_ORIGIN, DAY, hasCardClosure, hasPrClosure, latestDisposition } from "../src/custody-policy.js";
-vi.mock("../src/custody-reader.js", () => ({ custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
+vi.mock("../src/custody-reader.js", async (importOriginal) => ({ ...await importOriginal<typeof import("../src/custody-reader.js")>(), custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn() }));
 
 const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const ISSUE = "bbbbbbbb-0000-4000-8000-000000000001";
@@ -1087,6 +1087,36 @@ describe("coverage, summary and cursor controls", () => {
 });
 
 describe("work-product discovery from a cold ledger", () => {
+  it("fails closed on malformed ownership with the real reader", async () => {
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42" };
+    const h = fixture({ cards: [card({ workProducts: [binding, null] as any })], open: [pull({ headBranch: "feature/change" })] });
+    const real = await vi.importActual<typeof import("../src/custody-reader.js")>("../src/custody-reader.js");
+    vi.mocked(loadCustodyCards).mockImplementation(real.loadCustodyCards);
+    vi.mocked(loadCustodyTexts).mockImplementation(real.loadCustodyTexts);
+    const query = vi.fn(async (sql: string) => sql.includes("FROM public.issues") ? [{
+      id: ISSUE, company_id: COMPANY, project_id: PROJECT, identifier: "TASK-42", title: "Change",
+      description: null, status: "in_progress", status_version: 2, assignee_agent_id: ISSUE,
+      assignee_user_id: null, origin_kind: "manual", conversation_agent_id: null, conversation_user_id: null,
+      conversation_state: null, updated_at: new Date(NOW), completed_at: null, cancelled_at: null,
+    }] : []);
+    Object.assign(h.ctx, { db: { query } });
+    await h.runtime.poll();
+    expect(query).toHaveBeenCalled();
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.unknown).toContain(`work_product:${ISSUE}`);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ctx.issues.documents.upsert).not.toHaveBeenCalled();
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+  });
+  it.each(["binding", "empty"])("preserves dispatch for a present %s work-product list", async (kind) => {
+    const binding = { type: "pull_request", provider: "github", url: "https://github.com/example/project/pull/42", metadata: { repo: "example/project", number: 42 }, externalId: null, status: null };
+    const h = fixture({ cards: [card({ workProducts: kind === "binding" ? [binding] : [] })], open: [pull({ headBranch: kind === "binding" ? "feature/change" : `work/${ISSUE}` })] });
+    await h.runtime.poll();
+    expect(h.ledger().report.complete).toBe(true);
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ cardId: ISSUE, mapping: kind === "binding" ? "work_product" : "workspace" })]);
+    expect(h.ctx.issues.documents.upsert).toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalled();
+  });
   it("maps a work-product-only card in one tick from an empty ledger", async () => {
     // A dormant card bound to its PR only by a native work product: no
     // registration, workspace-branch, title/description URL or tracker

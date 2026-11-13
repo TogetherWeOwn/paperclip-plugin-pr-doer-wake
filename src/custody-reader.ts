@@ -115,35 +115,37 @@ function excluded(origin: string): boolean {
 /**
  * Parse native issue work-product PR bindings from an Issue payload's
  * `workProducts` field. Only explicit pull-request bindings from GitHub are
- * retained; malformed entries are ignored rather than failing the whole
- * snapshot because a single unrelated work product must not poison custody
- * evidence. Callers must treat a binding as authoritative only through
- * mapCustodyCard's work_product tier, which revalidates repo/number/URL
- * exactly.
- *
- * Returns null when the host does not supply the field at all (missing or
- * non-array). The shared Issue.workProducts is optional for payload
- * compatibility, and the installed host's detail route always populates it
- * as an array (GET /issues/:id spreads listForIssue, which returns [] when
- * there are no bindings), but an absent field is fail-closed UNKNOWN here —
- * never silently treated as "no bindings" — so a host that omits it can
- * never produce a false complete=true. Callers with a non-null result may
- * treat an empty array as a proven-absent field.
+ * retained. Entries whose identity cannot be safely classified make the
+ * entire result unknown; clearly unrelated types or providers are ignored.
+ * Callers must still revalidate identity through the work_product tier.
+ * Missing, malformed or ambiguous input returns null, never proven absence.
  */
 export function parseWorkProductBindings(raw: unknown): WorkProductBinding[] | null {
   if (!Array.isArray(raw)) return null;
   const out: WorkProductBinding[] = [];
   for (const entry of raw) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
     const row = entry as Row;
-    const type = typeof row.type === "string" ? row.type : "";
-    const provider = typeof row.provider === "string" ? row.provider : "";
-    if (type !== "pull_request" || provider !== "github") continue;
+    if (typeof row.type !== "string" || !row.type) return null;
+    if (row.type !== "pull_request") continue;
+    if (typeof row.provider !== "string" || !row.provider) return null;
+    if (row.provider !== "github") continue;
+    const type = row.type;
+    const provider = row.provider;
+    if (row.url != null && typeof row.url !== "string") return null;
+    if (row.metadata != null && (typeof row.metadata !== "object" || Array.isArray(row.metadata))) return null;
     const url = typeof row.url === "string" ? row.url : null;
-    let metadata: Record<string, unknown> | null = null;
-    if (row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)) {
-      metadata = row.metadata as Record<string, unknown>;
-    }
+    const metadata = (row.metadata ?? null) as Record<string, unknown> | null;
+    const repo = metadata?.repo;
+    const number = metadata?.number;
+    if (repo != null && (typeof repo !== "string" || !/^[^/\s?#]+\/[^/\s?#]+$/.test(repo))) return null;
+    if (number != null && (!Number.isSafeInteger(number) || (number as number) <= 0)) return null;
+    const match = url === null ? null : /^https:\/\/github\.com\/([^/\s?#]+)\/([^/\s?#]+)\/pull\/(\d+)(?:[?#].*)?$/i.exec(url);
+    if (url !== null && (!match || !Number.isSafeInteger(Number(match[3])) || Number(match[3]) <= 0)) return null;
+    if (match) {
+      if (repo != null && (repo as string).toLowerCase() !== `${match[1]}/${match[2]}`.toLowerCase()) return null;
+      if (number != null && number !== Number(match[3])) return null;
+    } else if (repo == null || number == null) return null;
     out.push({
       type, provider, url, metadata,
       externalId: typeof row.externalId === "string" ? row.externalId : null,
