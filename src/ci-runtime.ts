@@ -479,7 +479,8 @@ export class CiWakeRuntime {
           .filter((w) => w.companyId === run.companyId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.issueId === registration.issueId)
           .reverse()
           .sort((a, b) => b.registeredAt - a.registeredAt)[0];
-        if (prior) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior.headSha, registration.headSha);
+        const pending = ledger.prHeadPending[`${run.companyId}:${registration.repo}:${registration.prNumber}`];
+        if (prior || pending) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior?.headSha ?? pending!.newSha, registration.headSha);
         ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
@@ -505,10 +506,9 @@ export class CiWakeRuntime {
    * merges, forks and number mismatches are not pushes.
    */
   private noteHeadChange(ledger: Ledger, companyId: string, repo: string, prNumber: number, oldSha: string, newSha: string): void {
-    if (oldSha === newSha) return;
     const key = `${companyId}:${repo}:${prNumber}`;
     const existing = ledger.prHeadPending[key];
-    if (existing && existing.newSha === newSha) return;
+    if (existing ? existing.newSha === newSha : oldSha === newSha) return;
     // A pending head is the latest PR-wide observation, not reviewer history.
     // Match the polling retarget paths when a new registration supersedes it.
     ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.newSha ?? oldSha, newSha, observedAt: this.now() };

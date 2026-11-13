@@ -919,7 +919,25 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
-    it("characterizes a second card registering while an ambiguous head is pending", async () => {
+    it.each([false, true])("does not treat a %s join as a fresh head observation", async (join) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      github.pull.mockResolvedValue(pull({ headSha: HEAD }));
+      await h.runtime.register(registration, run);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+      const ledger = h.ledger();
+      const key = `${COMPANY}:${REPO}:17`;
+      ledger.prHeadPending = { [key]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      github.pull.mockClear();
+      const runId = join ? "33333333-3333-4333-8333-000000000099" : run.runId;
+      h.ownership.runId = runId;
+      const result = await h.runtime.register(registration, { ...run, runId });
+      expect(result.content).toBe(join ? "Joined active CI wait" : "CI wait already registered");
+      expect(github.pull).not.toHaveBeenCalled();
+      expect(h.ledger().prHeadPending?.[key]).toMatchObject({ oldSha: HEAD, newSha: NEXT_HEAD });
+    });
+
+    it("retargets an ambiguous pending head on another card's first registration", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
       const secondIssue = "00000000-0000-4000-8000-000000000099";
@@ -940,14 +958,15 @@ describe("CI runtime polling and durable wake outcomes", () => {
       await registerHead(ISSUE, NEXT_HEAD);
       await h.runtime.poll();
       expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
-      await registerHead(secondIssue, "c".repeat(40));
-      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
+      const thirdHead = "c".repeat(40);
+      await registerHead(secondIssue, thirdHead);
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ oldSha: NEXT_HEAD, newSha: thirdHead });
       const fourthHead = "d".repeat(40);
       await registerHead(secondIssue, fourthHead);
-      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ oldSha: NEXT_HEAD, newSha: fourthHead });
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ oldSha: thirdHead, newSha: fourthHead });
     });
 
-    it("characterizes a targeted return to a different card's prior head after an ambiguous retry", async () => {
+    it.each([false, true])("retargets a partial wake when another card registers its prior head (prior A wake=%s)", async (priorWake) => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
       const secondIssue = "00000000-0000-4000-8000-000000000099";
@@ -968,24 +987,26 @@ describe("CI runtime polling and durable wake outcomes", () => {
       const reviewerCalls = () => h.requestWakeup.mock.calls.filter((call) =>
         String((call[2] as { reason: string }).reason).startsWith("pr_head_changed:"));
 
+      if (priorWake) await registerHead(ISSUE, "c".repeat(40));
       await registerHead(ISSUE, HEAD);
+      if (priorWake) {
+        await h.runtime.poll();
+        expect(reviewerCalls().map((call) => call[0])).toEqual([ISSUE]);
+        expect(h.ledger().reviewerWakes?.[`${COMPANY}:${ISSUE}:${HEAD}`]).toBeDefined();
+      }
       await registerHead(secondIssue, HEAD);
       await registerHead(secondIssue, NEXT_HEAD);
       await h.runtime.poll();
       expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
-      expect(reviewerCalls().map((call) => call[0])).toEqual([ISSUE]);
+      expect(reviewerCalls().map((call) => call[0])).toEqual(priorWake ? [ISSUE, ISSUE] : [ISSUE]);
       expect(h.ledger().reviewerWakes?.[`${COMPANY}:${ISSUE}:${NEXT_HEAD}`]).toBeDefined();
       expect(h.ledger().reviewerWakes?.[`${COMPANY}:${secondIssue}:${NEXT_HEAD}`]).toBeUndefined();
       repaired = true;
       await registerHead(ISSUE, HEAD);
-      // Characterize the current stale-target delay, not a guarantee that the delay is desirable.
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ oldSha: NEXT_HEAD, newSha: HEAD });
       await h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
-      expect(reviewerCalls().map((call) => call[0])).toEqual([ISSUE]);
-      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
-      await h.runtime.poll();
-      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(HEAD);
-      await h.runtime.poll();
       expect(reviewerCalls().map((call) => call[0])).toEqual([ISSUE, ISSUE, secondIssue]);
+      expect(reviewerCalls().filter((call) => (call[2] as { idempotencyKey: string }).idempotencyKey === `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`)).toHaveLength(1);
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
