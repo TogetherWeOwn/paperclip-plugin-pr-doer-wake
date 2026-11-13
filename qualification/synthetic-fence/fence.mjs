@@ -25,6 +25,7 @@ export class SyntheticFence {
     if (this.#poison || !phase || phase.token !== token || !phase.accepting) {
       return this.#fail('late or invalid dispatch');
     }
+    if (typeof operation !== 'function') return this.#fail('invalid host operation');
     // Registration is synchronous and precedes calling the handler.
     const tracked = Promise.resolve().then(operation);
     phase.pending.add(tracked);
@@ -59,7 +60,12 @@ export class SyntheticFence {
       if (this.#poison) throw new Error(this.#poison);
       this.#phase = null;
     } catch (error) {
-      this.#poison ??= `phase failed: ${error.message}`;
+      if (!this.#poison) {
+        this.#poison = 'phase failed';
+        try {
+          if (typeof error?.message === 'string') this.#poison = `phase failed: ${error.message}`;
+        } catch { /* Keep the fence poisoned if the rejection cannot be inspected. */ }
+      }
       throw new Error(this.#poison);
     } finally {
       clearTimeout(timer);

@@ -67,6 +67,30 @@ test('crash, failed drain, rejected operation and late request prevent handover'
   assert.throws(() => other.start('old'));
 });
 
+test('an already-started operation is refused and permanently poisons the sequence', async () => {
+  const fence = new SyntheticFence();
+  const phase = fence.start('candidate');
+  const gate = deferred();
+  assert.throws(() => fence.dispatch(phase, gate.promise), /invalid host operation/);
+  assert.equal(fence.poisoned, true);
+  await assert.rejects(finish(fence, phase));
+  assert.throws(() => fence.start('old'));
+  gate.resolve();
+});
+
+test('arbitrary command and drain rejection values permanently poison the sequence', async () => {
+  const hostile = { get message() { throw new Error('unreadable'); } };
+  for (const field of ['command', 'closedAndDrained']) {
+    for (const reason of [null, undefined, hostile]) {
+      const fence = new SyntheticFence();
+      const phase = fence.start('candidate');
+      await assert.rejects(finish(fence, phase, { [field]: Promise.reject(reason) }), /phase failed/);
+      assert.equal(fence.poisoned, true);
+      assert.throws(() => fence.start('old'), /phase failed/);
+    }
+  }
+});
+
 test('missing finish options permanently poison the sequence', async () => {
   const fence = new SyntheticFence();
   const phase = fence.start('candidate');
