@@ -947,6 +947,48 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(Object.values(h.ledger().prHeadPending ?? {})[0]).toMatchObject({ oldSha: NEXT_HEAD, newSha: fourthHead });
     });
 
+    it("characterizes a targeted return to a different card's prior head after an ambiguous retry", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const secondIssue = "00000000-0000-4000-8000-000000000099";
+      h.assertCheckoutOwner.mockImplementation(async () => {});
+      let repaired = false;
+      h.issueGet.mockImplementation(async (id: string) => ({
+        ...clone(h.issue), id, workProducts: id === secondIssue && !repaired ? [prWorkProduct, null] : [prWorkProduct],
+      }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      let sequence = 0;
+      async function registerHead(issueId: string, headSha: string) {
+        h.advance(1);
+        const runId = `33333333-3333-4333-8333-${String(++sequence).padStart(12, "0")}`;
+        github.pull.mockResolvedValue(pull({ headSha }));
+        const result = await h.runtime.register({ ...registration, issueId, headSha }, { ...run, runId });
+        expect(waitData(result).status).toBe("open");
+      }
+      const reviewerCalls = () => h.requestWakeup.mock.calls.filter((call) =>
+        String((call[2] as { reason: string }).reason).startsWith("pr_head_changed:"));
+
+      await registerHead(ISSUE, HEAD);
+      await registerHead(secondIssue, HEAD);
+      await registerHead(secondIssue, NEXT_HEAD);
+      await h.runtime.poll();
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
+      expect(reviewerCalls().map((call) => call[0])).toEqual([ISSUE]);
+      expect(h.ledger().reviewerWakes?.[`${COMPANY}:${ISSUE}:${NEXT_HEAD}`]).toBeDefined();
+      expect(h.ledger().reviewerWakes?.[`${COMPANY}:${secondIssue}:${NEXT_HEAD}`]).toBeUndefined();
+      repaired = true;
+      await registerHead(ISSUE, HEAD);
+      // Characterize the current stale-target delay, not a guarantee that the delay is desirable.
+      await h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+      expect(reviewerCalls().map((call) => call[0])).toEqual([ISSUE]);
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(NEXT_HEAD);
+      await h.runtime.poll();
+      expect(Object.values(h.ledger().prHeadPending ?? {})[0]?.newSha).toBe(HEAD);
+      await h.runtime.poll();
+      expect(reviewerCalls().map((call) => call[0])).toEqual([ISSUE, ISSUE, secondIssue]);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
