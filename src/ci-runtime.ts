@@ -507,7 +507,9 @@ export class CiWakeRuntime {
     const key = `${companyId}:${repo}:${prNumber}`;
     const existing = ledger.prHeadPending[key];
     if (existing && existing.newSha === newSha) return;
-    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now() };
+    // A pending head is the latest PR-wide observation, not reviewer history.
+    // Match the polling retarget paths when a new registration supersedes it.
+    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.newSha ?? oldSha, newSha, observedAt: this.now() };
   }
 
   /** Exact work-product match for one PR; mirrors custody's work_product tier. */

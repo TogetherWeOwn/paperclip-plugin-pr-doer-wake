@@ -850,6 +850,47 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
+    it.each([false, true])("uses sequential registrations on return to A (prior A wake=%s)", async (priorWake) => {
+      for (const ambiguous of [false, true]) {
+        const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+        inReviewIssue(h, OTHER);
+        github.readiness.mockReturnValue(verdict("pass"));
+        let sequence = 0;
+        async function registerHead(headSha: string) {
+          h.advance(1);
+          const runId = `33333333-3333-4333-8333-${String(++sequence).padStart(12, "0")}`;
+          h.ownership.runId = runId;
+          github.pull.mockResolvedValue(pull({ headSha }));
+          const result = await h.runtime.register({ ...registration, headSha }, { ...run, runId });
+          expect(waitData(result).status).toBe("open");
+        }
+        const reviewerCalls = () => h.requestWakeup.mock.calls.filter((call) =>
+          String((call[2] as { reason: string }).reason).startsWith("pr_head_changed:"));
+
+        if (priorWake) await registerHead("c".repeat(40));
+        await registerHead(HEAD);
+        if (priorWake) {
+          await h.runtime.poll();
+          expect(reviewerCalls()).toHaveLength(1);
+        }
+        Object.assign(h.issue, { workProducts: ambiguous ? [prWorkProduct, null] : [prWorkProduct] });
+        await registerHead(NEXT_HEAD);
+        await h.runtime.poll();
+        expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(ambiguous ? 1 : 0);
+        Object.assign(h.issue, { workProducts: [prWorkProduct] });
+        await registerHead(HEAD);
+        await h.runtime.poll();
+        const calls = reviewerCalls();
+        if (priorWake) {
+          expect(calls.filter((call) => (call[2] as { idempotencyKey: string }).idempotencyKey === `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`)).toHaveLength(1);
+        } else {
+          const returned = calls.filter((call) => (call[2] as { idempotencyKey: string }).idempotencyKey === `pr-head-wake:${REPO}:17:${HEAD}:${ISSUE}`);
+          expect(returned).toHaveLength(1);
+          expect(returned[0]![2]).toMatchObject({ reason: `pr_head_changed: ${REPO}#17 observed head ${NEXT_HEAD.slice(0, 7)} -> ${HEAD.slice(0, 7)}; CI pass` });
+        }
+      }
+    });
+
     it("still skips a card whose supplied work products point at a different PR", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
