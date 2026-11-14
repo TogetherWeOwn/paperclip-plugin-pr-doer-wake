@@ -8,7 +8,9 @@
  * control parent must be owned by the effective uid and have mode 0700; no
  * same-uid adversary or privileged host actor may mutate either parent. The
  * cgroup parent, when supplied, must be an exclusively controlled delegated
- * cgroup-v2 directory. This helper does not prove those environmental facts.
+ * cgroup-v2 directory. The caller is single-threaded because allocation reads
+ * the process-wide umask; a mask denying owner access is rejected before any
+ * resource is created. This helper does not prove the environmental facts.
  *
  * Each attempt permanently reserves a 128-bit random identity in the control
  * parent, even on failure. Reservations must never be removed or copied into a

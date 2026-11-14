@@ -43,11 +43,16 @@ int phase_state_allocate(struct phase_state *s, int control_parent_fd,
     char reservation[42];
     size_t n = 0, i;
     int marker;
+    mode_t mask;
     if (!s) { errno = EINVAL; return -1; }
     memset(s, 0, sizeof(*s));
     s->control_parent = s->cgroup_parent = -1;
     s->control = s->cgroup = s->cli = s->workload = -1;
     if (cgroup_parent_fd < -1) { errno = EINVAL; return -1; }
+    /* Check before allocating anything; the supervisor is single-threaded. */
+    mask = umask(0777);
+    umask(mask);
+    if (mask & 0700) { errno = EPERM; return -1; }
     s->control_parent = dup_dir(control_parent_fd, 1);
     if (s->control_parent < 0) return -1;
     if (cgroup_parent_fd != -1) {

@@ -33,6 +33,13 @@ int main(void)
     cg = openat(rootfd, "cgroup", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     assert(cp >= 0 && cg >= 0);
 
+    /* A restrictive process umask must not strand an inaccessible directory. */
+    mode_t previous_mask = umask(0777);
+    int result = phase_state_allocate(&a, cp, cg);
+    umask(previous_mask);
+    assert(result == -1 && errno == EPERM && a.owned == 0);
+    phase_state_close(&a);
+
     seed = 1;
     assert(phase_state_allocate(&a, cp, cg) == 0);
     assert(strlen(a.id) == 32 && fstat(a.control, &st) == 0 &&
