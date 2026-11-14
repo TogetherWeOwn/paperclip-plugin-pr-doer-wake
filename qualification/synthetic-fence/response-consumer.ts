@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
 import type { Identity } from './response-ledger.js';
 
-/** Worker-side response acceptance. The adapter must invoke its real consumer here. */
+/**
+ * Worker-side response acceptance only. The adapter must invoke its real consumer here.
+ * A freed pending slot is not host settlement or permission to send another request:
+ * the channel owner must coordinate host write accounting and ACK processing separately.
+ * Follow-up requests triggered by the consumer must be queued until admission is safe.
+ */
 export class ResponseConsumer {
   private readonly pending = new Set<number>();
   private readonly accepting = new Set<number>();
@@ -57,7 +62,7 @@ export class ResponseConsumer {
     }
     const id = frame.id as number;
     const ack = Buffer.from(JSON.stringify({ ...this.identity, type: 'ACK', id, digest }) + '\n');
-    if (ack.byteLength > this.maxFrameBytes) return this.fail('frame limit');
+    if (ack.byteLength - 1 > this.maxFrameBytes) return this.fail('frame limit');
     this.accepting.add(id);
     try { await consume(frame.outcome); }
     catch { return this.fail('consumer rejected response'); }
