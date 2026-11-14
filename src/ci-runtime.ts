@@ -64,6 +64,10 @@ export interface PrHeadPending {
   newSha: string;
   observedAt: number;
   shadowLogged?: string[];
+  /** Durable round-robin positions, independent of wall-clock timestamps. */
+  pollOrder?: number;
+  candidateOrder?: Record<string, number>;
+  candidateSequence?: number;
 }
 interface Ledger {
   version: 1;
@@ -593,17 +597,24 @@ export class CiWakeRuntime {
     const started = this.now();
     let requests = 0;
     let wakes = 0;
+    // Reserve half of each count budget for reviewer work when both lanes
+    // have work. The shared time budget remains an absolute limit.
+    const hasReviewerWork = Object.values(ledger.prHeadPending).some((e) => !only || e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha);
+    const ciRequestLimit = hasReviewerWork ? Math.floor(LIMITS.requestsPerTick / 2) : LIMITS.requestsPerTick;
+    const ciWakeLimit = hasReviewerWork ? Math.floor(LIMITS.wakePerTick / 2) : LIMITS.wakePerTick;
+    let requestLimit: number = ciRequestLimit;
     // Tokens are reusable only within this bounded poll, never a runtime field/state.
     const cycle = new Map<string, CiAppAuth>();
     const appIdsByIdentity = new Map<string, Map<string, number | null>>();
     const fetch: PluginContext["http"]["fetch"] = async (url, init) => {
-      if (++requests > LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
+      if (requests >= requestLimit || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
+      requests += 1;
       return this.ctx.http.fetch(url, init);
     };
     // Oldest last-attempt first prevents one unavailable repository starving others.
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const wait of pending) {
-      if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+      if (requests >= ciRequestLimit || wakes >= ciWakeLimit || this.now() - started >= LIMITS.tickMs) break;
       try {
         wait.lastAttemptAt = this.now();
         const config = await this.config(wait.companyId, false);
@@ -709,11 +720,19 @@ export class CiWakeRuntime {
     }
     // Reviewer wakes for observed head changes (settled heads only).
     {
-      const entries = Object.entries(ledger.prHeadPending)
+      requestLimit = LIMITS.requestsPerTick;
+      const allEntries = Object.entries(ledger.prHeadPending).sort((a, b) => a[1].observedAt - b[1].observedAt);
+      let sequence = Math.max(0, ...allEntries.map(([, e]) => e.pollOrder ?? 0));
+      // Assign arrivals behind previously admitted work, including on targeted polls.
+      for (const [, entry] of allEntries) if (entry.pollOrder === undefined) entry.pollOrder = ++sequence;
+      const entries = allEntries
         .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
-        .sort((a, b) => a[1].observedAt - b[1].observedAt);
+        .sort((a, b) => a[1].pollOrder! - b[1].pollOrder!);
+      if (allEntries.length) await this.save(ledger);
       for (const [key, entry] of entries) {
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+        entry.pollOrder = ++sequence;
+        await this.save(ledger);
         try {
           const config = await this.config(entry.companyId, false);
           // Feature off: drop the entry rather than accumulate stale wakes.
@@ -765,10 +784,24 @@ export class CiWakeRuntime {
           // rollback via dryRun: true silences this path too.
           const shadow = revalidated.prHeadWakeShadow || revalidated.dryRun;
           const candidates = [...new Set(ledger.waits.filter((w) => w.companyId === entry.companyId && w.repo === entry.repo && w.prNumber === entry.prNumber).map((w) => w.issueId))];
+          entry.candidateOrder ??= {};
+          const liveCandidates = new Set(candidates);
+          for (const id of Object.keys(entry.candidateOrder)) if (!liveCandidates.has(id)) delete entry.candidateOrder[id];
+          let candidateSequence = entry.candidateSequence ?? 0;
+          for (const id of candidates) if (entry.candidateOrder[id] === undefined) entry.candidateOrder[id] = ++candidateSequence;
+          candidates.sort((a, b) => entry.candidateOrder![a]! - entry.candidateOrder![b]!);
+          entry.candidateSequence = candidateSequence;
+          await this.save(ledger);
           let outstanding = false;
           for (const issueId of candidates) {
             const wakeKey = `${entry.companyId}:${issueId}:${entry.newSha}`;
             if (ledger.reviewerWakes[wakeKey] !== undefined) continue;
+            // Admission precedes host reads too: slow or failing reads must not
+            // repeatedly consume the invocation before later cards are visited.
+            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            entry.candidateOrder[issueId] = ++candidateSequence;
+            entry.candidateSequence = candidateSequence;
+            await this.save(ledger);
             let issue: any;
             try { issue = await this.ctx.issues.get(issueId, entry.companyId); }
             catch { outstanding = true; continue; }

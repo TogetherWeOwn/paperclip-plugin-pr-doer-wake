@@ -971,6 +971,83 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
+    it("gives a settled reviewer head a turn despite continuously deferred CI wakes", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      const wait = ledger.waits[0]!;
+      // All CI attempts remain open and consume the entire wake budget each tick.
+      ledger.waits = Array.from({ length: LIMITS.wakePerTick }, (_, i) => ({ ...wait, waitId: `ci-${i}` }));
+      ledger.waits.push({ ...wait, waitId: "reviewer-binding", prNumber: 18, status: "woken" });
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:18`]: { companyId: COMPANY, repo: REPO, prNumber: 18, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      Object.assign(h.issue, { workProducts: [{ ...prWorkProduct, metadata: { repo: REPO, number: 18 }, url: `https://github.com/${REPO}/pull/18` }] });
+      github.pull.mockImplementation(async (_repo: string, n: number) => pull({ number: n, headSha: n === 18 ? NEXT_HEAD : HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      h.requestWakeup.mockImplementation(async (_id, _company, wake) => ({ queued: String((wake as { reason: string }).reason).includes("pr_head_changed") }));
+
+      await h.runtime.poll();
+      h.advance(1);
+      await h.runtime.poll();
+
+      expect(h.ledger().waits.filter((w) => w.status === "open")).toHaveLength(LIMITS.wakePerTick);
+      expect(h.requestWakeup.mock.calls.some(([, , wake]) => String((wake as { reason: string }).reason).includes("pr_head_changed") && String((wake as { reason: string }).reason).includes("#18"))).toBe(true);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("gives a later reviewer entry a turn when an older entry repeatedly exhausts the wake budget", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ids = Array.from({ length: LIMITS.wakePerTick + 1 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`);
+      h.issueGet.mockImplementation(async (id: string) => {
+        const number = id === ids.at(-1) ? 18 : 17;
+        return { ...clone(h.issue), id, workProducts: [{ ...prWorkProduct, url: `https://github.com/${REPO}/pull/${number}`, metadata: { repo: REPO, number } }] };
+      });
+      const ledger: Ledger = { version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = ids.map((issueId, i) => ({ companyId: COMPANY, repo: REPO, prNumber: i === ids.length - 1 ? 18 : 17, issueId, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" })) as unknown as Wait[];
+      ledger.prHeadPending = Object.fromEntries([17, 18].map((prNumber) => [`${COMPANY}:${REPO}:${prNumber}`, { companyId: COMPANY, repo: REPO, prNumber, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START + prNumber - 17 }]));
+      h.seed(ledger);
+      github.pull.mockImplementation(async (_repo: string, n: number) => pull({ number: n, headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      h.requestWakeup.mockImplementation(async (id) => ({ queued: id === ids.at(-1) }));
+
+      await h.runtime.poll();
+      h.advance(1);
+      await h.runtime.poll();
+
+      expect(h.ledger().prHeadPending?.[`${COMPANY}:${REPO}:17`]).toBeDefined();
+      expect(h.requestWakeup.mock.calls.some(([id]) => id === ids.at(-1))).toBe(true);
+      expect(h.ledger().reviewerWakes?.[`${COMPANY}:${ids.at(-1)}:${NEXT_HEAD}`]).toBeDefined();
+    });
+
+    it("resumes beyond a repeatedly deferred candidate prefix on a later tick", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ids = Array.from({ length: LIMITS.wakePerTick + 1 }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`);
+      h.issueGet.mockImplementation(async (id: string) => ({ ...clone(h.issue), id }));
+      const ledger: Ledger = { version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = ids.map((issueId) => ({ companyId: COMPANY, repo: REPO, prNumber: 17, issueId, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" })) as unknown as Wait[];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      h.requestWakeup.mockImplementation(async (id) => ({ queued: id === ids.at(-1) }));
+
+      await h.runtime.poll();
+      // Restart with a new candidate inserted ahead of the existing ledger.
+      // The durable ordering must keep previously waiting work ahead of arrivals.
+      const afterFirst = h.ledger();
+      afterFirst.waits.unshift({ ...afterFirst.waits[0]!, issueId: "00000000-0000-4000-8000-999999999999" });
+      h.seed(afterFirst);
+      h.advance(1);
+      await new CiWakeRuntime(h.ctx, h.clock).poll();
+
+      expect(h.ledger().prHeadPending?.[`${COMPANY}:${REPO}:17`]).toBeDefined(); // deferred prefix still needs retry
+      expect(h.requestWakeup.mock.calls.some(([id]) => id === ids.at(-1))).toBe(true);
+      expect(h.ledger().reviewerWakes?.[`${COMPANY}:${ids.at(-1)}:${NEXT_HEAD}`]).toBeDefined();
+    });
+
     it("never evicts dedupe records a still-pending entry relies on", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
