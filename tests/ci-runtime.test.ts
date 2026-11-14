@@ -61,6 +61,7 @@ type Ledger = {
   samples: Record<string, Array<{ sha: string; ms: number }>>;
   prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: string[] }>;
   reviewerWakes?: Record<string, number>;
+  nextPollLane?: "ci" | "reviewer";
 };
 const clone = <T>(value: T): T => structuredClone(value);
 const waitData = (result: ToolResult) => result.data as { waitId: string; status: string; expiresAt: number };
@@ -704,6 +705,88 @@ describe("CI runtime polling and durable wake outcomes", () => {
       github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
     }
 
+    it("gives a settled reviewer a turn after CI consumes a full tick", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      const ledger = h.ledger();
+      const original = ledger.waits[0]!;
+      ledger.waits = [
+        ...Array.from({ length: 6 }, (_, index) => ({ ...original, waitId: `slow-${index}`, companyId: OTHER })),
+        { ...original, status: "retired", finishedAt: START },
+      ];
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      h.configGet.mockImplementation(async (companyId) => {
+        if (companyId === OTHER) { h.advance(LIMITS.tickMs / 6); throw new Error("slow configuration"); }
+        return clone(h.rawConfig);
+      });
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("pr_head_changed") });
+      expect(h.ledger().waits.filter((wait) => wait.companyId === OTHER && wait.status === "open")).toHaveLength(6);
+    });
+
+    it("gives CI a turn after reviewer entries consume a full tick", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      await h.runtime.register(registration, run);
+      const ledger = h.ledger();
+      ledger.nextPollLane = "reviewer";
+      ledger.prHeadPending = Object.fromEntries(Array.from({ length: 6 }, (_, index) => [
+        `slow-${index}`, { companyId: OTHER, repo: REPO, prNumber: 17 + index, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START },
+      ]));
+      h.seed(ledger);
+      h.configGet.mockImplementation(async (companyId) => {
+        if (companyId === OTHER) { h.advance(LIMITS.tickMs / 6); throw new Error("slow configuration"); }
+        return clone(h.rawConfig);
+      });
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().waits[0]?.status).toBe("open");
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().waits[0]?.status).toBe("woken");
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(6);
+    });
+
+    it("retains the reviewer turn when CI exhausts the request quota", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      const ledger = h.ledger();
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      h.seed(ledger);
+      github.pull.mockImplementationOnce(async () => {
+        const fetch = github.construct.mock.lastCall![0] as PluginContext["http"]["fetch"];
+        for (let i = 0; i < LIMITS.requestsPerTick; i++) await fetch("https://api.github.com/", { method: "GET" });
+        return pull({ headSha: NEXT_HEAD });
+      });
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.requestWakeup.mock.calls[0]![2]).toMatchObject({ reason: expect.stringContaining("pr_head_changed") });
+    });
+
+    it("keeps the full-poll turn across targeted polls and runtime restarts", async () => {
+      const h = setup();
+      await h.runtime.register(registration, run);
+      await h.runtime.poll();
+      expect(h.ledger().nextPollLane).toBe("reviewer");
+      const restarted = new CiWakeRuntime(h.ctx, h.clock);
+      await restarted.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
+      expect(h.ledger().nextPollLane).toBe("reviewer");
+      await restarted.poll();
+      expect(h.ledger().nextPollLane).toBe("ci");
+    });
+
     it("wakes a pending reviewer once the new head settles", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
@@ -892,7 +975,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
       // The new wait's own CI wake (author card) plus one pr_head_changed
       // reviewer wake.
       expect(h.requestWakeup.mock.calls.length).toBe(wakesBefore + 2);
-      const [, , wake] = h.requestWakeup.mock.calls.at(-1)!;
+      const wake = h.requestWakeup.mock.calls.slice(wakesBefore).map(([, , value]) => value as { reason: string }).find((value) => value.reason.includes("pr_head_changed"));
       expect(wake).toMatchObject({ reason: expect.stringContaining("pr_head_changed") });
       expect((wake as { reason: string }).reason).toContain(HEAD.slice(0, 7));
       expect((wake as { reason: string }).reason).toContain(NEXT_HEAD.slice(0, 7));
@@ -969,6 +1052,29 @@ describe("CI runtime polling and durable wake outcomes", () => {
       await h.runtime.poll();
       expect(h.requestWakeup).toHaveBeenCalledTimes(101); // the last one resumes
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("gives CI the next turn after reviewer wakes exhaust the wake quota", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      await h.runtime.register(registration, run);
+      inReviewIssue(h, OTHER);
+      h.issueGet.mockImplementation(async (id: string) => ({ ...clone(h.issue), id }));
+      const ledger = h.ledger();
+      const original = ledger.waits[0]!;
+      const ids = Array.from({ length: LIMITS.wakePerTick }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`);
+      ledger.waits.push(...ids.map((issueId, i) => ({ ...original, issueId, waitId: `review-${i}`, status: "woken" as const })));
+      ledger.prHeadPending = { [`${COMPANY}:${REPO}:17`]: { companyId: COMPANY, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START } };
+      ledger.nextPollLane = "reviewer";
+      h.seed(ledger);
+      github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(LIMITS.wakePerTick);
+      expect(h.ledger().waits[0]?.status).toBe("open");
+      github.pull.mockResolvedValue(pull());
+      await h.runtime.poll();
+      expect(h.ledger().waits[0]?.status).toBe("woken");
+      expect(h.requestWakeup.mock.calls[LIMITS.wakePerTick]![2]).toMatchObject({ reason: expect.stringContaining("CI pass") });
     });
 
     it("never evicts dedupe records a still-pending entry relies on", async () => {
@@ -2123,7 +2229,7 @@ describe("CI runtime bounded retention and work quotas", () => {
     expect(h.ledger().waits.find((wait) => wait.waitId === "interrupted")?.status).toBe("unconfirmed");
     expect(h.ledger().waits.some((wait) => wait.waitId === "old")).toBe(false);
     expect(h.ledger().waits.filter((wait) => wait.status === "open")).toHaveLength(LIMITS.active);
-    expect(h.set).toHaveBeenCalledTimes(6);
+    expect(h.set).toHaveBeenCalledTimes(9); // compact, durable lane turn, and final save per poll
     expect(h.resolveSecret).not.toHaveBeenCalled();
     expect(github.pull).not.toHaveBeenCalled();
     expect(h.requestWakeup).not.toHaveBeenCalled();
