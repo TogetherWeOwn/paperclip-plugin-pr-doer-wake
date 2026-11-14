@@ -1,4 +1,5 @@
 #include "gated-launch.h"
+#include "cgroup-membership.h"
 #include <assert.h>
 #include <errno.h>
 #include <string.h>

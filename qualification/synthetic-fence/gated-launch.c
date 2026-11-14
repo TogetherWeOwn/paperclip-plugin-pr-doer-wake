@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "gated-launch.h"
-
+#include "cgroup-membership.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -8,34 +8,14 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
 #define MEMBERSHIP_LIMIT 65536
-
-int sf_cgroup_contains(const char *s, size_t n, pid_t pid)
-{
-    size_t i = 0;
-    int found = 0;
-    if (!s || pid <= 0) return -1;
-    while (i < n) {
-        unsigned long value = 0;
-        size_t start = i;
-        while (i < n && s[i] >= '0' && s[i] <= '9') {
-            unsigned digit = (unsigned)(s[i++] - '0');
-            if (value > ((unsigned long)INT_MAX - digit) / 10) return -1;
-            value = value * 10 + digit;
-        }
-        if (i == start || value == 0 || i == n || s[i++] != '\n') return -1;
-        if (value == (unsigned long)pid && ++found > 1) return -1;
-    }
-    return found;
-}
-
 static int before(const struct timespec *end)
 {
     struct timespec now;
@@ -43,7 +23,15 @@ static int before(const struct timespec *end)
     return now.tv_sec < end->tv_sec ||
         (now.tv_sec == end->tv_sec && now.tv_nsec < end->tv_nsec);
 }
-
+static int no_caught_signals(void)
+{
+    struct sigaction sa;
+    for (int i = 1; i < NSIG; i++) {
+        if (sigaction(i, NULL, &sa) < 0) { if (errno == EINVAL) continue; return 0; }
+        if (sa.sa_handler != SIG_DFL && sa.sa_handler != SIG_IGN) return 0;
+    }
+    return 1;
+}
 /* close_range failures are fatal: never exec with unknown inherited fds. */
 static void stub(int gate, int exe, char *const argv[], char *const envp[])
 {
@@ -66,7 +54,6 @@ static void stub(int gate, int exe, char *const argv[], char *const envp[])
     syscall(SYS_execveat, exe, "", argv, envp, AT_EMPTY_PATH);
     _exit(127);
 }
-
 static int membership(int dirfd, pid_t pid)
 {
     char buf[MEMBERSHIP_LIMIT + 1];
@@ -84,13 +71,12 @@ static int membership(int dirfd, pid_t pid)
     if (used > MEMBERSHIP_LIMIT) { errno = EOVERFLOW; return -1; }
     return sf_cgroup_contains(buf, used, pid);
 }
-
 static void terminate_owned(struct sf_child *c, const struct timespec *deadline)
 {
     int status;
     /* The child is still unreaped and therefore its numeric PID cannot recycle. */
-    if (c->pidfd >= 0) (void)syscall(SYS_pidfd_send_signal, c->pidfd, SIGKILL, NULL, 0);
-    else (void)kill(c->pid, SIGKILL);
+    if (c->pidfd < 0 || syscall(SYS_pidfd_send_signal, c->pidfd, SIGKILL, NULL, 0) < 0)
+        (void)kill(c->pid, SIGKILL);
     while (before(deadline)) {
         pid_t r = waitpid(c->pid, &status, WNOHANG | __WALL);
         if (r == c->pid) {
@@ -105,7 +91,6 @@ static void terminate_owned(struct sf_child *c, const struct timespec *deadline)
         }
     }
 }
-
 int sf_gated_launch(struct sf_child *c, int dirfd, int exe, char *const argv[],
                     char *const envp[], const struct timespec *deadline,
                     int (*record_child)(const struct sf_child *, void *), void *context)
@@ -123,20 +108,21 @@ int sf_gated_launch(struct sf_child *c, int dirfd, int exe, char *const argv[],
         !record_child || !argv || !argv[0] || !envp || exe < 3 || dirfd < 0 ||
         (exe_flags = fcntl(exe, F_GETFD)) < 0 || !(exe_flags & FD_CLOEXEC) ||
         getpid() != 1 || sigaction(SIGCHLD, NULL, &disposition) < 0 ||
-        disposition.sa_handler == SIG_IGN || (disposition.sa_flags & SA_NOCLDWAIT) ||
+        disposition.sa_handler == SIG_IGN || (disposition.sa_flags & SA_NOCLDWAIT) || !no_caught_signals() ||
         sigprocmask(SIG_SETMASK, NULL, &mask) < 0 || sigismember(&mask, SIGCHLD) != 1 ||
         fstatfs(dirfd, &fs) < 0 || (unsigned long)fs.f_type != CGROUP2_SUPER_MAGIC ||
         !before(deadline)) { errno = EINVAL; return -1; }
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate) < 0) return -1;
-    c->pid = fork();
+    c->pid = _Fork(); /* No pthread_atfork callbacks before the gate. */
     if (c->pid < 0) { c->pid = 0; saved = errno; goto fail; }
     if (c->pid == 0) { close(gate[0]); stub(gate[1], exe, argv, envp); }
     close(gate[1]); gate[1] = -1;
     c->pidfd = (int)syscall(SYS_pidfd_open, c->pid, 0);
     if (c->pidfd < 0) { saved = errno; goto fail; }
-    if (!before(deadline) || record_child(c, context) != 0 || !before(deadline)) {
-        saved = ETIMEDOUT; goto fail;
-    }
+    if (!before(deadline)) { saved = ETIMEDOUT; goto fail; }
+    errno = 0;
+    if (record_child(c, context) != 0) { saved = errno ? errno : EIO; goto fail; }
+    if (!before(deadline)) { saved = ETIMEDOUT; goto fail; }
     len = snprintf(pidbuf, sizeof(pidbuf), "%ld\n", (long)c->pid);
     if (len <= 0 || (size_t)len >= sizeof(pidbuf)) { saved = EOVERFLOW; goto fail; }
     fd = openat(dirfd, "cgroup.procs", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
