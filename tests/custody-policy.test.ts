@@ -226,6 +226,9 @@ describe("directive evidence boundaries", () => {
     expect(latestDisposition(owner(disposition.replace("contributor", "<!-- contributor -->")), pull())).toBeNull();
     expect(hasCardClosure(owner("Closed unmerged:  ; source example/project#42"), pull())).toBe(false);
     expect(hasCardClosure(owner("Closed unmerged: <!-- burden -->; source example/project#42"), pull())).toBe(false);
+    expect(hasPrClosure(["Closed unmerged:   "])).toBe(false);
+    expect(hasPrClosure(["Closed unmerged: <!-- burden -->"])).toBe(false);
+    expect(hasPrClosure([prClosure])).toBe(true);
     expect(latestDisposition(owner(disposition.replace("contributor", "contributor <!-- note -->")), pull())?.action).toBe("defer");
     expect(hasCardClosure(owner(`${cardClosure} <!-- note -->`), pull())).toBe(true);
   });
@@ -240,6 +243,7 @@ describe("directive evidence boundaries", () => {
     for (const prefix of ["`unmatched", "\\\\`escaped", "`unmatched\n\n", "`unmatched\n~~~\n~~~"]) {
       expect(latestDisposition(owner(`${prefix}\n${disposition}`), pull())?.action).toBe("defer");
     }
+    expect(latestDisposition(owner(`\\\`escaped\n${disposition}\n\``), pull())?.action).toBe("defer");
     expect(latestDisposition(owner(`\`\`open\n\`different\n${disposition}\n\`\`close`), pull())).toBeNull();
     expect(latestDisposition(card({ texts: [
       { id: "comment:1", body: "`unmatched", at: NOW, ownership: true },
