@@ -18,23 +18,23 @@ jobs:
           - name: cross-lane
             source: 0088fa09a64e4f1a0ee6c97460349bd84d856034
             pattern: gives a settled reviewer a turn after CI consumes a full tick
-            expected: 'expected "spy" to be called 1 times, but got 0 times'
+            expected: 'expected "vi.fn()" to be called 1 times, but got 0 times'
           - name: reviewer-pending
             source: dc220cc29db8764fa97eb1f7da9c621d74225076
             pattern: rotates past a saturated reviewer prefix after restart \(pending\)
-            expected: 'expected "spy" to be called 1 times, but got 0 times'
+            expected: 'expected "vi.fn()" to be called 1 times, but got 0 times'
           - name: reviewer-failure
             source: dc220cc29db8764fa97eb1f7da9c621d74225076
             pattern: rotates past a saturated reviewer prefix after restart \(failure\)
-            expected: 'expected "spy" to be called 1 times, but got 0 times'
+            expected: 'expected "vi.fn()" to be called 1 times, but got 0 times'
           - name: candidate-shadow
             source: dc220cc29db8764fa97eb1f7da9c621d74225076
             pattern: stops candidate reads after an admitted read exhausts the tick \(shadow=true\)
-            expected: 'expected "spy" to be called 1 times, but got 2 times'
+            expected: 'expected "vi.fn()" to be called 1 times, but got 2 times'
           - name: candidate-live
             source: dc220cc29db8764fa97eb1f7da9c621d74225076
             pattern: stops candidate reads after an admitted read exhausts the tick \(shadow=false\)
-            expected: 'expected "spy" to be called 1 times, but got 2 times'
+            expected: 'expected "vi.fn()" to be called 1 times, but got 2 times'
         version: [old, corrected]
     name: ${{ matrix.case.name }} / ${{ matrix.version }}
     steps:
@@ -78,7 +78,7 @@ jobs:
           RESULT="$result" node --input-type=module <<'JS'
           import { readFileSync } from 'node:fs';
           const report = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/result.json`, 'utf8'));
-          const tests = report.testResults.flatMap(suite => suite.assertionResults).filter(test => test.status !== 'pending');
+          const tests = report.testResults.flatMap(suite => suite.assertionResults).filter(test => test.status === 'passed' || test.status === 'failed');
           if (tests.length !== 1) throw new Error(`Expected one executed test, got ${tests.length}`);
           const test = tests[0];
           console.log(JSON.stringify({ name: test.fullName, status: test.status, failures: test.failureMessages }, null, 2));
