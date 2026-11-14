@@ -1,12 +1,9 @@
 #define syscall test_syscall
 #include "gated-launch.c"
 #undef syscall
-
 #include <assert.h>
-
 static int signal_attempts;
 static void handler(int sig) { (void)sig; }
-
 long test_syscall(long number, ...)
 {
     assert(number == SYS_pidfd_send_signal);
@@ -14,7 +11,6 @@ long test_syscall(long number, ...)
     errno = EPERM;
     return -1;
 }
-
 int main(void)
 {
     int ready[2];

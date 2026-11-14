@@ -32,7 +32,6 @@ jobs:
             qualification/synthetic-fence/cgroup-membership.test.c \
             -o "$RUNNER_TEMP/cgroup-membership-test"
           timeout 10s "$RUNNER_TEMP/cgroup-membership-test"
-
   gated-launch-behavior:
     name: Gated launch kernel behavior
     runs-on: ubuntu-24.04
@@ -54,7 +53,6 @@ jobs:
           cleanup() { sudo rmdir "$group"; sudo rm -f -- "$marker"; }
           trap cleanup EXIT
           sudo timeout --kill-after=5s 30s unshare --pid --fork --mount-proc --kill-child "$RUNNER_TEMP/gated-launch-behavior" "$group" "$marker"
-
   synthetic-cgroup-capability:
     name: Synthetic cgroup capability probe
     runs-on: ubuntu-24.04
@@ -159,7 +157,7 @@ jobs:
           npx vitest run tests/custody-policy.test.ts -t 'suppresses protected directives'
 
   check:
-    needs: cgroup-membership-parser
+    needs: [cgroup-membership-parser, gated-launch-behavior]
     if: ${{ always() }}
     # Required status check on main. Renaming this changes the check context
     # and blocks every merge until the ruleset is updated to match.
@@ -169,8 +167,8 @@ jobs:
     steps:
       - name: Require parser test success
         env:
-          PARSER_RESULT: ${{ needs.cgroup-membership-parser.result }}
-        run: test "$PARSER_RESULT" = success
+          PARSER_RESULT: ${{ needs.cgroup-membership-parser.result }}:${{ needs.gated-launch-behavior.result }}
+        run: test "$PARSER_RESULT" = success:success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Build the PR head itself, not GitHub's synthetic merge commit.
