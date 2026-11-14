@@ -36,6 +36,14 @@ describe('response ledger', () => {
     expect(l.completed).toBe(false);
   });
 
+  it('records the actual write result after a separate poison', () => {
+    const l = ledger();
+    prepare(l);
+    l.poison('channel closed');
+    expect(() => l.writeOutcome(1, bytes.length, true, 4)).toThrow('channel closed');
+    expect(l.snapshot()[0]).toMatchObject({ writeAccounted: true, writeError: true });
+  });
+
   it('includes ACK waiters in the outstanding limit', () => {
     const l = ledger();
     prepare(l);

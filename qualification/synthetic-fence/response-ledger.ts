@@ -25,6 +25,7 @@ type Request = {
   digest?: string;
   byteLength?: number;
   writeAccounted: boolean;
+  writeError?: boolean;
   acked: boolean;
   ackDeadline?: number;
 };
@@ -115,14 +116,15 @@ export class ResponseLedger {
   }
 
   writeOutcome(id: number, byteLength: number, error: boolean, now: number): void {
-    this.check(now);
     const request = this.request(id);
     if (!request.digest || request.writeAccounted || !Number.isSafeInteger(byteLength) || byteLength !== request.byteLength) {
       this.fail('invalid write outcome');
     }
     request.writeAccounted = true;
+    request.writeError = error;
     this.buffered -= byteLength;
-    if (error) this.fail('response write failed');
+    if (error) this.poison('response write failed');
+    this.check(now);
   }
 
   acknowledge(id: number, responseDigest: string, now: number): void {
