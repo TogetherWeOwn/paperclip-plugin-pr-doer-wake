@@ -2014,7 +2014,7 @@ describe("CI runtime bounded retention and work quotas", () => {
     expect(LIMITS.active).toBeGreaterThanOrEqual(300);
     expect(LIMITS.requestsPerTick).toBeGreaterThanOrEqual(3_600);
     expect(LIMITS.wakePerTick).toBeGreaterThanOrEqual(100);
-    expect(LIMITS.tickMs).toBeGreaterThanOrEqual(600_000);
+    expect(LIMITS.tickMs).toBe(240_000);
     expect(LIMITS.retained).toBeGreaterThanOrEqual(8_000);
     expect(LIMITS.audit).toBeGreaterThanOrEqual(5_000);
     expect(LIMITS.deliveries).toBeGreaterThanOrEqual(10_000);
@@ -2088,7 +2088,7 @@ describe("CI runtime bounded retention and work quotas", () => {
     h.seed(ledger);
     h.configGet.mockImplementation(async (companyId) => {
       // Six failing attempts consume the whole tick budget before the healthy wait.
-      if (companyId === OTHER) { h.advance(100_000); throw new Error("temporary configuration read failure"); }
+      if (companyId === OTHER) { h.advance(LIMITS.tickMs / 6); throw new Error("temporary configuration read failure"); }
       return clone(h.rawConfig);
     });
     github.readiness.mockReturnValue(verdict("pass"));
