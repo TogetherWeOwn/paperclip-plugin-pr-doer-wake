@@ -70,16 +70,6 @@ export class ResponseLedger {
 
   /** The channel owner must schedule this at every applicable absolute deadline. */
   checkDeadline(now: number): void { this.check(now); }
-  nextDeadline(): number | undefined {
-    if (this.poisoned || this.done) return undefined;
-    let deadline = Math.min(this.limits.phaseDeadline, this.sealDeadline ?? Infinity);
-    for (const request of this.requests.values()) {
-      if (request.ackDeadline !== undefined && !(request.acked && request.writeAccounted)) {
-        deadline = Math.min(deadline, request.ackDeadline);
-      }
-    }
-    return deadline;
-  }
   poison(reason: string): void { this.failure ??= reason; }
   get poisoned(): boolean { return this.failure !== undefined; }
   get admissionClosed(): boolean { return this.endId !== undefined || this.poisoned; }
