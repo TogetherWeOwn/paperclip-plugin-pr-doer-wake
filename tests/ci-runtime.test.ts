@@ -1049,7 +1049,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
       let admittedFetch: PluginContext["http"]["fetch"];
       github.construct.mockImplementation((fetch) => { admittedFetch = fetch; });
       github.pull.mockImplementation(async (_repo: string, n: number) => { await admittedFetch("https://example.test", {}); return pull({ number: n, headSha: NEXT_HEAD }); });
-      github.snapshot.mockImplementation(async () => { for (let i = 0; i < 68; i++) await admittedFetch("https://example.test", {}); return {}; });
+      github.snapshot.mockImplementation(async () => { for (let i = 0; i < 68; i++) { try { await admittedFetch("https://example.test", {}); } catch { throw new Error("network"); } } return {}; });
       github.readiness.mockReturnValue(verdict("pass"));
       h.requestWakeup.mockImplementation(async (id) => ({ queued: id === `issue-${numbers.at(-1)}` }));
 

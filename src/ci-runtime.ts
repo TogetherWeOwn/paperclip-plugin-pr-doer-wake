@@ -886,7 +886,7 @@ export class CiWakeRuntime {
         } catch (error) {
           // Retry a request-truncated entry first next tick, unless it already
           // had the whole reviewer share: then rotate it to avoid blocking peers.
-          if (error instanceof Error && error.message === "tick_budget" && requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
+          if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
           this.audit(ledger, "pr_head_wake", "retryable");
           await this.save(ledger);
         }
