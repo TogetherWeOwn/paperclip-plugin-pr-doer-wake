@@ -88,7 +88,9 @@ int main(int argc, char **argv) {
     }
 
     while (!drained) {
-        if (!remaining_ms(&deadline) || ownership_is_poisoned(ledger)) {
+        int expired = !remaining_ms(&deadline);
+        if (expired || ownership_is_poisoned(ledger)) {
+            if (expired) fault = 1;
             if (!cleaning) {
                 cleaning = 1;
                 ownership_poison(ledger);
@@ -137,11 +139,13 @@ int main(int argc, char **argv) {
             if (ready < 0 && errno != EINTR) {
                 fault = 1;
                 ownership_poison(ledger);
+                if (cleaning) break;
             }
             if (ready > 0) {
                 if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) fault = 1;
                 if (drain_signals(event.fd, &interrupted) < 0) fault = 1;
                 if (interrupted || fault) ownership_poison(ledger);
+                if (cleaning && fault) break;
             }
         }
     }

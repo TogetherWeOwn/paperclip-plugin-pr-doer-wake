@@ -13,7 +13,7 @@
 
 enum scenario { NORMAL, NO_CHILD, WAIT_ERROR, POLL_ERROR, READ_ERROR, SHORT_READ,
                 INTERRUPT, FULL, TIMEOUT, NO_PIDFD, UNKNOWN, LATE_INTERRUPT,
-                SIGNAL_FLOOD, SIGNAL_FAILURE };
+                SIGNAL_FLOOD, SIGNAL_FAILURE, EXPIRED_RECEIPT, PERSISTENT_POLL };
 static enum scenario scenario;
 static int waits, signals_sent, polls, ticks, reads;
 
@@ -51,7 +51,11 @@ static pid_t fake_waitpid(pid_t pid, int *status, int options) {
     (void)options; assert(pid == -1); ++waits;
     if (scenario == FULL) { *status = 0; return 100 + waits; }
     if (scenario == UNKNOWN && waits == 1) { *status = 0; return 99; }
-    if (scenario == TIMEOUT || scenario == SIGNAL_FAILURE) return 0;
+    if (scenario == TIMEOUT || scenario == SIGNAL_FAILURE || scenario == PERSISTENT_POLL) return 0;
+    if (scenario == EXPIRED_RECEIPT) {
+        if (waits == 1) { ticks = 100; *status = 0; return 42; }
+        errno = ECHILD; return -1;
+    }
     if (scenario == NO_CHILD) { errno = ECHILD; return -1; }
     if (scenario == WAIT_ERROR && waits == 1) { errno = EIO; return -1; }
     if ((scenario == POLL_ERROR || scenario == READ_ERROR || scenario == SHORT_READ ||
@@ -64,7 +68,9 @@ static pid_t fake_waitpid(pid_t pid, int *status, int options) {
 }
 static int fake_poll(struct pollfd *fds, nfds_t n, int timeout) {
     (void)timeout; assert(n == 1); ++polls;
-    if (scenario == POLL_ERROR && polls == 1) { errno = EIO; return -1; }
+    if ((scenario == POLL_ERROR && polls == 1) || scenario == PERSISTENT_POLL) {
+        errno = EIO; return -1;
+    }
     if ((scenario == READ_ERROR || scenario == SHORT_READ || scenario == INTERRUPT) && polls == 1) {
         fds->revents = POLLIN; return 1;
     }
@@ -122,5 +128,8 @@ int main(void) {
     run(SIGNAL_FLOOD, 1, 2, 0);
     assert(reads == SIGNAL_BATCH);
     run(SIGNAL_FAILURE, 1, -1, 1);
+    run(EXPIRED_RECEIPT, 1, 2, 0);
+    run(PERSISTENT_POLL, 1, 2, 1);
+    assert(polls == 2);
     return 0;
 }
