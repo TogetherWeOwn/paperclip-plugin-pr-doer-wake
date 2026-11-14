@@ -139,7 +139,26 @@ static void reused_pid_remains_ambiguous(void) {
     assert(ownership_observe_echild(ledger) == 0);
 }
 
+static void poisoned_cleanup_retains_identity(void) {
+    ownership_receipt receipt;
+    ownership_ledger *ledger = ownership_create(1, 2);
+    ownership_record *record = ownership_reserve(ledger);
+    assert(ownership_register(ledger, record, 101, 3, 4) == 0);
+    ownership_poison(ledger);
+    assert(ownership_observe_no_ready(ledger) == 0);
+    assert(ownership_observe_echild(ledger) == 0);
+    assert(ownership_snapshot(ledger, record, &receipt) == 0);
+    assert(receipt.pid == 101 && receipt.pidfd == 4 && !receipt.has_status);
+    assert(ownership_observe_status(ledger, 101, 9) == 0);
+    assert(ownership_snapshot(ledger, record, &receipt) == 0);
+    assert(receipt.pid == 101 && receipt.has_status && receipt.status == 9);
+    assert(ownership_observe_echild(ledger) == 0);
+    assert(ownership_is_poisoned(ledger));
+    assert(ownership_advance(ledger, record, OWN_PINNED) == -1);
+}
+
 int main(void) {
+    poisoned_cleanup_retains_identity();
     reused_pid_remains_ambiguous();
     invalid_and_duplicate_events();
     early_each_state();
