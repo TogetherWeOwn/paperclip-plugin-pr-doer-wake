@@ -816,6 +816,46 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().cursors["example/project"]).toBe(NOW + DAY);
     expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
   });
+  it("keeps ambiguous closure coverage pinned while the effect budget drains", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event <!-- note -->";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
+    const closed = [pull({ number: 42, state: "closed", closedAt: NOW - 30_000 }), ...Array.from({ length: 18 }, (_, i) => pull({ number: i + 1, state: "closed", closedAt: NOW - (20 - i) * 1000 }))];
+    const h = fixture({ cards: [owner], open: [], closed });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(15);
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().cursors).toEqual({});
+    expect(h.ledger().dispositions).toEqual({});
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(18);
+    expect(h.ledger().cursors).toEqual({});
+    owner.texts[0]!.body = body.replace(" <!-- note -->", "");
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).not.toContain("example/project#42");
+    expect(h.ledger().cursors["example/project"]).toBe(NOW);
+  });
+  it("preserves an ambiguous clock through a failed receipt archive and restart", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions);
+    for (let i = 0; i < 19_999; i++) h.ledger().receipts[`history-${i}`] = { at: NOW, status: "woken" };
+    owner.texts[0]!.body += " <!-- note -->";
+    const set = h.ctx.state.set.getMockImplementation()!;
+    h.ctx.state.set.mockImplementation(async (key, value) => {
+      if (key.stateKey.includes(":receipt:")) throw new Error("archive reply failed");
+      return set(key, value);
+    });
+    await expect(h.restart().poll()).rejects.toThrow("archive reply failed");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().report.complete).toBe(false);
+    h.ctx.state.set.mockImplementation(set);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
   it("isolates physical-line clocks when one of two directives gains a comment", async () => {
     const first = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
     const second = "PR disposition: example/project#43 finish; next actor contributor; revisit event";
