@@ -56,6 +56,26 @@ describe('response consumer hook', () => {
     await expect(malformed.accept(Buffer.from([0xff]), () => {})).rejects.toThrow('malformed response');
   });
 
+  it('poisons before consumption when the acknowledgement exceeds the frame limit', async () => {
+    const bytes = response(1);
+    const consumer = new ResponseConsumer(identity, bytes.byteLength, 1);
+    consumer.register(1);
+    let consumed = false;
+    await expect(consumer.accept(bytes, () => { consumed = true; })).rejects.toThrow('frame limit');
+    expect(consumed).toBe(false);
+    expect(consumer.poisoned).toBe(true);
+  });
+
+  it('poisons on a deeply nested response that cannot be canonicalized', async () => {
+    const consumer = new ResponseConsumer(identity, 65536, 1);
+    consumer.register(1);
+    const prefix = JSON.stringify({ ...identity, type: 'RESPONSE', id: 1 }).slice(0, -1);
+    const bytes = Buffer.from(`${prefix},"outcome":${'['.repeat(10000)}0${']'.repeat(10000)}}`);
+    await expect(consumer.accept(bytes, () => {})).rejects.toThrow('invalid response');
+    expect(consumer.poisoned).toBe(true);
+    expect(() => consumer.register(2)).toThrow();
+  });
+
   it('does not acknowledge acceptance completing after channel poison', async () => {
     const consumer = new ResponseConsumer(identity, 65536, 1);
     consumer.register(1);
