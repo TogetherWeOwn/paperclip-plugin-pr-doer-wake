@@ -14,6 +14,15 @@ def populated(group):
     return events["populated"]
 
 
+def kill_and_wait_empty(group):
+    (group / "cgroup.kill").write_text("1")
+    deadline = time.monotonic() + 5
+    while populated(group) != "0":
+        if time.monotonic() >= deadline:
+            raise RuntimeError("recursive populated=0 not observed within cleanup budget")
+        time.sleep(0.05)
+
+
 def main():
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         raise RuntimeError("refusing outside a GitHub-hosted Actions runner")
@@ -75,12 +84,7 @@ def main():
         if status != 0 or populated(group) != "1" or populated(nested) != "1":
             raise RuntimeError("nested survivor or recursive population not observed")
         print("observed: gated placement; orphaned setsid descendant; recursive populated=1", flush=True)
-        (group / "cgroup.kill").write_text("1")
-        deadline = time.monotonic() + 5
-        while populated(group) != "0":
-            if time.monotonic() >= deadline:
-                raise RuntimeError("recursive populated=0 not observed within cleanup budget")
-            time.sleep(0.05)
+        kill_and_wait_empty(group)
         print("observed: cgroup.kill followed by recursive populated=0", flush=True)
     finally:
         if gate_write is not None:
@@ -95,7 +99,7 @@ def main():
             if fd is not None:
                 os.close(fd)
         # Only this freshly created subtree is ours. Failure remains a failed probe.
-        (group / "cgroup.kill").write_text("1")
+        kill_and_wait_empty(group)
         for directory in (group / "leaf" / "nested", group / "leaf", group):
             if directory.exists():
                 directory.rmdir()
