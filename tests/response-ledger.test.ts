@@ -63,6 +63,20 @@ describe('response ledger', () => {
     expect(() => l.admit(2, 3)).toThrow('outstanding limit');
   });
 
+  it('retains inherited identity and limits and enforces their bounds', () => {
+    const l = new ResponseLedger(Object.create(identity), Object.create({ ...limits, maxOutstanding: 1 }), 0);
+    expect(l.identity).toEqual(identity);
+    expect(l.limits).toEqual({ ...limits, maxOutstanding: 1 });
+    prepare(l);
+    expect(() => l.admit(2, 3)).toThrow('outstanding limit');
+  });
+
+  it.each(Object.keys(limits))('rejects an omitted %s bound', key => {
+    const incomplete: Partial<typeof limits> = { ...limits };
+    delete incomplete[key as keyof typeof limits];
+    expect(() => new ResponseLedger(identity, incomplete as typeof limits, 0)).toThrow('invalid ledger identity or limits');
+  });
+
   it('records the actual write result after a separate poison', () => {
     const l = ledger();
     prepare(l);

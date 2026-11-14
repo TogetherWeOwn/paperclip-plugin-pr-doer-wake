@@ -48,14 +48,18 @@ export class ResponseLedger {
   readonly limits: Readonly<LedgerLimits>;
 
   constructor(identity: Identity, limits: LedgerLimits, now: number) {
-    if (identity.version !== 1 || !identity.caseId || !identity.phaseId || !identity.nonce ||
-        Object.values(limits).some(n => !Number.isSafeInteger(n) || n <= 0) ||
-        limits.phaseDeadline <= now || limits.maxFrameBytes > 65536 ||
-        limits.maxOutstanding > 32 || limits.ackTimeout > 10000 || limits.sealTimeout > 10000) {
+    const retainedIdentity = { version: identity.version, caseId: identity.caseId, phaseId: identity.phaseId, nonce: identity.nonce };
+    const retainedLimits = { phaseDeadline: limits.phaseDeadline, ackTimeout: limits.ackTimeout,
+      sealTimeout: limits.sealTimeout, maxOutstanding: limits.maxOutstanding, maxRequests: limits.maxRequests,
+      maxFrameBytes: limits.maxFrameBytes, maxBufferedBytes: limits.maxBufferedBytes };
+    if (retainedIdentity.version !== 1 || !retainedIdentity.caseId || !retainedIdentity.phaseId || !retainedIdentity.nonce ||
+        Object.values(retainedLimits).some(n => !Number.isSafeInteger(n) || n <= 0) ||
+        retainedLimits.phaseDeadline <= now || retainedLimits.maxFrameBytes > 65536 ||
+        retainedLimits.maxOutstanding > 32 || retainedLimits.ackTimeout > 10000 || retainedLimits.sealTimeout > 10000) {
       throw new Error('invalid ledger identity or limits');
     }
-    this.identity = Object.freeze({ ...identity });
-    this.limits = Object.freeze({ ...limits });
+    this.identity = Object.freeze(retainedIdentity);
+    this.limits = Object.freeze(retainedLimits);
   }
 
   private fail(reason: string): never {
