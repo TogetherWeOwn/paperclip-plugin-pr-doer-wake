@@ -27,6 +27,30 @@ jobs:
       # Pure synthetic fixtures only; this does not launch or qualify a container.
       - run: python3 -I qualification/cross-version/test_inspect_image.py
 
+  ownership-ledger:
+    name: Synthetic ownership accounting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # Supplied observations only; no process or cgroup fixture is launched.
+      - run: |
+          set -eu
+          cc -std=c11 -Wall -Wextra -Werror -pedantic -c \
+            qualification/synthetic-fence/ownership-ledger.c \
+            -o "$RUNNER_TEMP/ownership-ledger.o"
+          if nm "$RUNNER_TEMP/ownership-ledger.o" | grep -E '(^|[[:space:]])(wait|waitpid|waitid|wait3|wait4|ownership_drain[^[:space:]]*)$'; then
+            exit 1
+          fi
+          cc -std=c11 -Wall -Wextra -Werror -pedantic \
+            "$RUNNER_TEMP/ownership-ledger.o" \
+            qualification/synthetic-fence/ownership-ledger.test.c \
+            -o "$RUNNER_TEMP/ownership-ledger-test"
+          timeout 10s "$RUNNER_TEMP/ownership-ledger-test"
+
   custody-parser-baseline:
     name: Custody parser pinned regression control
     runs-on: ubuntu-24.04
