@@ -79,6 +79,8 @@ interface Ledger {
   prHeadPending: Record<string, PrHeadPending>;
   /** Per-(company, card, SHA) wake dedupe timestamps for pr_head_changed. */
   reviewerWakes: Record<string, number>;
+  /** A queued request requires a conservative full scan on a later poll. */
+  deferredFullPoll?: boolean;
 }
 const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {}, prHeadPending: {}, reviewerWakes: {} });
 class BindingChanged extends Error {}
@@ -561,6 +563,13 @@ export class CiWakeRuntime {
       // Queue targeted hints instead of dropping them: a completed head whose
       // hint arrives mid-poll must not wait for the next backstop tick.
       else if (only) this.pendingTargets.set(`${only.companyId}:${only.repo}:${only.sha}`, only);
+      // The in-memory queue can disappear on failure or restart. Do not
+      // acknowledge it until its full-scan fallback is saved under the lock.
+      await this.serialized(async () => {
+        const ledger = await this.load();
+        ledger.deferredFullPoll = true;
+        await this.save(ledger);
+      });
       return;
     }
     this.pollInFlight = true;
@@ -592,8 +601,10 @@ export class CiWakeRuntime {
 
   private async pollLocked(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
     const ledger = await this.load();
+    if (ledger.deferredFullPoll) only = undefined;
     this.compact(ledger);
     await this.save(ledger);
+    let scanComplete = true;
     const started = this.now();
     let requests = 0;
     let wakes = 0;
@@ -614,7 +625,7 @@ export class CiWakeRuntime {
     // Oldest last-attempt first prevents one unavailable repository starving others.
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const wait of pending) {
-      if (requests >= ciRequestLimit || wakes >= ciWakeLimit || this.now() - started >= LIMITS.tickMs) break;
+      if (requests >= ciRequestLimit || wakes >= ciWakeLimit || this.now() - started >= LIMITS.tickMs) { scanComplete = false; break; }
       try {
         wait.lastAttemptAt = this.now();
         const config = await this.config(wait.companyId, false);
@@ -711,6 +722,7 @@ export class CiWakeRuntime {
           await this.save(ledger);
         }
       } catch (error) {
+        if (!(error instanceof BindingChanged)) scanComplete = false;
         if (error instanceof BindingChanged) {
           wait.status = "retired"; wait.reason = "binding_changed"; wait.finishedAt = this.now();
         }
@@ -731,7 +743,7 @@ export class CiWakeRuntime {
       if (allEntries.length) await this.save(ledger);
       const reviewerStartRequests = requests;
       for (const [key, entry] of entries) {
-        if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+        if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) { scanComplete = false; break; }
         const entryStartRequests = requests;
         const previousOrder = entry.pollOrder!;
         entry.pollOrder = ++sequence;
@@ -803,6 +815,7 @@ export class CiWakeRuntime {
             // repeatedly consume the invocation before later cards are visited.
             if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) {
               if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
+              scanComplete = false;
               outstanding = true; break;
             }
             entry.candidateOrder[issueId] = ++candidateSequence;
@@ -850,7 +863,7 @@ export class CiWakeRuntime {
             // one PR can have many eligible cards. Stop dispatching, keep
             // the entry, and resume the rest on the next tick; already
             // woken cards stay deduped via reviewerWakes.
-            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { scanComplete = false; outstanding = true; break; }
             // Persist dedupe intent BEFORE the host call. A lost reply or
             // restart never repeats this (card, SHA) effect.
             ledger.reviewerWakes[wakeKey] = this.now();
@@ -887,6 +900,7 @@ export class CiWakeRuntime {
           // Clear only when every candidate is woken/deduped/ineligible/excluded.
           if (!outstanding && !shadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
         } catch (error) {
+          scanComplete = false;
           // Retry a request-truncated entry first next tick, unless it already
           // had the whole reviewer share: then rotate it to avoid blocking peers.
           if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
@@ -895,6 +909,7 @@ export class CiWakeRuntime {
         }
       }
     }
+    if (!only && scanComplete && ledger.deferredFullPoll) ledger.deferredFullPoll = false;
     await this.save(ledger);
   }
 

@@ -61,6 +61,7 @@ type Ledger = {
   samples: Record<string, Array<{ sha: string; ms: number }>>;
   prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: string[]; pollOrder?: number }>;
   reviewerWakes?: Record<string, number>;
+  deferredFullPoll?: boolean;
 };
 const clone = <T>(value: T): T => structuredClone(value);
 const waitData = (result: ToolResult) => result.data as { waitId: string; status: string; expiresAt: number };
@@ -1685,15 +1686,79 @@ describe("CI wait identity and serialization", () => {
     const targeted = h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD });
     await entered.promise;
     const fullJob = h.runtime.poll();
-    await fullJob;
     expect(h.requestWakeup).not.toHaveBeenCalled();
     release.resolve();
-    await targeted;
+    await Promise.all([targeted, fullJob]);
     expect(github.snapshot.mock.calls.map(([, sha]) => sha)).toEqual([HEAD, NEXT_HEAD]);
     expect(h.requestWakeup.mock.calls.map(([issueId]) => issueId)).toEqual([ISSUE, OTHER]);
     expect(h.ledger().waits.map((wait) => wait.status)).toEqual(["woken", "woken"]);
     await h.runtime.poll();
     expect(h.requestWakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("acknowledges a queued poll only after its serialized fallback write", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const entered = deferred(), release = deferred(), saving = deferred(), saved = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    const first = h.runtime.poll();
+    await entered.promise;
+    const set = h.set.getMockImplementation()!;
+    h.set.mockImplementation(async (key, value) => {
+      if ((value as Ledger).deferredFullPoll) { saving.resolve(); await saved.promise; }
+      await set(key, value);
+    });
+    let acknowledged = false;
+    const queued = h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD }).then(() => { acknowledged = true; });
+    release.resolve();
+    await saving.promise;
+    expect(acknowledged).toBe(false);
+    saved.resolve();
+    await Promise.all([first, queued]);
+    expect(h.writes.some((ledger) => ledger.deferredFullPoll)).toBe(true);
+  });
+
+  it("rejects a queued poll when its fallback write fails", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const entered = deferred(), release = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    const first = h.runtime.poll();
+    await entered.promise;
+    const set = h.set.getMockImplementation()!;
+    h.set.mockImplementation(async (key, value) => {
+      if ((value as Ledger).deferredFullPoll) throw new Error("fallback unavailable");
+      await set(key, value);
+    });
+    const queued = expect(h.runtime.poll({ companyId: COMPANY, repo: REPO, sha: HEAD })).rejects.toThrow("fallback unavailable");
+    release.resolve();
+    await Promise.all([first, queued]);
+  });
+
+  it("resumes a persisted full scan after restart even for an unrelated target", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    h.seed({ ...h.ledger(), deferredFullPoll: true });
+    github.readiness.mockReturnValue(verdict("pass"));
+    await new CiWakeRuntime(h.ctx, h.clock).poll({ companyId: COMPANY, repo: REPO, sha: NEXT_HEAD });
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(h.ledger().deferredFullPoll).toBe(false);
+  });
+
+  it("retains the fallback when a full scan exhausts its time before visiting every wait", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const ledger = h.ledger();
+    ledger.waits.push({ ...ledger.waits[0]!, waitId: "second-wait" });
+    ledger.deferredFullPoll = true;
+    h.seed(ledger);
+    github.pull.mockImplementationOnce(async () => { h.advance(LIMITS.tickMs); return pull(); });
+    await h.runtime.poll();
+    expect(h.ledger().deferredFullPoll).toBe(true);
+    expect(github.snapshot).toHaveBeenCalledTimes(1);
+    await new CiWakeRuntime(h.ctx, h.clock).poll();
+    expect(h.ledger().deferredFullPoll).toBe(false);
+    expect(github.snapshot).toHaveBeenCalledTimes(3);
   });
 
   it("coalesces an overlapping poll while a terminal poll and registration retry are in flight", async () => {
