@@ -26,8 +26,9 @@ def kill_and_wait_empty(group):
 def main():
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         raise RuntimeError("refusing outside a GitHub-hosted Actions runner")
-    if os.geteuid() != 0:
-        raise RuntimeError("expected a delegated systemd scope running as root")
+    if os.geteuid() == 0 or os.getuid() == 0:
+        raise RuntimeError("expected an unprivileged delegated systemd scope")
+    print(f"probe uid={os.getuid()} euid={os.geteuid()}", flush=True)
     memberships = Path("/proc/self/cgroup").read_text().splitlines()
     paths = [line[3:] for line in memberships if line.startswith("0::/")]
     if len(paths) != 1 or "fixture-cgroup-" not in paths[0]:

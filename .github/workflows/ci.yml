@@ -32,7 +32,7 @@ jobs:
           {
             printf 'requested_sha=%s\ncheckout_sha=%s\nrun=%s attempt=%s job=%s\n' "$REQUESTED_SHA" "$(git rev-parse HEAD)" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB"
             test "$(git rev-parse HEAD)" = "$REQUESTED_SHA" || exit 1
-            sudo systemd-run --scope --unit="fixture-cgroup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -p Delegate=yes \
+            sudo systemd-run --scope --uid="$(id -u)" --unit="fixture-cgroup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -p Delegate=yes \
               env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
               python3 -I qualification/synthetic-fence/cgroup-capability.py
           } 2>&1 | tee "$RUNNER_TEMP/cgroup-capability.log"
