@@ -99,23 +99,110 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
   return tracker ?? { card: null, source: "unmapped", candidates: [] };
 }
 
+/** Classify physical lines without joining fragments across protected text. */
+export function classifyDirectiveLines(body: string): { line: string; original: string; comment: boolean }[] {
+  const lines = body.split(/\r?\n/);
+  const markerFor = (line: string) => /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  const opener = (line: string) => {
+    const marker = markerFor(line);
+    return marker && (marker[1]![0] !== "`" || !marker[2]!.includes("`")) ? marker : null;
+  };
+  // Index the next exact maximal run within each bounded inline region.
+  const closing = new Map<string, { line: number; end: number }>();
+  let next = new Map<number, { line: number; end: number }>();
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (/^\s*$/.test(line) || opener(line)) { next = new Map(); continue; }
+    const runs = [...line.matchAll(/`+/g)];
+    for (let j = runs.length - 1; j >= 0; j--) {
+      const run = runs[j]!;
+      const close = next.get(run[0].length);
+      if (close) closing.set(`${i}:${run.index}`, close);
+      next.set(run[0].length, { line: i, end: run.index! + run[0].length });
+    }
+  }
+  const result: { line: string; original: string; comment: boolean }[] = [];
+  let fence: { marker: string; length: number } | null = null;
+  let comment = false;
+  let span: { line: number; end: number } | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const marker = markerFor(line);
+    if (fence) {
+      if (marker && marker[1]![0] === fence.marker && marker[1]!.length >= fence.length && /^\s*$/.test(marker[2]!)) fence = null;
+      continue;
+    }
+    if (!comment && !span && opener(line)) {
+      fence = { marker: marker![1]![0]!, length: marker![1]!.length };
+      continue;
+    }
+    let visible = span || comment ? " " : "";
+    let touched = comment;
+    let position = 0;
+    let slashes = 0;
+    while (position < line.length) {
+      if (span) {
+        if (span.line !== i) { position = line.length; continue; }
+        position = span.end;
+        span = null;
+        slashes = 0;
+      } else if (comment) {
+        const end = line.indexOf("-->", position);
+        if (end < 0) break;
+        position = end + 3;
+        comment = false;
+        slashes = 0;
+      } else if (line[position] === "`") {
+        let end = position + 1;
+        while (line[end] === "`") end++;
+        const close = slashes % 2 === 0 ? closing.get(`${i}:${position}`) : undefined;
+        if (close) { visible += " "; span = close; position = end; }
+        else { visible += line.slice(position, end); position = end; }
+        slashes = 0;
+      } else if (line.startsWith("<!--", position) && slashes % 2 === 0) {
+        visible += " ";
+        touched = true;
+        position += 4;
+        comment = true;
+        slashes = 0;
+      } else {
+        const char = line[position++]!;
+        visible += char;
+        slashes = char === "\\" ? slashes + 1 : 0;
+      }
+    }
+    result.push({ line: visible, original: line, comment: touched });
+  }
+  return result;
+}
+
+export function directiveLines(body: string): string[] {
+  return classifyDirectiveLines(body).map(({ line }) => line);
+}
+
+/** Parse a line classified in its original body context. */
+export function dispositionLine(line: string, pr: CustodyPull, at: number): Disposition | null {
+  const match = new RegExp(`^PR disposition:\\s+${escape(prReference(pr))}\\s+(finish|rework|defer|close);\\s*next actor\\s+[^;\\s][^;]*;\\s*revisit\\s+(\\S(?:.*?\\S)?)\\s*$`, "i").exec(line);
+  if (!match) return null;
+  const revisitText = match[2]!;
+  const revisit = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?$/.test(revisitText) ? Date.parse(revisitText) : NaN;
+  const canonical = revisitText.length === 10 ? `${revisitText}T00:00:00Z` : revisitText;
+  const valid = Number.isFinite(revisit) && new Date(revisit).toISOString().replace(".000Z", "Z") === canonical;
+  return { at, action: match[1]!.toLowerCase(), revisit: valid ? revisit : null };
+}
+
 /** A directive belongs to this PR, not to every PR mentioned elsewhere in the same card. */
 export function latestDisposition(card: CustodyCard, pr: CustodyPull): Disposition | null {
   const found: Disposition[] = [];
-  for (const text of card.texts.filter((t) => t.id?.startsWith("comment:"))) for (const line of text.body.split(/\r?\n/)) {
-    const match = new RegExp(`^PR disposition:\\s+${escape(prReference(pr))}\\s+(finish|rework|defer|close);\\s*next actor\\s+[^;]+;\\s*revisit\\s+(.+?)\\s*$`, "i").exec(line);
-    if (!match) continue;
-    const revisitText = match[2]!;
-    const revisit = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}Z)?$/.test(revisitText) ? Date.parse(revisitText) : NaN;
-    const canonical = revisitText.length === 10 ? `${revisitText}T00:00:00Z` : revisitText;
-    const valid = Number.isFinite(revisit) && new Date(revisit).toISOString().replace(".000Z", "Z") === canonical;
-    found.push({ at: text.at, action: match[1]!.toLowerCase(), revisit: valid ? revisit : null });
+  for (const text of card.texts.filter((t) => t.id?.startsWith("comment:"))) for (const line of directiveLines(text.body)) {
+    const disposition = dispositionLine(line, pr, text.at);
+    if (disposition) found.push(disposition);
   }
   return found.sort((a, b) => b.at - a.at)[0] ?? null;
 }
 export function hasCardClosure(card: CustodyCard, pr: CustodyPull): boolean {
-  return card.texts.some((t) => t.id?.startsWith("comment:") && t.body.split(/\r?\n/).some((line) => {
-    if (!/^Closed unmerged:\s+\S/i.test(line)) return false;
+  return card.texts.some((t) => t.id?.startsWith("comment:") && directiveLines(t.body).some((line) => {
+    if (!/^Closed unmerged:\s+[^;\s]/i.test(line)) return false;
     const sources = line.split(";").slice(1).map((field) => field.trim()).filter((field) => /^source\b/i.test(field));
     if (sources.length !== 1) return false;
     const source = /^source\s+(.+)$/i.exec(sources[0]!);
@@ -123,12 +210,11 @@ export function hasCardClosure(card: CustodyCard, pr: CustodyPull): boolean {
   }));
 }
 export function hasPrClosure(texts: string[]): boolean {
-  return texts.some((body) => body.split(/\r?\n/).some((line) => /^Closed unmerged:\s+(?:duplicate of|superseded by|need lost|mismatch|burden)\b/i.test(line)));
+  return texts.some((body) => directiveLines(body).some((line) => /^Closed unmerged:\s+(?:duplicate of|superseded by|need lost|mismatch|burden)\b/i.test(line)));
 }
-export function custodyTriggers(pr: CustodyPull, card: CustodyCard, activityAt: number | null, closureTexts: string[] | null, now: number): Trigger[] {
+export function custodyTriggers(pr: CustodyPull, card: CustodyCard, activityAt: number | null, closureTexts: string[] | null, now: number, disposition: Disposition | null = latestDisposition(card, pr)): Trigger[] {
   const result: Trigger[] = [];
   const add = (kind: Trigger["kind"], epoch: string, at: number) => result.push({ key: `${prReference(pr)}|${kind}|${epoch}`, kind, epoch, at });
-  const disposition = latestDisposition(card, pr);
   if (pr.state === "open") {
     if (["done", "cancelled", "backlog"].includes(card.status)) {
       // statusVersion changes only on status transitions, unlike updatedAt/document writes.

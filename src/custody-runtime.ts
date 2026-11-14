@@ -7,7 +7,7 @@ import { parseCustodyConfig, type CustodyConfig } from "./custody-config.js";
 import { CustodyAppAuth } from "./custody-auth.js";
 import { CustodyGithub, type CustodyPull } from "./custody-github.js";
 import { custodyByteBudget, loadCustodyCards, loadCustodyTexts, parseWorkProductBindings, type CustodyCard } from "./custody-reader.js";
-import { CUSTODY_ORIGIN, DAY, custodyTriggers, latestDisposition, mapCustodyCard, prIndexRef, prReference, prRefFromUrl, prUrl, type CustodyRegistration, type Trigger } from "./custody-policy.js";
+import { CUSTODY_ORIGIN, DAY, classifyDirectiveLines, custodyTriggers, dispositionLine, mapCustodyCard, prIndexRef, prReference, prRefFromUrl, prUrl, type CustodyRegistration, type Disposition, type Trigger } from "./custody-policy.js";
 
 // A 100-PR listing page carries full PR bodies; long bodies push it past the
 // default 2 MiB response cap, so custody uses the transport's 8 MiB maximum.
@@ -271,7 +271,7 @@ export class CustodyRuntime {
       for (const repo of Object.keys(ledger.activityAfter)) if (!monitored.has(repo)) delete ledger.activityAfter[repo];
       for (const ref of Object.keys(ledger.heads)) if (!monitored.has(ref.split("#")[0]!)) delete ledger.heads[ref];
       const summaries = new Set<string>();
-      const pending: Array<{ pr: CustodyPull; card: CustodyCard; trigger: Trigger; repo: string }> = [];
+      const pending: Array<{ pr: CustodyPull; card: CustodyCard; trigger: Trigger; repo: string; disposition: Disposition | null }> = [];
       const scanned = new Map<string, number>();
       const summaryClosures = new Set<string>();
       const holdClosure = (repo: string, trigger: Trigger) => { if (trigger.kind === "closed") scanned.delete(repo); };
@@ -388,8 +388,9 @@ export class CustodyRuntime {
               if (pr.state === "closed") summaryClosures.add(repo);
               continue;
             }
-            let owner: CustodyCard;
-            try { owner = await this.dispositionClock(mapping.card, pr, ledger, async (id) => await archived("disposition", id) as number | null); }
+            const owner = mapping.card;
+            let disposition: Disposition | null;
+            try { disposition = await this.dispositionClock(owner, pr, ledger, async (id) => await archived("disposition", id) as number | null); }
             catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); continue; }
             let activity: number | null = null;
             let closure: string[] | null = null;
@@ -468,9 +469,9 @@ export class CustodyRuntime {
               if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr));
             }
             // Missing activity cannot erase an independently established terminal-card trigger.
-            const triggers = custodyTriggers(pr, owner, activity, closure, this.now());
+            const triggers = custodyTriggers(pr, owner, activity, closure, this.now(), disposition);
             row.triggers = triggers.map((t) => t.key);
-            for (const trigger of triggers) pending.push({ pr, card: owner, trigger, repo });
+            for (const trigger of triggers) pending.push({ pr, card: owner, trigger, repo, disposition });
           }
           if (complete) scanned.set(repo, until);
           // Stamp only when the repo's evidence pass actually ran — never
@@ -543,7 +544,7 @@ export class CustodyRuntime {
           if (summaryReceipt) summaryReceipt.turn ??= entry.turn;
           await dispatchSummary(); continue;
         }
-        const { pr, card, trigger, repo } = entry.item;
+        const { pr, card, trigger, repo, disposition } = entry.item;
         let receipt = ledger.receipts[trigger.key];
         if (!receipt) {
           try { if (await archived("receipt", trigger.key)) continue; }
@@ -555,7 +556,7 @@ export class CustodyRuntime {
         receipt.turn ??= entry.turn;
         const spend = effectSlot();
         // A fresh disposition acknowledges a terminal trigger; closed rationale remains mandatory on both sides.
-        if (trigger.kind === "terminal" && (latestDisposition(card, pr)?.at ?? 0) > receipt.at) receipt.status = "cleared";
+        if (trigger.kind === "terminal" && (disposition?.at ?? 0) > receipt.at) receipt.status = "cleared";
         if (receipt.status === "unconfirmed" && receipt.phase === "create") {
           // Reconcile a possibly created child by origin without ever repeating creation.
           try { await this.child(config, trigger.key, "", "", card, guard, audit, save, receipt, spend); }
@@ -618,23 +619,26 @@ export class CustodyRuntime {
     this.ctx.logger.info("pr-custody: inventory", { complete: ledger.report.complete, prs: ledger.report.rows.length, unknown: ledger.report.unknown.length, effects: ledger.report.effects, dryRun: config.dryRun });
   }
 
-  private async dispositionClock(card: CustodyCard, pr: CustodyPull, ledger: Ledger, archived: (id: string) => Promise<number | null>): Promise<CustodyCard> {
-    const texts: CustodyCard["texts"] = [];
-    for (const text of card.texts) for (const line of text.body.split(/\r?\n/)) {
-      const entry = { ...text, body: line };
-      if (latestDisposition({ ...card, texts: [entry] }, pr)) {
-        const key = createHash("sha256").update(JSON.stringify([card.id, text.id ?? "legacy", line])).digest("hex");
-        let at = ledger.dispositions[key] ?? await archived(key);
-        if (at === null) {
-          if (Object.keys(ledger.dispositions).length >= CUSTODY_LIMITS.receipts) throw new Error("disposition_capacity");
-          at = ledger.dispositions[key] = Math.min(text.at, this.now());
-        }
-        // Generic card/document timestamps cannot refresh an unchanged directive, even after compaction.
-        entry.at = at;
-      }
-      texts.push(entry);
+  private async dispositionClock(card: CustodyCard, pr: CustodyPull, ledger: Ledger, archived: (id: string) => Promise<number | null>): Promise<Disposition | null> {
+    const classified = card.texts.filter((text) => text.id?.startsWith("comment:")).flatMap((text) => classifyDirectiveLines(text.body).map(({ line, original, comment }) => ({ text, line, original, comment })));
+    // Reject ambiguity for the whole PR before acquiring any new clocks.
+    for (const { text, line, comment } of classified) {
+      if (comment && dispositionLine(line.trimStart(), pr, text.at)) throw new Error("disposition_ambiguous");
     }
-    return { ...card, texts };
+    const found: Disposition[] = [];
+    for (const { text, line, original } of classified) {
+      const disposition = dispositionLine(line, pr, text.at);
+      if (!disposition) continue;
+      const key = createHash("sha256").update(JSON.stringify([card.id, text.id ?? "legacy", original])).digest("hex");
+      let at = ledger.dispositions[key] ?? await archived(key);
+      if (at === null) {
+        if (Object.keys(ledger.dispositions).length >= CUSTODY_LIMITS.receipts) throw new Error("disposition_capacity");
+        at = ledger.dispositions[key] = Math.min(text.at, this.now());
+      }
+      // Generic card/document timestamps cannot refresh an unchanged directive, even after compaction.
+      found.push({ ...disposition, at });
+    }
+    return found.sort((a, b) => b.at - a.at)[0] ?? null;
   }
 
   private async confirmConfig(expected: CustodyConfig, guard: () => void): Promise<void> {

@@ -756,6 +756,43 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
     expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "pending" })]);
   });
+  it.each(["", " "])("defers comment-altered dispositions without changing existing clocks or receipts (trailing %j)", async (space) => {
+    const body = `PR disposition: example/project#42 finish; next actor contributor; revisit event${space}`;
+    const owner = card({ status: "done", texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    h.activity.mockResolvedValue(NOW);
+    h.ctx.issues.requestWakeup.mockResolvedValue({ queued: false, runId: null } as any);
+    await h.runtime.poll();
+    const clocks = { ...h.ledger().dispositions };
+    const receipts = structuredClone(h.ledger().receipts);
+    owner.texts[0]!.body += " <!-- note -->";
+    owner.texts[0]!.at = NOW + DAY;
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().receipts).toEqual(receipts);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it("retains closed coverage for ambiguous dispositions while an unrelated PR proceeds", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event <!-- note -->";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
+    const closed = pull({ state: "closed", closedAt: NOW - DAY });
+    const h = fixture({ cards: [owner], open: [pull({ number: 43 })], closed: [closed] });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().cursors["example/project"]).toBeUndefined();
+    expect(h.ledger().dispositions).toEqual({});
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: expect.stringContaining("example/project#43|") }));
+  });
+  it("does not reparse a masked multiline code span while acquiring clocks", async () => {
+    const body = "`example\nPR disposition: example/project#42 finish; next actor contributor; revisit event\nend`";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll();
+    expect(h.ledger().dispositions).toEqual({});
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
   it("acknowledges a terminal trigger when the same disposition is genuinely posted in a new comment", async () => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
     const owner = card({ status: "done", texts: [{ id: "description", body, at: NOW - DAY, ownership: true }] });
