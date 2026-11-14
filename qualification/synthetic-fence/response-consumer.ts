@@ -45,7 +45,10 @@ export class ResponseConsumer {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return this.fail('malformed response');
     const frame = value as Record<string, unknown>;
     const allowed = ['version', 'caseId', 'phaseId', 'nonce', 'type', 'id', 'outcome'];
-    if (JSON.stringify(frame) !== received.toString('utf8') || Object.keys(frame).length !== allowed.length ||
+    let canonical: string;
+    try { canonical = JSON.stringify(frame); }
+    catch { return this.fail('invalid response'); }
+    if (canonical !== received.toString('utf8') || Object.keys(frame).length !== allowed.length ||
         Object.keys(frame).some(key => !allowed.includes(key)) ||
         frame.version !== this.identity.version || frame.caseId !== this.identity.caseId ||
         frame.phaseId !== this.identity.phaseId || frame.nonce !== this.identity.nonce || frame.type !== 'RESPONSE' ||
@@ -53,12 +56,14 @@ export class ResponseConsumer {
       return this.fail('invalid response');
     }
     const id = frame.id as number;
+    const ack = Buffer.from(JSON.stringify({ ...this.identity, type: 'ACK', id, digest }) + '\n');
+    if (ack.byteLength > this.maxFrameBytes) return this.fail('frame limit');
     this.accepting.add(id);
     try { await consume(frame.outcome); }
     catch { return this.fail('consumer rejected response'); }
     if (this.poisoned) return this.fail(this.failure!);
     this.accepting.delete(id);
     this.pending.delete(id);
-    return Buffer.from(JSON.stringify({ ...this.identity, type: 'ACK', id, digest }) + '\n');
+    return ack;
   }
 }
