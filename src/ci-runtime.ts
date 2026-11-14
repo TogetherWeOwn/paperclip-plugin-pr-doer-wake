@@ -63,6 +63,8 @@ export interface PrHeadPending {
   oldSha: string;
   newSha: string;
   observedAt: number;
+  /** Durable service order; absent on legacy entries. */
+  attemptOrder?: number;
   shadowLogged?: string[];
 }
 interface Ledger {
@@ -509,7 +511,7 @@ export class CiWakeRuntime {
     const key = `${companyId}:${repo}:${prNumber}`;
     const existing = ledger.prHeadPending[key];
     if (existing && existing.newSha === newSha) return;
-    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now() };
+    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now(), attemptOrder: existing?.attemptOrder };
   }
 
   /** Exact work-product match for one PR; mirrors custody's work_product tier. */
@@ -720,11 +722,25 @@ export class CiWakeRuntime {
     };
     // Reviewer wakes for observed head changes (settled heads only).
     const pollReviewers = async () => {
-      const entries = Object.entries(ledger.prHeadPending)
-        .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
-        .sort((a, b) => a[1].observedAt - b[1].observedAt);
+      const allEntries = Object.entries(ledger.prHeadPending);
+      const order = (entry: PrHeadPending) => Number.isSafeInteger(entry.attemptOrder) && entry.attemptOrder! > 0 ? entry.attemptOrder! : 0;
+      const compare = (a: [string, PrHeadPending], b: [string, PrHeadPending]) =>
+        order(a[1]) - order(b[1]) || a[1].observedAt - b[1].observedAt || a[0].localeCompare(b[0]);
+      allEntries.sort(compare);
+      let nextOrder = allEntries.reduce((max, [, entry]) => Math.max(max, order(entry)), 0);
+      if (nextOrder > Number.MAX_SAFE_INTEGER - allEntries.length) {
+        allEntries.forEach(([, entry], index) => { entry.attemptOrder = index + 1; });
+        nextOrder = allEntries.length;
+      }
+      const entries = allEntries.filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha));
       for (const [key, entry] of entries) {
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+        // Persist service order before any attempt or wake. A failed write
+        // cannot authorize work based on a rotation that may not survive.
+        const previousOrder = entry.attemptOrder;
+        entry.attemptOrder = ++nextOrder;
+        try { await this.save(ledger); } catch { entry.attemptOrder = previousOrder; break; }
+        if (this.now() - started >= LIMITS.tickMs) break;
         try {
           const config = await this.config(entry.companyId, false);
           // Feature off: drop the entry rather than accumulate stale wakes.
@@ -778,6 +794,7 @@ export class CiWakeRuntime {
           const candidates = [...new Set(ledger.waits.filter((w) => w.companyId === entry.companyId && w.repo === entry.repo && w.prNumber === entry.prNumber).map((w) => w.issueId))];
           let outstanding = false;
           for (const issueId of candidates) {
+            if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
             const wakeKey = `${entry.companyId}:${issueId}:${entry.newSha}`;
             if (ledger.reviewerWakes[wakeKey] !== undefined) continue;
             let issue: any;
