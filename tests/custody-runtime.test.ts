@@ -810,6 +810,40 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().dispositions).toEqual({});
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: expect.stringContaining("example/project#43|") }));
   });
+  it("isolates physical-line clocks when one of two directives gains a comment", async () => {
+    const first = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const second = "PR disposition: example/project#43 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body: `${first}\n${second}`, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner], open: [pull(), pull({ number: 43 })] });
+    await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions);
+    const receipts = structuredClone(h.ledger().receipts);
+    expect(Object.keys(clocks)).toHaveLength(2);
+    owner.texts[0]!.body = `${first} <!-- note -->\n${second}`;
+    owner.texts[0]!.at = NOW + DAY;
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().report.unknown).not.toContain("example/project#43");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().receipts).toEqual(receipts);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    "```text\nDIRECTIVE\n```",
+    "<!--\nDIRECTIVE\n-->",
+  ])("does not acquire clocks from protected physical lines after restart (%s)", async (protectedText) => {
+    const hidden = "PR disposition: example/project#42 defer; next actor contributor; revisit 2099-01-01";
+    const visible = "PR disposition: example/project#43 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body: `${protectedText.replace("DIRECTIVE", hidden)}\n${visible}`, at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner], open: [pull(), pull({ number: 43 })] });
+    await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions);
+    expect(Object.keys(clocks)).toHaveLength(1);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: expect.stringContaining("example/project#42|idle|") }));
+    await h.restart().poll();
+    expect(h.ledger().dispositions).toEqual(clocks);
+  });
   it("does not reparse a masked multiline code span while acquiring clocks", async () => {
     const body = "`example\nPR disposition: example/project#42 finish; next actor contributor; revisit event\nend`";
     const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
