@@ -856,6 +856,22 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().dispositions).toEqual(clocks);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
+  it("acquires clocks only from comments, not other card text", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ texts: ["title", "description", "document:example"].map((id) => ({ id, body, at: NOW, ownership: true })) });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll(); expect(h.ledger().dispositions).toEqual({});
+    owner.texts.push({ id: `comment:${PROJECT}`, body, at: NOW, ownership: true });
+    await h.restart().poll(); expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
+  });
+  it("retains a hot disposition on failed archive write and recovers", async () => {
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body: "PR disposition: example/project#42 finish; next actor contributor; revisit event", at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner] }); await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions); for (let i = 0; i < 19_999; i++) h.ledger().dispositions[`history-${i}`] = NOW;
+    const set = h.ctx.state.set.getMockImplementation()!; h.ctx.state.set.mockImplementation(async (key, value) => { if (key.stateKey.includes(":disposition:")) throw new Error("archive failed"); return set(key, value); });
+    await expect(h.restart().poll()).rejects.toThrow("archive failed"); expect(h.ledger().dispositions).toMatchObject(clocks);
+    h.ctx.state.set.mockImplementation(set); await h.restart().poll(); expect(h.ledger().report.complete).toBe(true);
+  });
   it("isolates physical-line clocks when one of two directives gains a comment", async () => {
     const first = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
     const second = "PR disposition: example/project#43 finish; next actor contributor; revisit event";
