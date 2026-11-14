@@ -15,6 +15,37 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  synthetic-cgroup-capability:
+    name: Synthetic cgroup capability probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Probe delegated scope and recursive termination
+        env:
+          REQUESTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -o pipefail
+          {
+            printf 'requested_sha=%s\ncheckout_sha=%s\nrun=%s attempt=%s job=%s\n' "$REQUESTED_SHA" "$(git rev-parse HEAD)" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB"
+            test "$(git rev-parse HEAD)" = "$REQUESTED_SHA" || exit 1
+            sudo systemd-run --wait --pipe --uid="$(id -u)" --unit="fixture-cgroup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -p Delegate=yes \
+              -p "WorkingDirectory=$GITHUB_WORKSPACE" \
+              env GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+              python3 -I qualification/synthetic-fence/cgroup-capability.py
+          } 2>&1 | tee "$RUNNER_TEMP/cgroup-capability.log"
+      - name: Retain probe evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cgroup-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cgroup-capability.log
+          if-no-files-found: warn
+          retention-days: 7
+
   synthetic-image-validation:
     name: Synthetic image inspection checks
     runs-on: ubuntu-24.04
