@@ -15,6 +15,20 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  gated-launch-parser:
+    name: Gated launch parser unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # Pure parser tests only: no supervisor, runtime, or cgroup execution.
+      - run: |
+          cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/gated-launch.c qualification/synthetic-fence/gated-launch-test.c -o "$RUNNER_TEMP/gated-launch-test"
+          "$RUNNER_TEMP/gated-launch-test"
+
   synthetic-image-validation:
     name: Synthetic image inspection checks
     runs-on: ubuntu-24.04
