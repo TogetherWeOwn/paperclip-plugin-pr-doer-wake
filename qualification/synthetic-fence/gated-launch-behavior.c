@@ -5,12 +5,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
+static int atfork_pipe[2];
+static void atfork_child(void) { (void)write(atfork_pipe[1], "A", 1); }
 struct observation { const char *marker; int fail; int called; };
 static int record(const struct sf_child *child, void *arg)
 {
@@ -23,7 +25,6 @@ static int record(const struct sf_child *child, void *arg)
     if (o->fail) errno = ENOSPC;
     return o->fail;
 }
-
 static int placed(const char *marker)
 {
     int fd = open(marker, O_RDONLY | O_CLOEXEC);
@@ -33,7 +34,6 @@ static int placed(const char *marker)
     close(fd);
     return n == 1 && receipt == 'P';
 }
-
 static struct timespec deadline(void)
 {
     struct timespec t;
@@ -41,7 +41,6 @@ static struct timespec deadline(void)
     t.tv_sec += 10;
     return t;
 }
-
 int main(int argc, char **argv)
 {
     if (argc == 4 && strcmp(argv[1], "fixture") == 0) {
@@ -73,7 +72,9 @@ int main(int argc, char **argv)
     assert(dir >= 0 && exe >= 3);
     char *args[] = { "fixture", "fixture", argv[2], argv[1], NULL };
     char *env[] = { NULL };
-    /* A deliberately unplaced exec must leave an entry witness, not a placement receipt. */
+    /* The control proves both the unplaced entry witness and the atfork witness work. */
+    assert(pipe2(atfork_pipe, O_NONBLOCK | O_CLOEXEC) == 0);
+    assert(pthread_atfork(NULL, NULL, atfork_child) == 0);
     pid_t control = fork();
     assert(control >= 0);
     if (control == 0) {
@@ -82,11 +83,12 @@ int main(int argc, char **argv)
     }
     int status;
     assert(waitpid(control, &status, 0) == control);
+    char witness;
+    assert(read(atfork_pipe[0], &witness, 1) == 1 && witness == 'A');
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 4);
     assert(access(argv[2], F_OK) == 0 && !placed(argv[2]));
     assert(unlink(argv[2]) == 0);
     puts("negative control: unplaced fixture entry detected");
-
     struct sf_child child;
     struct observation o = { .marker = argv[2], .fail = 1 };
     struct timespec end = deadline();
@@ -95,7 +97,6 @@ int main(int argc, char **argv)
     assert(o.called == 1 && child.poisoned && child.reaped && child.pid == 0 && child.pidfd == -1);
     assert(access(argv[2], F_OK) == -1);
     assert(waitpid(-1, NULL, WNOHANG) == -1);
-
     o.fail = 0; o.called = 0; end = deadline();
     assert(sf_gated_launch(&child, dir, exe, args, env, &end, record, &o) == 0);
     assert(o.called == 1 && !child.poisoned && child.pid > 0 && child.pidfd >= 0);
@@ -109,6 +110,8 @@ int main(int argc, char **argv)
     assert(placed(argv[2]));
     assert(unlink(argv[2]) == 0);
     assert(waitpid(child.pid, &status, 0) == child.pid);
+    assert(read(atfork_pipe[0], &witness, 1) == -1 && errno == EAGAIN);
+    close(atfork_pipe[0]); close(atfork_pipe[1]);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     assert(waitpid(-1, NULL, WNOHANG) == -1);
     close(child.pidfd);

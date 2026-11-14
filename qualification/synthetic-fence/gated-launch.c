@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include "gated-launch.h"
 #include "cgroup-membership.h"
-
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -9,15 +8,14 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
 #define MEMBERSHIP_LIMIT 65536
-
 static int before(const struct timespec *end)
 {
     struct timespec now;
@@ -25,7 +23,6 @@ static int before(const struct timespec *end)
     return now.tv_sec < end->tv_sec ||
         (now.tv_sec == end->tv_sec && now.tv_nsec < end->tv_nsec);
 }
-
 static int no_caught_signals(void)
 {
     struct sigaction sa;
@@ -35,7 +32,6 @@ static int no_caught_signals(void)
     }
     return 1;
 }
-
 /* close_range failures are fatal: never exec with unknown inherited fds. */
 static void stub(int gate, int exe, char *const argv[], char *const envp[])
 {
@@ -58,7 +54,6 @@ static void stub(int gate, int exe, char *const argv[], char *const envp[])
     syscall(SYS_execveat, exe, "", argv, envp, AT_EMPTY_PATH);
     _exit(127);
 }
-
 static int membership(int dirfd, pid_t pid)
 {
     char buf[MEMBERSHIP_LIMIT + 1];
@@ -76,7 +71,6 @@ static int membership(int dirfd, pid_t pid)
     if (used > MEMBERSHIP_LIMIT) { errno = EOVERFLOW; return -1; }
     return sf_cgroup_contains(buf, used, pid);
 }
-
 static void terminate_owned(struct sf_child *c, const struct timespec *deadline)
 {
     int status;
@@ -97,7 +91,6 @@ static void terminate_owned(struct sf_child *c, const struct timespec *deadline)
         }
     }
 }
-
 int sf_gated_launch(struct sf_child *c, int dirfd, int exe, char *const argv[],
                     char *const envp[], const struct timespec *deadline,
                     int (*record_child)(const struct sf_child *, void *), void *context)
@@ -120,7 +113,7 @@ int sf_gated_launch(struct sf_child *c, int dirfd, int exe, char *const argv[],
         fstatfs(dirfd, &fs) < 0 || (unsigned long)fs.f_type != CGROUP2_SUPER_MAGIC ||
         !before(deadline)) { errno = EINVAL; return -1; }
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, gate) < 0) return -1;
-    c->pid = fork();
+    c->pid = _Fork(); /* No pthread_atfork callbacks before the gate. */
     if (c->pid < 0) { c->pid = 0; saved = errno; goto fail; }
     if (c->pid == 0) { close(gate[0]); stub(gate[1], exe, argv, envp); }
     close(gate[1]); gate[1] = -1;
