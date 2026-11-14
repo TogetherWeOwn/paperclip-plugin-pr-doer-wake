@@ -893,7 +893,7 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
   });
   it.each([
-    "```text\nDIRECTIVE\n```",
+    "```text\nDIRECTIVE\n```", ...[0x2028, 0x2029, 13].map((c) => `~~~info${String.fromCharCode(c)}x\nDIRECTIVE\n~~~`),
     "<!--\nDIRECTIVE\n-->",
   ])("does not acquire clocks from protected physical lines after restart (%s)", async (protectedText) => {
     const hidden = "PR disposition: example/project#42 defer; next actor contributor; revisit 2099-01-01";

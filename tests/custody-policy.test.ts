@@ -232,11 +232,11 @@ describe("directive evidence boundaries", () => {
     expect(latestDisposition(owner(disposition.replace("contributor", "contributor <!-- note -->")), pull())?.action).toBe("defer");
     expect(hasCardClosure(owner(`${cardClosure} <!-- note -->`), pull())).toBe(true);
   });
-  it.each(["```\n%s\n```", "~~~\n%s\n~~~", "<!--\n%s\n-->", "`example\n%s\nend`"])("suppresses protected directives in %s", (wrapper) => {
+  it.each(["```\n%s\n```", "~~~\n%s\n~~~", ...[0x2028, 0x2029, 13].map((c) => `~~~info${String.fromCharCode(c)}x\n%s\n~~~`), "<!--\n%s\n-->", "`example\n%s\nend`"])("suppresses protected directives in %s", (wrapper) => {
     const wrap = (s: string) => wrapper.replace("%s", s);
     expect(latestDisposition(owner(wrap(disposition)), pull())).toBeNull();
-    expect(hasCardClosure(owner(wrap(cardClosure)), pull())).toBe(false);
-    expect(hasPrClosure([wrap(prClosure)])).toBe(false);
+    expect(hasCardClosure(owner(wrap(cardClosure)), pull())).toBe(false); expect(hasCardClosure(owner(`${wrap(cardClosure)}\n${cardClosure}`), pull())).toBe(true);
+    expect(hasPrClosure([wrap(prClosure)])).toBe(false); expect(hasPrClosure([`${wrap(prClosure)}\n${prClosure}`])).toBe(true);
     expect(latestDisposition(owner(`${wrap(disposition)}\n${disposition}`), pull())?.action).toBe("defer");
   });
   it("keeps unmatched and escaped backticks literal and respects region boundaries", () => {

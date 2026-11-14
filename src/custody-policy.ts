@@ -102,7 +102,7 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
 /** Classify physical lines without joining fragments across protected text. */
 export function classifyDirectiveLines(body: string): { line: string; original: string; comment: boolean }[] {
   const lines = body.split(/\r?\n/);
-  const markerFor = (line: string) => /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+  const markerFor = (line: string) => /^ {0,3}(`{3,}|~{3,})([\s\S]*)/.exec(line);
   const opener = (line: string) => {
     const marker = markerFor(line);
     return marker && (marker[1]![0] !== "`" || !marker[2]!.includes("`")) ? marker : null;
