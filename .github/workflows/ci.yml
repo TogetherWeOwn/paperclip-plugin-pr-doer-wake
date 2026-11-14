@@ -15,6 +15,22 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  phase-state-unit:
+    name: Phase state and rejected launch inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # Inert temporary directories and rejected inputs only.
+      - run: |
+          cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/phase-state.c qualification/synthetic-fence/phase-state.test.c -Wl,--wrap=getrandom -o "$RUNNER_TEMP/phase-state-test"
+          timeout 10s "$RUNNER_TEMP/phase-state-test"
+          cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/gated-launch.c qualification/synthetic-fence/cgroup-membership.c qualification/synthetic-fence/gated-launch-test.c -o "$RUNNER_TEMP/gated-launch-test"
+          timeout 10s "$RUNNER_TEMP/gated-launch-test"
+
   cgroup-membership-parser:
     name: Cgroup membership parser unit tests
     runs-on: ubuntu-24.04
@@ -157,7 +173,7 @@ jobs:
           npx vitest run tests/custody-policy.test.ts -t 'suppresses protected directives'
 
   check:
-    needs: [cgroup-membership-parser, gated-launch-behavior]
+    needs: [cgroup-membership-parser, gated-launch-behavior, phase-state-unit]
     if: ${{ always() }}
     # Required status check on main. Renaming this changes the check context
     # and blocks every merge until the ruleset is updated to match.
@@ -167,8 +183,8 @@ jobs:
     steps:
       - name: Require parser test success
         env:
-          PARSER_RESULT: ${{ needs.cgroup-membership-parser.result }}:${{ needs.gated-launch-behavior.result }}
-        run: test "$PARSER_RESULT" = success:success
+          PARSER_RESULT: ${{ needs.cgroup-membership-parser.result }}:${{ needs.gated-launch-behavior.result }}:${{ needs.phase-state-unit.result }}
+        run: test "$PARSER_RESULT" = success:success:success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Build the PR head itself, not GitHub's synthetic merge commit.
