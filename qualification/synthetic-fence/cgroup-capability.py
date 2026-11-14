@@ -27,12 +27,12 @@ def main():
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         raise RuntimeError("refusing outside a GitHub-hosted Actions runner")
     if os.geteuid() == 0 or os.getuid() == 0:
-        raise RuntimeError("expected an unprivileged delegated systemd scope")
+        raise RuntimeError("expected an unprivileged delegated systemd unit")
     print(f"probe uid={os.getuid()} euid={os.geteuid()}", flush=True)
     memberships = Path("/proc/self/cgroup").read_text().splitlines()
     paths = [line[3:] for line in memberships if line.startswith("0::/")]
     if len(paths) != 1 or "fixture-cgroup-" not in paths[0]:
-        raise RuntimeError("not in the expected exclusive systemd scope")
+        raise RuntimeError("not in the expected exclusive systemd unit")
     mount = Path("/sys/fs/cgroup")
     scope = mount / paths[0].lstrip("/")
     if not (mount / "cgroup.controllers").is_file() or not (scope / "cgroup.events").is_file():
