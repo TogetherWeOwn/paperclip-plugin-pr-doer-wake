@@ -620,10 +620,10 @@ export class CustodyRuntime {
   }
 
   private async dispositionClock(card: CustodyCard, pr: CustodyPull, ledger: Ledger, archived: (id: string) => Promise<number | null>): Promise<Disposition | null> {
-    const classified = card.texts.filter((text) => text.id?.startsWith("comment:")).flatMap((text) => classifyDirectiveLines(text.body).map(({ line, original, comment }) => ({ text, line, original, comment })));
+    const classified = card.texts.filter((text) => text.id?.startsWith("comment:")).flatMap((text) => classifyDirectiveLines(text.body).map((classified) => ({ text, ...classified })));
     // Reject ambiguity for the whole PR before acquiring any new clocks.
-    for (const { text, line, comment } of classified) {
-      if (comment && dispositionLine(line.trimStart(), pr, text.at)) throw new Error("disposition_ambiguous");
+    for (const { text, line, comment, commentPrefix } of classified) {
+      if (comment && dispositionLine(commentPrefix ? line.trimStart() : line, pr, text.at)) throw new Error("disposition_ambiguous");
     }
     const found: Disposition[] = [];
     for (const { text, line, original } of classified) {

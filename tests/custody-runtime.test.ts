@@ -794,11 +794,15 @@ describe("coverage, summary and cursor controls", () => {
     owner.texts[0]!.body += " <!-- note -->";
     h.advance(DAY);
     await h.restart().poll();
-    expect(h.ledger().report.unknown).toContain("example/project#42");
-    expect(h.ledger().dispositions).toEqual(clocks);
-    expect(h.ledger().receipts).toEqual(receipts);
-    expect([...h.state.entries()].filter(([key]) => key.includes(":disposition:"))).toEqual(archived);
+    expect(h.ledger().report.unknown).toContain("example/project#42"); expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().receipts).toEqual(receipts); expect([...h.state.entries()].filter(([key]) => key.includes(":disposition:"))).toEqual(archived);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it.each([["    DIRECTIVE <!-- note -->", false], ["`example` DIRECTIVE <!-- note -->", false], ["<!-- note --> `example` DIRECTIVE", false], ["<!-- note --> DIRECTIVE", true], ["<!-- note\n--> DIRECTIVE", true]])("classifies commented examples (%s)", async (example, ambiguous) => {
+    const body = example.replace("DIRECTIVE", "PR disposition: example/project#42 finish; next actor contributor; revisit event");
+    const h = fixture({ cards: [card({ status: "done", texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] })] });
+    await h.runtime.poll(); expect(h.ledger().report.unknown.includes("example/project#42")).toBe(ambiguous);
+    expect(Object.keys(h.ledger().receipts).some((key) => key.includes("example/project#42|terminal|"))).toBe(!ambiguous); expect(h.ledger().dispositions).toEqual({});
   });
   it("retains closed coverage for ambiguous dispositions while an unrelated PR proceeds", async () => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event <!-- note -->";
@@ -806,15 +810,12 @@ describe("coverage, summary and cursor controls", () => {
     const closed = pull({ state: "closed", closedAt: NOW - DAY });
     const h = fixture({ cards: [owner], open: [pull({ number: 43 })], closed: [closed] });
     await h.runtime.poll();
-    expect(h.ledger().report.unknown).toContain("example/project#42");
-    expect(h.ledger().cursors["example/project"]).toBeUndefined();
+    expect(h.ledger().report.unknown).toContain("example/project#42"); expect(h.ledger().cursors["example/project"]).toBeUndefined();
     expect(h.ledger().dispositions).toEqual({});
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: expect.stringContaining("example/project#43|") }));
-    owner.texts[0]!.body = body.replace(" <!-- note -->", "");
-    h.advance(DAY);
+    owner.texts[0]!.body = body.replace(" <!-- note -->", ""); h.advance(DAY);
     await h.restart().poll();
-    expect(h.ledger().report.unknown).not.toContain("example/project#42");
-    expect(h.ledger().cursors["example/project"]).toBe(NOW + DAY);
+    expect(h.ledger().report.unknown).not.toContain("example/project#42"); expect(h.ledger().cursors["example/project"]).toBe(NOW + DAY);
     expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
   });
   it("keeps ambiguous closure coverage pinned while the effect budget drains", async () => {
@@ -886,10 +887,8 @@ describe("coverage, summary and cursor controls", () => {
     owner.texts[0]!.at = NOW + DAY;
     h.advance(DAY);
     await h.restart().poll();
-    expect(h.ledger().report.unknown).toContain("example/project#42");
-    expect(h.ledger().report.unknown).not.toContain("example/project#43");
-    expect(h.ledger().dispositions).toEqual(clocks);
-    expect(h.ledger().receipts).toEqual(receipts);
+    expect(h.ledger().report.unknown).toContain("example/project#42"); expect(h.ledger().report.unknown).not.toContain("example/project#43");
+    expect(h.ledger().dispositions).toEqual(clocks); expect(h.ledger().receipts).toEqual(receipts);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
   });
   it.each([

@@ -100,7 +100,7 @@ export function mapCustodyCard(pr: CustodyPull, cards: CustodyCard[], registrati
 }
 
 /** Classify physical lines without joining fragments across protected text. */
-export function classifyDirectiveLines(body: string): { line: string; original: string; comment: boolean }[] {
+export function classifyDirectiveLines(body: string): { line: string; original: string; comment: boolean; commentPrefix: boolean }[] {
   const lines = body.split(/\r?\n/);
   const markerFor = (line: string) => /^ {0,3}(`{3,}|~{3,})([\s\S]*)/.exec(line);
   const opener = (line: string) => {
@@ -121,7 +121,7 @@ export function classifyDirectiveLines(body: string): { line: string; original: 
       next.set(run[0].length, { line: i, end: run.index! + run[0].length });
     }
   }
-  const result: { line: string; original: string; comment: boolean }[] = [];
+  const result: { line: string; original: string; comment: boolean; commentPrefix: boolean }[] = [];
   let fence: { marker: string; length: number } | null = null;
   let comment = false;
   let span: { line: number; end: number } | null = null;
@@ -136,6 +136,7 @@ export function classifyDirectiveLines(body: string): { line: string; original: 
       fence = { marker: marker![1]![0]!, length: marker![1]!.length };
       continue;
     }
+    let commentPrefix = comment || (!span && line.startsWith("<!--"));
     let visible = span || comment ? " " : "";
     let touched = comment;
     let position = 0;
@@ -156,7 +157,7 @@ export function classifyDirectiveLines(body: string): { line: string; original: 
         let end = position + 1;
         while (line[end] === "`") end++;
         const close = slashes % 2 === 0 ? closing.get(`${i}:${position}`) : undefined;
-        if (close) { visible += " "; span = close; position = end; }
+        if (close) { if (!visible.trim()) commentPrefix = false; visible += " "; span = close; position = end; }
         else { visible += line.slice(position, end); position = end; }
         slashes = 0;
       } else if (line.startsWith("<!--", position) && slashes % 2 === 0) {
@@ -171,7 +172,7 @@ export function classifyDirectiveLines(body: string): { line: string; original: 
         slashes = char === "\\" ? slashes + 1 : 0;
       }
     }
-    result.push({ line: visible, original: line, comment: touched });
+    result.push({ line: visible, original: line, comment: touched, commentPrefix });
   }
   return result;
 }
