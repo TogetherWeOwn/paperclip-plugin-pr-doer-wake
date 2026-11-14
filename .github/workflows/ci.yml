@@ -51,6 +51,25 @@ jobs:
             -o "$RUNNER_TEMP/ownership-ledger-test"
           timeout 10s "$RUNNER_TEMP/ownership-ledger-test"
 
+  sole-waiter-fixture:
+    name: Benign sole-waiter fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build and run benign immediate-exit fixture
+        run: |
+          set -eu
+          cc -std=c11 -Wall -Wextra -Werror -pedantic \
+            qualification/synthetic-fence/sole-waiter.c \
+            qualification/synthetic-fence/ownership-ledger.c \
+            -o "$RUNNER_TEMP/sole-waiter"
+          timeout 15s "$RUNNER_TEMP/sole-waiter"
+          if "$RUNNER_TEMP/sole-waiter" anything; then exit 1; fi
+
   custody-parser-baseline:
     name: Custody parser pinned regression control
     runs-on: ubuntu-24.04
