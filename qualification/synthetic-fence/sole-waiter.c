@@ -142,10 +142,11 @@ int main(int argc, char **argv) {
                 if (cleaning) break;
             }
             if (ready > 0) {
-                if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) fault = 1;
-                if (drain_signals(event.fd, &interrupted) < 0) fault = 1;
+                int event_fault = !!(event.revents & (POLLERR | POLLHUP | POLLNVAL));
+                if (drain_signals(event.fd, &interrupted) < 0) event_fault = 1;
+                if (event_fault) fault = 1;
                 if (interrupted || fault) ownership_poison(ledger);
-                if (cleaning && fault) break;
+                if (cleaning && event_fault) break;
             }
         }
     }

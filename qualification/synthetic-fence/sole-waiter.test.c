@@ -13,7 +13,8 @@
 
 enum scenario { NORMAL, NO_CHILD, WAIT_ERROR, POLL_ERROR, READ_ERROR, SHORT_READ,
                 INTERRUPT, FULL, TIMEOUT, NO_PIDFD, UNKNOWN, LATE_INTERRUPT,
-                SIGNAL_FLOOD, SIGNAL_FAILURE, EXPIRED_RECEIPT, PERSISTENT_POLL };
+                SIGNAL_FLOOD, SIGNAL_FAILURE, EXPIRED_RECEIPT, PERSISTENT_POLL,
+                CLEANUP_SIGCHLD };
 static enum scenario scenario;
 static int waits, signals_sent, polls, ticks, reads;
 
@@ -52,6 +53,11 @@ static pid_t fake_waitpid(pid_t pid, int *status, int options) {
     if (scenario == FULL) { *status = 0; return 100 + waits; }
     if (scenario == UNKNOWN && waits == 1) { *status = 0; return 99; }
     if (scenario == TIMEOUT || scenario == SIGNAL_FAILURE || scenario == PERSISTENT_POLL) return 0;
+    if (scenario == CLEANUP_SIGCHLD) {
+        if (waits <= 2) return 0;
+        if (waits == 3) { *status = 0; return 42; }
+        errno = ECHILD; return -1;
+    }
     if (scenario == EXPIRED_RECEIPT) {
         if (waits == 1) { ticks = 100; *status = 0; return 42; }
         errno = ECHILD; return -1;
@@ -68,10 +74,11 @@ static pid_t fake_waitpid(pid_t pid, int *status, int options) {
 }
 static int fake_poll(struct pollfd *fds, nfds_t n, int timeout) {
     (void)timeout; assert(n == 1); ++polls;
-    if ((scenario == POLL_ERROR && polls == 1) || scenario == PERSISTENT_POLL) {
+    if (((scenario == POLL_ERROR || scenario == CLEANUP_SIGCHLD) && polls == 1) || scenario == PERSISTENT_POLL) {
         errno = EIO; return -1;
     }
-    if ((scenario == READ_ERROR || scenario == SHORT_READ || scenario == INTERRUPT) && polls == 1) {
+    if (((scenario == READ_ERROR || scenario == SHORT_READ || scenario == INTERRUPT) && polls == 1) ||
+        (scenario == CLEANUP_SIGCHLD && polls == 2)) {
         fds->revents = POLLIN; return 1;
     }
     return 0;
@@ -81,8 +88,9 @@ static ssize_t fake_read(int fd, void *buf, size_t count) {
     if (scenario == SHORT_READ && reads == 1) return 1;
     if (scenario == READ_ERROR && reads == 1) { errno = EIO; return -1; }
     if (scenario == SIGNAL_FLOOD ||
-        ((scenario == INTERRUPT || scenario == LATE_INTERRUPT) && reads == 1)) {
-        ((struct signalfd_siginfo *)buf)->ssi_signo = scenario == SIGNAL_FLOOD ? SIGCHLD : SIGTERM;
+        ((scenario == INTERRUPT || scenario == LATE_INTERRUPT || scenario == CLEANUP_SIGCHLD) && reads == 1)) {
+        ((struct signalfd_siginfo *)buf)->ssi_signo =
+            (scenario == SIGNAL_FLOOD || scenario == CLEANUP_SIGCHLD) ? SIGCHLD : SIGTERM;
         return sizeof(struct signalfd_siginfo);
     }
     errno = EAGAIN;
@@ -131,5 +139,6 @@ int main(void) {
     run(EXPIRED_RECEIPT, 1, 2, 0);
     run(PERSISTENT_POLL, 1, 2, 1);
     assert(polls == 2);
+    run(CLEANUP_SIGCHLD, 1, 4, 1);
     return 0;
 }
