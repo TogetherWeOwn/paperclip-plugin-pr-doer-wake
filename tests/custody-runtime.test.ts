@@ -798,7 +798,7 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().receipts).toEqual(receipts); expect([...h.state.entries()].filter(([key]) => key.includes(":disposition:"))).toEqual(archived);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
-  it.each([["    DIRECTIVE <!-- note -->", false], ["`example` DIRECTIVE <!-- note -->", false], ["<!-- note --> `example` DIRECTIVE", false], ["<!-- note --> DIRECTIVE", true], ["<!-- note\n--> DIRECTIVE", true]])("classifies commented examples (%s)", async (example, ambiguous) => {
+  it.each([["    DIRECTIVE <!-- note -->", false], ["`example` DIRECTIVE <!-- note -->", false], ["<!-- note --> `example` DIRECTIVE", false], ["<!-- note --> `x` `y` `z` DIRECTIVE", false], ["<!-- note --> DIRECTIVE", true], ["<!-- note\n--> DIRECTIVE", true]])("classifies commented examples (%s)", async (example, ambiguous) => {
     const body = example.replace("DIRECTIVE", "PR disposition: example/project#42 finish; next actor contributor; revisit event");
     const h = fixture({ cards: [card({ status: "done", texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] })] });
     await h.runtime.poll(); expect(h.ledger().report.unknown.includes("example/project#42")).toBe(ambiguous);

@@ -138,7 +138,7 @@ export function classifyDirectiveLines(body: string): { line: string; original: 
     }
     let commentPrefix = comment || (!span && line.startsWith("<!--"));
     let visible = span || comment ? " " : "";
-    let touched = comment;
+    let touched = comment, prefixHasText = false;
     let position = 0;
     let slashes = 0;
     while (position < line.length) {
@@ -157,8 +157,8 @@ export function classifyDirectiveLines(body: string): { line: string; original: 
         let end = position + 1;
         while (line[end] === "`") end++;
         const close = slashes % 2 === 0 ? closing.get(`${i}:${position}`) : undefined;
-        if (close) { if (!visible.trim()) commentPrefix = false; visible += " "; span = close; position = end; }
-        else { visible += line.slice(position, end); position = end; }
+        if (close) { if (!prefixHasText) commentPrefix = false; visible += " "; span = close; position = end; }
+        else { prefixHasText = true; visible += line.slice(position, end); position = end; }
         slashes = 0;
       } else if (line.startsWith("<!--", position) && slashes % 2 === 0) {
         visible += " ";
@@ -168,7 +168,7 @@ export function classifyDirectiveLines(body: string): { line: string; original: 
         slashes = 0;
       } else {
         const char = line[position++]!;
-        visible += char;
+        visible += char; if (!/\s/.test(char)) prefixHasText = true;
         slashes = char === "\\" ? slashes + 1 : 0;
       }
     }
