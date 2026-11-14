@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ResponseConsumer } from '../qualification/synthetic-fence/response-consumer.js';
 
 const identity = { version: 1 as const, caseId: 'case', phaseId: 'phase', nonce: 'nonce' };
@@ -77,14 +77,18 @@ describe('response consumer hook', () => {
     expect(consumer.poisoned).toBe(false);
   });
 
-  it('poisons on a deeply nested response that cannot be canonicalized', async () => {
+  it('poisons when response canonicalization throws', async () => {
     const consumer = new ResponseConsumer(identity, 65536, 1);
     consumer.register(1);
-    const prefix = JSON.stringify({ ...identity, type: 'RESPONSE', id: 1 }).slice(0, -1);
-    const bytes = Buffer.from(`${prefix},"outcome":${'['.repeat(10000)}0${']'.repeat(10000)}}`);
-    await expect(consumer.accept(bytes, () => {})).rejects.toThrow('invalid response');
-    expect(consumer.poisoned).toBe(true);
-    expect(() => consumer.register(2)).toThrow();
+    const bytes = response(1);
+    const stringify = vi.spyOn(JSON, 'stringify').mockImplementationOnce(() => { throw new Error('serialization failed'); });
+    try {
+      await expect(consumer.accept(bytes, () => {})).rejects.toThrow('invalid response');
+      expect(consumer.poisoned).toBe(true);
+      expect(() => consumer.register(2)).toThrow();
+    } finally {
+      stringify.mockRestore();
+    }
   });
 
   it('does not acknowledge acceptance completing after channel poison', async () => {
