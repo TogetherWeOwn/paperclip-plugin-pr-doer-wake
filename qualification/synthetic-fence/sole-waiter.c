@@ -16,6 +16,22 @@
 
 #define UNKNOWN_CAPACITY 16
 #define DEADLINE_SECONDS 5
+#define SIGNAL_BATCH 32
+
+static int drain_signals(int fd, int *interrupted) {
+    struct signalfd_siginfo info;
+    int i;
+    for (i = 0; i < SIGNAL_BATCH; ++i) {
+        ssize_t bytes = read(fd, &info, sizeof(info));
+        if (bytes == (ssize_t)sizeof(info)) {
+            if (info.ssi_signo != SIGCHLD) *interrupted = 1;
+            continue;
+        }
+        if (bytes < 0 && errno == EAGAIN) return 0;
+        return -1;
+    }
+    return -1;
+}
 
 static int remaining_ms(const struct timespec *deadline) {
     struct timespec now;
@@ -79,8 +95,9 @@ int main(int argc, char **argv) {
                 if (ownership_snapshot(ledger, record, &receipt) < 0) break;
                 if (!receipt.has_status) {
                     interrupted = 1;
-                    if (pidfd >= 0) (void)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0);
-                    else (void)kill(child, SIGKILL);
+                    int sent = pidfd >= 0 ? (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0)
+                                            : kill(child, SIGKILL);
+                    if (sent < 0) fault = 1;
                 }
                 if (clock_gettime(CLOCK_MONOTONIC, &deadline) < 0) break;
                 deadline.tv_sec += DEADLINE_SECONDS;
@@ -95,13 +112,17 @@ int main(int argc, char **argv) {
         }
         result = waitpid(-1, &status, WNOHANG | __WALL);
         if (result > 0) {
+            size_t unknown_before = ownership_unknown_count(ledger);
             if (ownership_observe_status(ledger, result, status) < 0) break;
+            if (ownership_unknown_count(ledger) != unknown_before) fault = 1;
             continue;
         }
         if (result < 0) {
             if (errno == EINTR) continue;
             if (errno == ECHILD) {
                 (void)ownership_observe_echild(ledger);
+                if (drain_signals(event.fd, &interrupted) < 0) fault = 1;
+                if (interrupted || fault) ownership_poison(ledger);
                 drained = 1;
                 break;
             }
@@ -118,22 +139,9 @@ int main(int argc, char **argv) {
                 ownership_poison(ledger);
             }
             if (ready > 0) {
-                struct signalfd_siginfo info;
-                ssize_t bytes;
-                if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                    fault = 1;
-                    ownership_poison(ledger);
-                }
-                while ((bytes = read(event.fd, &info, sizeof(info))) == (ssize_t)sizeof(info)) {
-                    if (info.ssi_signo != SIGCHLD) {
-                        interrupted = 1;
-                        ownership_poison(ledger);
-                    }
-                }
-                if (bytes >= 0 || (errno != EAGAIN && errno != EINTR)) {
-                    fault = 1;
-                    ownership_poison(ledger);
-                }
+                if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) fault = 1;
+                if (drain_signals(event.fd, &interrupted) < 0) fault = 1;
+                if (interrupted || fault) ownership_poison(ledger);
             }
         }
     }
