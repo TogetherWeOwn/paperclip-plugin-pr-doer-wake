@@ -756,6 +756,164 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
     expect(Object.values(h.ledger().receipts)).toEqual([expect.objectContaining({ status: "pending" })]);
   });
+  it.each(["", " "])("defers comment-altered dispositions without changing existing clocks or receipts (trailing %j)", async (space) => {
+    const body = `PR disposition: example/project#42 finish; next actor contributor; revisit event${space}`;
+    const owner = card({ status: "done", texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    h.activity.mockResolvedValue(NOW);
+    h.ctx.issues.requestWakeup.mockResolvedValue({ queued: false, runId: null } as any);
+    await h.runtime.poll();
+    const clocks = { ...h.ledger().dispositions };
+    const receipts = structuredClone(h.ledger().receipts);
+    owner.texts[0]!.body += " <!-- note -->";
+    owner.texts[0]!.at = NOW + DAY;
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().receipts).toEqual(receipts);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it.each(["none", "hot", "archive", "both"])("preserves %s historical clocks on comment-altered dispositions after restart", async (location) => {
+    const { createHash } = await import("node:crypto");
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll();
+    const [clock, at] = Object.entries(h.ledger().dispositions)[0] as [string, number];
+    if (location === "none" || location === "archive") delete h.ledger().dispositions[clock];
+    if (location === "archive" || location === "both") {
+      const ledgerKey = JSON.parse([...h.state.keys()].find((key) => key.includes("pr-custody-v1"))!);
+      const archivedClock = location === "both" ? createHash("sha256").update(JSON.stringify([ISSUE, `comment:${PROJECT}`, `${body} `])).digest("hex") : clock;
+      const hash = createHash("sha256").update(archivedClock).digest("hex");
+      h.state.set(JSON.stringify({ ...ledgerKey, stateKey: `${ledgerKey.stateKey}:disposition:${hash}` }), { version: 1, key: archivedClock, value: location === "both" ? at - DAY : at });
+    }
+    const clocks = structuredClone(h.ledger().dispositions);
+    const receipts = structuredClone(h.ledger().receipts);
+    const archived = structuredClone([...h.state.entries()].filter(([key]) => key.includes(":disposition:")));
+    owner.texts[0]!.body += " <!-- note -->";
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42"); expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().receipts).toEqual(receipts); expect([...h.state.entries()].filter(([key]) => key.includes(":disposition:"))).toEqual(archived);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it.each([["    DIRECTIVE <!-- note -->", false], ["`example` DIRECTIVE <!-- note -->", false], ["<!-- note --> `example` DIRECTIVE", false], ["<!-- note --> `x` `y` `z` DIRECTIVE", false], ["<!-- note --> DIRECTIVE", true], ["<!-- note\n--> DIRECTIVE", true]])("classifies commented examples (%s)", async (example, ambiguous) => {
+    const body = example.replace("DIRECTIVE", "PR disposition: example/project#42 finish; next actor contributor; revisit event");
+    const h = fixture({ cards: [card({ status: "done", texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] })] });
+    await h.runtime.poll(); expect(h.ledger().report.unknown.includes("example/project#42")).toBe(ambiguous);
+    expect(Object.keys(h.ledger().receipts).some((key) => key.includes("example/project#42|terminal|"))).toBe(!ambiguous); expect(h.ledger().dispositions).toEqual({});
+  });
+  it("retains closed coverage for ambiguous dispositions while an unrelated PR proceeds", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event <!-- note -->";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
+    const closed = pull({ state: "closed", closedAt: NOW - DAY });
+    const h = fixture({ cards: [owner], open: [pull({ number: 43 })], closed: [closed] });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42"); expect(h.ledger().cursors["example/project"]).toBeUndefined();
+    expect(h.ledger().dispositions).toEqual({});
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: expect.stringContaining("example/project#43|") }));
+    owner.texts[0]!.body = body.replace(" <!-- note -->", ""); h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).not.toContain("example/project#42"); expect(h.ledger().cursors["example/project"]).toBe(NOW + DAY);
+    expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
+  });
+  it("keeps ambiguous closure coverage pinned while the effect budget drains", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event <!-- note -->";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
+    const closed = [pull({ number: 42, state: "closed", closedAt: NOW - 30_000 }), ...Array.from({ length: 18 }, (_, i) => pull({ number: i + 1, state: "closed", closedAt: NOW - (20 - i) * 1000 }))];
+    const h = fixture({ cards: [owner], open: [], closed });
+    await h.runtime.poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(15);
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().cursors).toEqual({});
+    expect(h.ledger().dispositions).toEqual({});
+    await h.restart().poll();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(18);
+    expect(h.ledger().cursors).toEqual({});
+    owner.texts[0]!.body = body.replace(" <!-- note -->", "");
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).not.toContain("example/project#42");
+    expect(h.ledger().cursors["example/project"]).toBe(NOW);
+  });
+  it("preserves an ambiguous clock through a failed receipt archive and restart", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions);
+    for (let i = 0; i < 19_999; i++) h.ledger().receipts[`history-${i}`] = { at: NOW, status: "woken" };
+    owner.texts[0]!.body += " <!-- note -->";
+    const set = h.ctx.state.set.getMockImplementation()!;
+    h.ctx.state.set.mockImplementation(async (key, value) => {
+      if (key.stateKey.includes(":receipt:")) throw new Error("archive reply failed");
+      return set(key, value);
+    });
+    await expect(h.restart().poll()).rejects.toThrow("archive reply failed");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().report.complete).toBe(false);
+    h.ctx.state.set.mockImplementation(set);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+  it("acquires clocks only from comments, not other card text", async () => {
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ texts: ["title", "description", "document:example"].map((id) => ({ id, body, at: NOW, ownership: true })) });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll(); expect(h.ledger().dispositions).toEqual({});
+    owner.texts.push({ id: `comment:${PROJECT}`, body, at: NOW, ownership: true });
+    await h.restart().poll(); expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
+  });
+  it("retains a hot disposition on failed archive write and recovers", async () => {
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body: "PR disposition: example/project#42 finish; next actor contributor; revisit event", at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner] }); await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions); for (let i = 0; i < 19_999; i++) h.ledger().dispositions[`history-${i}`] = NOW;
+    const set = h.ctx.state.set.getMockImplementation()!; h.ctx.state.set.mockImplementation(async (key, value) => { if (key.stateKey.includes(":disposition:")) throw new Error("archive failed"); return set(key, value); });
+    await expect(h.restart().poll()).rejects.toThrow("archive failed"); expect(h.ledger().dispositions).toMatchObject(clocks);
+    h.ctx.state.set.mockImplementation(set); await h.restart().poll(); expect(h.ledger().report.complete).toBe(true);
+  });
+  it("isolates physical-line clocks when one of two directives gains a comment", async () => {
+    const first = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const second = "PR disposition: example/project#43 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body: `${first}\n${second}`, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner], open: [pull(), pull({ number: 43 })] });
+    await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions);
+    const receipts = structuredClone(h.ledger().receipts);
+    expect(Object.keys(clocks)).toHaveLength(2);
+    owner.texts[0]!.body = `${first} <!-- note -->\n${second}`;
+    owner.texts[0]!.at = NOW + DAY;
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42"); expect(h.ledger().report.unknown).not.toContain("example/project#43");
+    expect(h.ledger().dispositions).toEqual(clocks); expect(h.ledger().receipts).toEqual(receipts);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    "```text\nDIRECTIVE\n```", ...[0x2028, 0x2029, 13].map((c) => `~~~info${String.fromCharCode(c)}x\nDIRECTIVE\n~~~`),
+    "<!--\nDIRECTIVE\n-->",
+  ])("does not acquire clocks from protected physical lines after restart (%s)", async (protectedText) => {
+    const hidden = "PR disposition: example/project#42 defer; next actor contributor; revisit 2099-01-01";
+    const visible = "PR disposition: example/project#43 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body: `${protectedText.replace("DIRECTIVE", hidden)}\n${visible}`, at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner], open: [pull(), pull({ number: 43 })] });
+    await h.runtime.poll();
+    const clocks = structuredClone(h.ledger().dispositions);
+    expect(Object.keys(clocks)).toHaveLength(1);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: expect.stringContaining("example/project#42|idle|") }));
+    await h.restart().poll();
+    expect(h.ledger().dispositions).toEqual(clocks);
+  });
+  it("does not reparse a masked multiline code span while acquiring clocks", async () => {
+    const body = "`example\nPR disposition: example/project#42 finish; next actor contributor; revisit event\nend`";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll();
+    expect(h.ledger().dispositions).toEqual({});
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
   it("acknowledges a terminal trigger when the same disposition is genuinely posted in a new comment", async () => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
     const owner = card({ status: "done", texts: [{ id: "description", body, at: NOW - DAY, ownership: true }] });
