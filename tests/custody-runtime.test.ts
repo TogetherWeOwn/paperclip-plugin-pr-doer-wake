@@ -784,8 +784,9 @@ describe("coverage, summary and cursor controls", () => {
     if (location === "none" || location === "archive") delete h.ledger().dispositions[clock];
     if (location === "archive" || location === "both") {
       const ledgerKey = JSON.parse([...h.state.keys()].find((key) => key.includes("pr-custody-v1"))!);
-      const hash = createHash("sha256").update(clock).digest("hex");
-      h.state.set(JSON.stringify({ ...ledgerKey, stateKey: `${ledgerKey.stateKey}:disposition:${hash}` }), { version: 1, key: clock, value: at });
+      const archivedClock = location === "both" ? createHash("sha256").update(JSON.stringify([ISSUE, `comment:${PROJECT}`, `${body} `])).digest("hex") : clock;
+      const hash = createHash("sha256").update(archivedClock).digest("hex");
+      h.state.set(JSON.stringify({ ...ledgerKey, stateKey: `${ledgerKey.stateKey}:disposition:${hash}` }), { version: 1, key: archivedClock, value: location === "both" ? at - DAY : at });
     }
     const clocks = structuredClone(h.ledger().dispositions);
     const receipts = structuredClone(h.ledger().receipts);
