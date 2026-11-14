@@ -138,12 +138,17 @@ jobs:
 
   check:
     needs: cgroup-membership-parser
+    if: ${{ always() }}
     # Required status check on main. Renaming this changes the check context
     # and blocks every merge until the ruleset is updated to match.
     name: check
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      - name: Require parser test success
+        env:
+          PARSER_RESULT: ${{ needs.cgroup-membership-parser.result }}
+        run: test "$PARSER_RESULT" = success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Build the PR head itself, not GitHub's synthetic merge commit.
