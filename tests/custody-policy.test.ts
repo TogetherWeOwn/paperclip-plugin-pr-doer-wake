@@ -216,6 +216,48 @@ describe("PR-specific trigger policy", () => {
   });
 });
 
+describe("directive evidence boundaries", () => {
+  const disposition = "PR disposition: example/project#42 defer; next actor contributor; revisit 2026-10-21";
+  const cardClosure = "Closed unmerged: burden; source example/project#42";
+  const prClosure = "Closed unmerged: burden";
+  const owner = (body: string) => card({ texts: [{ id: "comment:1", body, at: NOW, ownership: true }] });
+  it("requires visible nonblank actor and rationale, without borrowing hidden fields", () => {
+    expect(latestDisposition(owner(disposition.replace("contributor", "   ")), pull())).toBeNull();
+    expect(latestDisposition(owner(disposition.replace("contributor", "<!-- contributor -->")), pull())).toBeNull();
+    expect(hasCardClosure(owner("Closed unmerged:  ; source example/project#42"), pull())).toBe(false);
+    expect(hasCardClosure(owner("Closed unmerged: <!-- burden -->; source example/project#42"), pull())).toBe(false);
+    expect(hasPrClosure(["Closed unmerged:   "])).toBe(false);
+    expect(hasPrClosure(["Closed unmerged: <!-- burden -->"])).toBe(false);
+    expect(hasPrClosure([prClosure])).toBe(true);
+    expect(latestDisposition(owner(disposition.replace("contributor", "contributor <!-- note -->")), pull())?.action).toBe("defer");
+    expect(hasCardClosure(owner(`${cardClosure} <!-- note -->`), pull())).toBe(true);
+  });
+  it.each(["```\n%s\n```", "~~~\n%s\n~~~", ...[0x2028, 0x2029, 13].map((c) => `~~~info${String.fromCharCode(c)}x\n%s\n~~~`), "<!--\n%s\n-->", "`example\n%s\nend`"])("suppresses protected directives in %s", (wrapper) => {
+    const wrap = (s: string) => wrapper.replace("%s", s);
+    expect(latestDisposition(owner(wrap(disposition)), pull())).toBeNull();
+    expect(hasCardClosure(owner(wrap(cardClosure)), pull())).toBe(false); expect(hasCardClosure(owner(`${wrap(cardClosure)}\n${cardClosure}`), pull())).toBe(true);
+    expect(hasPrClosure([wrap(prClosure)])).toBe(false); expect(hasPrClosure([`${wrap(prClosure)}\n${prClosure}`])).toBe(true);
+    expect(latestDisposition(owner(`${wrap(disposition)}\n${disposition}`), pull())?.action).toBe("defer");
+  });
+  it("keeps unmatched and escaped backticks literal and respects region boundaries", () => {
+    for (const prefix of ["`unmatched", "\\\\`escaped", "`unmatched\n\n", "`unmatched\n~~~\n~~~"]) {
+      expect(latestDisposition(owner(`${prefix}\n${disposition}`), pull())?.action).toBe("defer");
+    }
+    expect(latestDisposition(owner(`\\\`escaped\n${disposition}\n\``), pull())?.action).toBe("defer");
+    expect(latestDisposition(owner(`\`\`open\n\`different\n${disposition}\n\`\`close`), pull())).toBeNull();
+    expect(latestDisposition(card({ texts: [
+      { id: "comment:1", body: "`unmatched", at: NOW, ownership: true },
+      { id: "comment:2", body: `${disposition}\n\``, at: NOW, ownership: true },
+    ] }), pull())?.action).toBe("defer");
+  });
+  it("gives matched spans and active comments their own opaque precedence", () => {
+    expect(latestDisposition(owner(`\`<!--\`\n${disposition}`), pull())?.action).toBe("defer");
+    expect(latestDisposition(owner(`<!--\n\`\n~~~\n-->\n${disposition}`), pull())?.action).toBe("defer");
+    expect(latestDisposition(owner(`\`unmatched <!--\n${disposition}\n-->`), pull())).toBeNull();
+    expect(latestDisposition(owner(`PR disposition: example/pro<!--x-->ject#42 defer; next actor contributor; revisit event`), pull())).toBeNull();
+  });
+});
+
 describe("custody opt-in configuration", () => {
   const config = { custodyEnabled: true, custodyCompanyId: COMPANY, custodySummaryAgentId: ISSUE, custodyOrg: "example", custodyClosedSince: "2026-10-01T00:00:00Z", githubTokenSecretRef: { type: "secret_ref", secretId: PROJECT } };
   it("is disabled by default with independent dry-run and org scope", () => {
