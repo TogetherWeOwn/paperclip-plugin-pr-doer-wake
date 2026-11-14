@@ -38,7 +38,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      # Pure parser tests only: no supervisor, runtime, or cgroup execution.
+      # Parser and rejected-input tests only; no child or cgroup execution.
       - run: |
           cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/gated-launch.c qualification/synthetic-fence/gated-launch-test.c -o "$RUNNER_TEMP/gated-launch-test"
           "$RUNNER_TEMP/gated-launch-test"
