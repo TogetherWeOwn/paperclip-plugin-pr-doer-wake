@@ -729,8 +729,11 @@ export class CiWakeRuntime {
         .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
         .sort((a, b) => a[1].pollOrder! - b[1].pollOrder!);
       if (allEntries.length) await this.save(ledger);
+      const reviewerStartRequests = requests;
       for (const [key, entry] of entries) {
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+        const entryStartRequests = requests;
+        const previousOrder = entry.pollOrder!;
         entry.pollOrder = ++sequence;
         await this.save(ledger);
         try {
@@ -881,6 +884,9 @@ export class CiWakeRuntime {
           // Clear only when every candidate is woken/deduped/ineligible/excluded.
           if (!outstanding && !shadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
         } catch (error) {
+          // Retry a request-truncated entry first next tick, unless it already
+          // had the whole reviewer share: then rotate it to avoid blocking peers.
+          if (error instanceof Error && error.message === "tick_budget" && requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
           this.audit(ledger, "pr_head_wake", "retryable");
           await this.save(ledger);
         }

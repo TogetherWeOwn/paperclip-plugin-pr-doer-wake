@@ -1037,6 +1037,50 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().reviewerWakes?.[`${COMPANY}:${ids.at(-1)}:${NEXT_HEAD}`]).toBeDefined();
     });
 
+    it("retries a request-truncated reviewer entry before deferred predecessors after restart", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const numbers = Array.from({ length: 52 }, (_, i) => i + 17);
+      const ledger: Ledger = { version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = numbers.map((prNumber) => ({ companyId: COMPANY, repo: REPO, prNumber, issueId: `issue-${prNumber}`, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" })) as unknown as Wait[];
+      ledger.prHeadPending = Object.fromEntries(numbers.map((prNumber) => [`${COMPANY}:${REPO}:${prNumber}`, { companyId: COMPANY, repo: REPO, prNumber, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START + prNumber }]));
+      h.seed(ledger);
+      h.issueGet.mockImplementation(async (id: string) => ({ ...clone(h.issue), id, workProducts: [{ ...prWorkProduct, url: `https://github.com/${REPO}/pull/${id.slice(6)}`, metadata: { repo: REPO, number: Number(id.slice(6)) } }] }));
+      let admittedFetch: PluginContext["http"]["fetch"];
+      github.construct.mockImplementation((fetch) => { admittedFetch = fetch; });
+      github.pull.mockImplementation(async (_repo: string, n: number) => { await admittedFetch("https://example.test", {}); return pull({ number: n, headSha: NEXT_HEAD }); });
+      github.snapshot.mockImplementation(async () => { for (let i = 0; i < 68; i++) await admittedFetch("https://example.test", {}); return {}; });
+      github.readiness.mockReturnValue(verdict("pass"));
+      h.requestWakeup.mockImplementation(async (id) => ({ queued: id === `issue-${numbers.at(-1)}` }));
+
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(51);
+      expect(h.ledger().prHeadPending?.[`${COMPANY}:${REPO}:${numbers.at(-1)}`]).toBeDefined();
+      await new CiWakeRuntime(h.ctx, h.clock).poll();
+      expect(h.requestWakeup.mock.calls.some(([id]) => id === `issue-${numbers.at(-1)}`)).toBe(true);
+    });
+
+    it("rotates a reviewer that cannot fit even the fresh request budget", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const ledger: Ledger = { version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = [{ companyId: COMPANY, repo: REPO, prNumber: 18, issueId: ISSUE, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" }] as unknown as Wait[];
+      ledger.prHeadPending = Object.fromEntries([17, 18].map((prNumber) => [`${COMPANY}:${REPO}:${prNumber}`, { companyId: COMPANY, repo: REPO, prNumber, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START + prNumber }]));
+      h.seed(ledger);
+      Object.assign(h.issue, { workProducts: [{ ...prWorkProduct, url: `https://github.com/${REPO}/pull/18`, metadata: { repo: REPO, number: 18 } }] });
+      let admittedFetch: PluginContext["http"]["fetch"];
+      let currentNumber = 0;
+      github.construct.mockImplementation((fetch) => { admittedFetch = fetch; });
+      github.pull.mockImplementation(async (_repo: string, n: number) => { currentNumber = n; await admittedFetch("https://example.test", {}); return pull({ number: n, headSha: NEXT_HEAD }); });
+      github.snapshot.mockImplementation(async () => { if (currentNumber === 17) for (let i = 0; i < LIMITS.requestsPerTick; i++) await admittedFetch("https://example.test", {}); return {}; });
+      github.readiness.mockReturnValue(verdict("pass"));
+
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      await new CiWakeRuntime(h.ctx, h.clock).poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
     it("resumes beyond a repeatedly deferred candidate prefix on a later tick", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
