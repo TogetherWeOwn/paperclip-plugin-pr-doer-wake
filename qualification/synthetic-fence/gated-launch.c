@@ -89,8 +89,8 @@ static void terminate_owned(struct sf_child *c, const struct timespec *deadline)
 {
     int status;
     /* The child is still unreaped and therefore its numeric PID cannot recycle. */
-    if (c->pidfd >= 0) (void)syscall(SYS_pidfd_send_signal, c->pidfd, SIGKILL, NULL, 0);
-    else (void)kill(c->pid, SIGKILL);
+    if (c->pidfd < 0 || syscall(SYS_pidfd_send_signal, c->pidfd, SIGKILL, NULL, 0) < 0)
+        (void)kill(c->pid, SIGKILL);
     while (before(deadline)) {
         pid_t r = waitpid(c->pid, &status, WNOHANG | __WALL);
         if (r == c->pid) {
@@ -134,9 +134,10 @@ int sf_gated_launch(struct sf_child *c, int dirfd, int exe, char *const argv[],
     close(gate[1]); gate[1] = -1;
     c->pidfd = (int)syscall(SYS_pidfd_open, c->pid, 0);
     if (c->pidfd < 0) { saved = errno; goto fail; }
-    if (!before(deadline) || record_child(c, context) != 0 || !before(deadline)) {
-        saved = ETIMEDOUT; goto fail;
-    }
+    if (!before(deadline)) { saved = ETIMEDOUT; goto fail; }
+    errno = 0;
+    if (record_child(c, context) != 0) { saved = errno ? errno : EIO; goto fail; }
+    if (!before(deadline)) { saved = ETIMEDOUT; goto fail; }
     len = snprintf(pidbuf, sizeof(pidbuf), "%ld\n", (long)c->pid);
     if (len <= 0 || (size_t)len >= sizeof(pidbuf)) { saved = EOVERFLOW; goto fail; }
     fd = openat(dirfd, "cgroup.procs", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);

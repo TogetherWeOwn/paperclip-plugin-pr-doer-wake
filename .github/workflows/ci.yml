@@ -28,6 +28,8 @@ jobs:
       - run: |
           cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/gated-launch.c qualification/synthetic-fence/gated-launch-test.c -o "$RUNNER_TEMP/gated-launch-test"
           "$RUNNER_TEMP/gated-launch-test"
+          cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/gated-launch-signal-test.c -o "$RUNNER_TEMP/gated-launch-signal-test"
+          timeout --kill-after=2s 10s "$RUNNER_TEMP/gated-launch-signal-test"
 
   gated-launch-behavior:
     name: Gated launch kernel behavior

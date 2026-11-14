@@ -2,6 +2,7 @@
 #include "gated-launch.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -21,6 +22,7 @@ static int record(const struct sf_child *child, void *arg)
     assert(access(o->marker, F_OK) == -1);
     assert(poll(&p, 1, 0) == 0);
     o->called++;
+    if (o->fail) errno = ENOSPC;
     return o->fail;
 }
 
@@ -91,6 +93,7 @@ int main(int argc, char **argv)
     struct observation o = { .marker = argv[2], .fail = 1 };
     struct timespec end = deadline();
     assert(sf_gated_launch(&child, dir, exe, args, env, &end, record, &o) == -1);
+    assert(errno == ENOSPC);
     assert(o.called == 1 && child.poisoned && child.reaped && child.pid == 0 && child.pidfd == -1);
     assert(access(argv[2], F_OK) == -1);
     assert(waitpid(-1, NULL, WNOHANG) == -1);
