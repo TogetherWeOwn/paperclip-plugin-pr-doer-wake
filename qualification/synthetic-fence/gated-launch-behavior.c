@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include "gated-launch.h"
 #include "cgroup-membership.h"
-
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -13,7 +12,6 @@
 #include <unistd.h>
 
 struct observation { const char *marker; int fail; int called; };
-
 static int record(const struct sf_child *child, void *arg)
 {
     struct observation *o = arg;
