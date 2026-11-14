@@ -774,6 +774,31 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().receipts).toEqual(receipts);
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
+  it.each(["none", "hot", "archive", "both"])("preserves %s historical clocks on comment-altered dispositions after restart", async (location) => {
+    const { createHash } = await import("node:crypto");
+    const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+    const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW - 10 * DAY, ownership: true }] });
+    const h = fixture({ cards: [owner] });
+    await h.runtime.poll();
+    const [clock, at] = Object.entries(h.ledger().dispositions)[0] as [string, number];
+    if (location === "none" || location === "archive") delete h.ledger().dispositions[clock];
+    if (location === "archive" || location === "both") {
+      const ledgerKey = JSON.parse([...h.state.keys()].find((key) => key.includes("pr-custody-v1"))!);
+      const hash = createHash("sha256").update(clock).digest("hex");
+      h.state.set(JSON.stringify({ ...ledgerKey, stateKey: `${ledgerKey.stateKey}:disposition:${hash}` }), { version: 1, key: clock, value: at });
+    }
+    const clocks = structuredClone(h.ledger().dispositions);
+    const receipts = structuredClone(h.ledger().receipts);
+    const archived = structuredClone([...h.state.entries()].filter(([key]) => key.includes(":disposition:")));
+    owner.texts[0]!.body += " <!-- note -->";
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).toContain("example/project#42");
+    expect(h.ledger().dispositions).toEqual(clocks);
+    expect(h.ledger().receipts).toEqual(receipts);
+    expect([...h.state.entries()].filter(([key]) => key.includes(":disposition:"))).toEqual(archived);
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
   it("retains closed coverage for ambiguous dispositions while an unrelated PR proceeds", async () => {
     const body = "PR disposition: example/project#42 finish; next actor contributor; revisit event <!-- note -->";
     const owner = card({ texts: [{ id: `comment:${PROJECT}`, body, at: NOW, ownership: true }] });
