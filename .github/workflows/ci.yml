@@ -50,6 +50,10 @@ jobs:
             qualification/synthetic-fence/ownership-ledger.test.c \
             -o "$RUNNER_TEMP/ownership-ledger-test"
           timeout 10s "$RUNNER_TEMP/ownership-ledger-test"
+          cc -std=c11 -Wall -Wextra -Werror -pedantic \
+            qualification/synthetic-fence/sole-waiter.test.c \
+            "$RUNNER_TEMP/ownership-ledger.o" -o "$RUNNER_TEMP/sole-waiter-test"
+          timeout 10s "$RUNNER_TEMP/sole-waiter-test"
 
   sole-waiter-fixture:
     name: Benign sole-waiter fixture

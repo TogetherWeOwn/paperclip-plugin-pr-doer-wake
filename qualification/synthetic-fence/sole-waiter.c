@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     struct pollfd event;
     pid_t child, result;
     int gate[2], pidfd, status, poisoned = 0, drained = 0, cleaning = 0;
-    int interrupted = 0;
+    int interrupted = 0, fault = 0;
     (void)argv;
     if (argc != 1) return 2;
     action.sa_handler = SIG_DFL;
@@ -66,7 +66,10 @@ int main(int argc, char **argv) {
     /* This fixture never releases a gate. An early exit poisons the phase. */
     close(gate[1]);
     if (pidfd < 0) poisoned = 1;
-    if (poisoned) ownership_poison(ledger);
+    if (poisoned) {
+        fault = 1;
+        ownership_poison(ledger);
+    }
 
     while (!drained) {
         if (!remaining_ms(&deadline) || ownership_is_poisoned(ledger)) {
@@ -85,7 +88,9 @@ int main(int argc, char **argv) {
         }
         /* Every possible status has a reserved unknown-evidence slot. */
         if (ownership_unknown_count(ledger) >= UNKNOWN_CAPACITY) {
+            fault = 1;
             ownership_poison(ledger);
+            if (!cleaning) continue;
             break;
         }
         result = waitpid(-1, &status, WNOHANG | __WALL);
@@ -98,15 +103,35 @@ int main(int argc, char **argv) {
             if (errno == ECHILD) {
                 (void)ownership_observe_echild(ledger);
                 drained = 1;
-            } else ownership_poison(ledger);
-            break;
+                break;
+            }
+            fault = 1;
+            ownership_poison(ledger);
+            if (!cleaning) continue;
+        } else {
+            (void)ownership_observe_no_ready(ledger);
         }
-        (void)ownership_observe_no_ready(ledger);
-        if (poll(&event, 1, remaining_ms(&deadline)) > 0) {
-            struct signalfd_siginfo info;
-            while (read(event.fd, &info, sizeof(info)) == (ssize_t)sizeof(info)) {
-                if (info.ssi_signo != SIGCHLD) {
-                    interrupted = 1;
+        {
+            int ready = poll(&event, 1, remaining_ms(&deadline));
+            if (ready < 0 && errno != EINTR) {
+                fault = 1;
+                ownership_poison(ledger);
+            }
+            if (ready > 0) {
+                struct signalfd_siginfo info;
+                ssize_t bytes;
+                if (event.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    fault = 1;
+                    ownership_poison(ledger);
+                }
+                while ((bytes = read(event.fd, &info, sizeof(info))) == (ssize_t)sizeof(info)) {
+                    if (info.ssi_signo != SIGCHLD) {
+                        interrupted = 1;
+                        ownership_poison(ledger);
+                    }
+                }
+                if (bytes >= 0 || (errno != EAGAIN && errno != EINTR)) {
+                    fault = 1;
                     ownership_poison(ledger);
                 }
             }
@@ -122,5 +147,5 @@ int main(int argc, char **argv) {
            ownership_is_poisoned(ledger), drained);
     return receipt.has_status && WIFEXITED(receipt.status) &&
            WEXITSTATUS(receipt.status) == 0 && drained &&
-           ownership_is_poisoned(ledger) && !interrupted ? 0 : 1;
+           ownership_is_poisoned(ledger) && !interrupted && !fault ? 0 : 1;
 }
