@@ -63,8 +63,6 @@ export interface PrHeadPending {
   oldSha: string;
   newSha: string;
   observedAt: number;
-  /** Durable service order; absent on legacy entries. */
-  attemptOrder?: number;
   shadowLogged?: string[];
 }
 interface Ledger {
@@ -77,8 +75,6 @@ interface Ledger {
   prHeadPending: Record<string, PrHeadPending>;
   /** Per-(company, card, SHA) wake dedupe timestamps for pr_head_changed. */
   reviewerWakes: Record<string, number>;
-  /** First lane on the next full poll; targeted polls do not advance it. */
-  nextPollLane?: "ci" | "reviewer";
 }
 const empty = (): Ledger => ({ version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {}, prHeadPending: {}, reviewerWakes: {} });
 class BindingChanged extends Error {}
@@ -511,7 +507,7 @@ export class CiWakeRuntime {
     const key = `${companyId}:${repo}:${prNumber}`;
     const existing = ledger.prHeadPending[key];
     if (existing && existing.newSha === newSha) return;
-    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now(), attemptOrder: existing?.attemptOrder };
+    ledger.prHeadPending[key] = { companyId, repo, prNumber, oldSha: existing?.oldSha ?? oldSha, newSha, observedAt: this.now() };
   }
 
   /** Exact work-product match for one PR; mirrors custody's work_product tier. */
@@ -604,14 +600,6 @@ export class CiWakeRuntime {
       if (++requests > LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
       return this.ctx.http.fetch(url, init);
     };
-    // Advance the durable turn before either lane can exhaust the shared budget.
-    // Targeted webhook polls must not consume a full poll's turn.
-    const firstLane = only ? "ci" : ledger.nextPollLane === "reviewer" ? "reviewer" : "ci";
-    if (!only) {
-      ledger.nextPollLane = firstLane === "ci" ? "reviewer" : "ci";
-      await this.save(ledger);
-    }
-    const pollCi = async () => {
     // Oldest last-attempt first prevents one unavailable repository starving others.
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const wait of pending) {
@@ -719,28 +707,13 @@ export class CiWakeRuntime {
         await this.save(ledger);
       }
     }
-    };
     // Reviewer wakes for observed head changes (settled heads only).
-    const pollReviewers = async () => {
-      const allEntries = Object.entries(ledger.prHeadPending);
-      const order = (entry: PrHeadPending) => Number.isSafeInteger(entry.attemptOrder) && entry.attemptOrder! > 0 ? entry.attemptOrder! : 0;
-      const compare = (a: [string, PrHeadPending], b: [string, PrHeadPending]) =>
-        order(a[1]) - order(b[1]) || a[1].observedAt - b[1].observedAt || a[0].localeCompare(b[0]);
-      allEntries.sort(compare);
-      let nextOrder = allEntries.reduce((max, [, entry]) => Math.max(max, order(entry)), 0);
-      if (nextOrder > Number.MAX_SAFE_INTEGER - allEntries.length) {
-        allEntries.forEach(([, entry], index) => { entry.attemptOrder = index + 1; });
-        nextOrder = allEntries.length;
-      }
-      const entries = allEntries.filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha));
+    {
+      const entries = Object.entries(ledger.prHeadPending)
+        .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
+        .sort((a, b) => a[1].observedAt - b[1].observedAt);
       for (const [key, entry] of entries) {
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
-        // Persist service order before any attempt or wake. A failed write
-        // cannot authorize work based on a rotation that may not survive.
-        const previousOrder = entry.attemptOrder;
-        entry.attemptOrder = ++nextOrder;
-        try { await this.save(ledger); } catch { entry.attemptOrder = previousOrder; break; }
-        if (this.now() - started >= LIMITS.tickMs) break;
         try {
           const config = await this.config(entry.companyId, false);
           // Feature off: drop the entry rather than accumulate stale wakes.
@@ -794,7 +767,6 @@ export class CiWakeRuntime {
           const candidates = [...new Set(ledger.waits.filter((w) => w.companyId === entry.companyId && w.repo === entry.repo && w.prNumber === entry.prNumber).map((w) => w.issueId))];
           let outstanding = false;
           for (const issueId of candidates) {
-            if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
             const wakeKey = `${entry.companyId}:${issueId}:${entry.newSha}`;
             if (ledger.reviewerWakes[wakeKey] !== undefined) continue;
             let issue: any;
@@ -880,13 +852,6 @@ export class CiWakeRuntime {
           await this.save(ledger);
         }
       }
-    };
-    if (firstLane === "reviewer") {
-      await pollReviewers();
-      await pollCi();
-    } else {
-      await pollCi();
-      await pollReviewers();
     }
     await this.save(ledger);
   }
