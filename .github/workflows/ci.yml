@@ -29,6 +29,26 @@ jobs:
           cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/gated-launch.c qualification/synthetic-fence/gated-launch-test.c -o "$RUNNER_TEMP/gated-launch-test"
           "$RUNNER_TEMP/gated-launch-test"
 
+  gated-launch-behavior:
+    name: Gated launch kernel behavior
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # Disposable hosted runner only: no protected runtime or controller.
+      - run: |
+          set -euo pipefail
+          cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/gated-launch.c qualification/synthetic-fence/gated-launch-behavior.c -o "$RUNNER_TEMP/gated-launch-behavior"
+          group="/sys/fs/cgroup/gated-launch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          marker="$RUNNER_TEMP/gated-launch-marker"
+          sudo mkdir "$group"
+          cleanup() { sudo rmdir "$group"; sudo rm -f -- "$marker"; }
+          trap cleanup EXIT
+          sudo timeout --kill-after=5s 30s unshare --pid --fork --mount-proc --kill-child "$RUNNER_TEMP/gated-launch-behavior" "$group" "$marker"
+
   synthetic-image-validation:
     name: Synthetic image inspection checks
     runs-on: ubuntu-24.04
