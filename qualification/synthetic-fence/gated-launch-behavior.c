@@ -24,6 +24,16 @@ static int record(const struct sf_child *child, void *arg)
     return o->fail;
 }
 
+static int placed(const char *marker)
+{
+    int fd = open(marker, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char receipt;
+    ssize_t n = read(fd, &receipt, 1);
+    close(fd);
+    return n == 1 && receipt == 'P';
+}
+
 static struct timespec deadline(void)
 {
     struct timespec t;
@@ -36,6 +46,8 @@ int main(int argc, char **argv)
 {
     if (argc == 4 && strcmp(argv[1], "fixture") == 0) {
         char expected[4096], actual[4096];
+        int marker = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (marker < 0) return 5;
         int fd = open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC);
         if (fd < 0) return 2;
         ssize_t n = read(fd, actual, sizeof(actual) - 1);
@@ -44,9 +56,8 @@ int main(int argc, char **argv)
         actual[n] = '\0';
         int len = snprintf(expected, sizeof(expected), "0::/%s\n", strrchr(argv[3], '/') + 1);
         if (len < 0 || (size_t)len >= sizeof(expected) || strcmp(actual, expected) != 0) return 4;
-        fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) return 5;
-        close(fd);
+        if (write(marker, "P", 1) != 1) return 5;
+        close(marker);
         for (int i = 0; i < 1000; i++) {
             if (access(argv[2], F_OK) != 0) return 0;
             usleep(10000);
@@ -62,6 +73,20 @@ int main(int argc, char **argv)
     assert(dir >= 0 && exe >= 3);
     char *args[] = { "fixture", "fixture", argv[2], argv[1], NULL };
     char *env[] = { NULL };
+    /* A deliberately unplaced exec must leave an entry witness, not a placement receipt. */
+    pid_t control = fork();
+    assert(control >= 0);
+    if (control == 0) {
+        execve("/proc/self/exe", args, env);
+        _exit(127);
+    }
+    int status;
+    assert(waitpid(control, &status, 0) == control);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 4);
+    assert(access(argv[2], F_OK) == 0 && !placed(argv[2]));
+    assert(unlink(argv[2]) == 0);
+    puts("negative control: unplaced fixture entry detected");
+
     struct sf_child child;
     struct observation o = { .marker = argv[2], .fail = 1 };
     struct timespec end = deadline();
@@ -79,10 +104,9 @@ int main(int argc, char **argv)
     ssize_t n = read(procs, buf, sizeof(buf));
     assert(n >= 0 && sf_cgroup_contains(buf, (size_t)n, child.pid) == 1);
     close(procs);
-    for (int i = 0; i < 1000 && access(argv[2], F_OK) != 0; i++) usleep(10000);
-    assert(access(argv[2], F_OK) == 0);
+    for (int i = 0; i < 1000 && !placed(argv[2]); i++) usleep(10000);
+    assert(placed(argv[2]));
     assert(unlink(argv[2]) == 0);
-    int status;
     assert(waitpid(child.pid, &status, 0) == child.pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     assert(waitpid(-1, NULL, WNOHANG) == -1);
