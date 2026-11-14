@@ -801,7 +801,10 @@ export class CiWakeRuntime {
             if (ledger.reviewerWakes[wakeKey] !== undefined) continue;
             // Admission precedes host reads too: slow or failing reads must not
             // repeatedly consume the invocation before later cards are visited.
-            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) {
+              if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
+              outstanding = true; break;
+            }
             entry.candidateOrder[issueId] = ++candidateSequence;
             entry.candidateSequence = candidateSequence;
             await this.save(ledger);

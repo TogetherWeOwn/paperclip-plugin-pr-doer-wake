@@ -1060,6 +1060,31 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup.mock.calls.some(([id]) => id === `issue-${numbers.at(-1)}`)).toBe(true);
     });
 
+    it("retries an entry whose last read exactly exhausts the shared request budget", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      const numbers = Array.from({ length: 52 }, (_, i) => i + 17);
+      const last = numbers.at(-1)!;
+      const ledger: Ledger = { version: 1, waits: [], audits: [], deliveries: {}, hints: {}, samples: {} };
+      ledger.waits = numbers.map((prNumber) => ({ companyId: COMPANY, repo: REPO, prNumber, issueId: `issue-${prNumber}`, headSha: HEAD, registeredAt: START, expiresAt: START + 86_400_000, status: "woken" })) as unknown as Wait[];
+      ledger.prHeadPending = Object.fromEntries(numbers.map((prNumber) => [`${COMPANY}:${REPO}:${prNumber}`, { companyId: COMPANY, repo: REPO, prNumber, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START + prNumber }]));
+      h.seed(ledger);
+      h.issueGet.mockImplementation(async (id: string) => ({ ...clone(h.issue), id, workProducts: [{ ...prWorkProduct, url: `https://github.com/${REPO}/pull/${id.slice(6)}`, metadata: { repo: REPO, number: Number(id.slice(6)) } }] }));
+      let admittedFetch: PluginContext["http"]["fetch"];
+      let currentNumber = 0;
+      github.construct.mockImplementation((fetch) => { admittedFetch = fetch; });
+      github.pull.mockImplementation(async (_repo: string, n: number) => { currentNumber = n; await admittedFetch("https://example.test", {}); return pull({ number: n, headSha: NEXT_HEAD }); });
+      github.snapshot.mockImplementation(async () => { for (let i = 0; i < (currentNumber === last ? 28 : 68); i++) await admittedFetch("https://example.test", {}); return {}; });
+      github.readiness.mockReturnValue(verdict("pass"));
+      h.requestWakeup.mockImplementation(async (id) => ({ queued: id === `issue-${last}` }));
+
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(51);
+      expect(h.ledger().prHeadPending?.[`${COMPANY}:${REPO}:${last}`]).toBeDefined();
+      await new CiWakeRuntime(h.ctx, h.clock).poll();
+      expect(h.requestWakeup.mock.calls.some(([id]) => id === `issue-${last}`)).toBe(true);
+    });
+
     it("rotates a reviewer that cannot fit even the fresh request budget", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
