@@ -16,7 +16,7 @@ struct observation { const char *marker; int fail; int called; };
 static int record(const struct sf_child *child, void *arg)
 {
     struct observation *o = arg;
-    struct pollfd p = { .fd = child->pidfd, .events = POLIN };
+    struct pollfd p = { .fd = child->pidfd, .events = POLLIN };
     assert(child->pid > 0 && child->pidfd >= 0 && child->poisoned);
     assert(access(o->marker, F_OK) == -1);
     assert(poll(&p, 1, 0) == 0);
