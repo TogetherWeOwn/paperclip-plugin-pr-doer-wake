@@ -809,6 +809,12 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().cursors["example/project"]).toBeUndefined();
     expect(h.ledger().dispositions).toEqual({});
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledWith(ISSUE, COMPANY, expect.objectContaining({ idempotencyKey: expect.stringContaining("example/project#43|") }));
+    owner.texts[0]!.body = body.replace(" <!-- note -->", "");
+    h.advance(DAY);
+    await h.restart().poll();
+    expect(h.ledger().report.unknown).not.toContain("example/project#42");
+    expect(h.ledger().cursors["example/project"]).toBe(NOW + DAY);
+    expect(Object.keys(h.ledger().dispositions)).toHaveLength(1);
   });
   it("isolates physical-line clocks when one of two directives gains a comment", async () => {
     const first = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
