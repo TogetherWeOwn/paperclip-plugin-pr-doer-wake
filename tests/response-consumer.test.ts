@@ -66,6 +66,17 @@ describe('response consumer hook', () => {
     expect(consumer.poisoned).toBe(true);
   });
 
+  it('accepts an acknowledgement whose undelimited frame exactly fits the limit', async () => {
+    const bytes = response(1);
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    const frame = JSON.stringify({ ...identity, type: 'ACK', id: 1, digest });
+    const consumer = new ResponseConsumer(identity, Buffer.byteLength(frame), 1);
+    consumer.register(1);
+    const ack = await consumer.accept(bytes, () => {});
+    expect(Buffer.from(ack).toString()).toBe(frame + '\n');
+    expect(consumer.poisoned).toBe(false);
+  });
+
   it('poisons on a deeply nested response that cannot be canonicalized', async () => {
     const consumer = new ResponseConsumer(identity, 65536, 1);
     consumer.register(1);
