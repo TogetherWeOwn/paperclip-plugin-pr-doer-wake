@@ -15,6 +15,20 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  phase-state-unit:
+    name: Phase state filesystem unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # Inert temporary directories only: no cgroup or worker execution.
+      - run: |
+          cc -std=c11 -Wall -Wextra -Werror qualification/synthetic-fence/phase-state.c qualification/synthetic-fence/phase-state.test.c -Wl,--wrap=getrandom -o "$RUNNER_TEMP/phase-state-test"
+          "$RUNNER_TEMP/phase-state-test"
+
   gated-launch-parser:
     name: Gated launch parser unit tests
     runs-on: ubuntu-24.04
