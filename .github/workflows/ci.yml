@@ -137,6 +137,7 @@ jobs:
           npx vitest run tests/custody-policy.test.ts -t 'suppresses protected directives'
 
   check:
+    needs: cgroup-membership-parser
     # Required status check on main. Renaming this changes the check context
     # and blocks every merge until the ruleset is updated to match.
     name: check
