@@ -36,12 +36,51 @@ describe('response ledger', () => {
     expect(l.completed).toBe(false);
   });
 
+  it.each([1002, 1003])('records but rejects a late write after an early ACK at %i', now => {
+    const l = ledger();
+    const hash = prepare(l);
+    l.acknowledge(1, hash, 3);
+    expect(() => l.writeOutcome(1, bytes.length, false, now)).toThrow('ack deadline');
+    expect(l.snapshot()[0]).toMatchObject({ writeAccounted: true, writeError: false, acked: true });
+    expect(l.poisoned).toBe(true);
+  });
+
+  it('does not permit admission after an empty poison reason', () => {
+    const l = ledger();
+    l.poison('');
+    expect(l.poisoned).toBe(true);
+    expect(() => l.admit(1, 1)).toThrow();
+  });
+
+  it('retains validated identity and limits when the caller mutates its inputs', () => {
+    const sourceIdentity = { ...identity };
+    const sourceLimits = { ...limits, maxOutstanding: 1 };
+    const l = new ResponseLedger(sourceIdentity, sourceLimits, 0);
+    sourceIdentity.nonce = 'changed';
+    sourceLimits.maxOutstanding = 32;
+    expect(l.identity.nonce).toBe('nonce');
+    prepare(l);
+    expect(() => l.admit(2, 3)).toThrow('outstanding limit');
+  });
+
   it('records the actual write result after a separate poison', () => {
     const l = ledger();
     prepare(l);
     l.poison('channel closed');
     expect(() => l.writeOutcome(1, bytes.length, true, 4)).toThrow('channel closed');
     expect(l.snapshot()[0]).toMatchObject({ writeAccounted: true, writeError: true });
+  });
+
+  it('releases outstanding slots for either ACK/write ordering while retaining history', () => {
+    const l = new ResponseLedger(identity, { ...limits, maxOutstanding: 1 }, 0);
+    const first = prepare(l);
+    l.writeOutcome(1, bytes.length, false, 3);
+    l.acknowledge(1, first, 4);
+    const second = prepare(l, 2);
+    l.acknowledge(2, second, 5);
+    l.writeOutcome(2, bytes.length, false, 6);
+    l.admit(3, 7);
+    expect(l.snapshot()).toHaveLength(3);
   });
 
   it('includes ACK waiters in the outstanding limit', () => {

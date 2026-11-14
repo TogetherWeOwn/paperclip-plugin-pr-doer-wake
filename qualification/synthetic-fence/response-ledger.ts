@@ -35,6 +35,7 @@ const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest(
 /** All times are absolute monotonic milliseconds supplied by the owner. */
 export class ResponseLedger {
   private readonly requests = new Map<number, Request>();
+  private readonly outstanding = new Set<Request>();
   private lastId = 0;
   private sealDeadline?: number;
   private endId?: number;
@@ -43,13 +44,18 @@ export class ResponseLedger {
   private buffered = 0;
   private failure?: string;
 
-  constructor(readonly identity: Identity, readonly limits: LedgerLimits, now: number) {
+  readonly identity: Readonly<Identity>;
+  readonly limits: Readonly<LedgerLimits>;
+
+  constructor(identity: Identity, limits: LedgerLimits, now: number) {
     if (identity.version !== 1 || !identity.caseId || !identity.phaseId || !identity.nonce ||
         Object.values(limits).some(n => !Number.isSafeInteger(n) || n <= 0) ||
         limits.phaseDeadline <= now || limits.maxFrameBytes > 65536 ||
         limits.maxOutstanding > 32 || limits.ackTimeout > 10000 || limits.sealTimeout > 10000) {
       throw new Error('invalid ledger identity or limits');
     }
+    this.identity = Object.freeze({ ...identity });
+    this.limits = Object.freeze({ ...limits });
   }
 
   private fail(reason: string): never {
@@ -58,11 +64,11 @@ export class ResponseLedger {
   }
 
   private check(now: number): void {
-    if (this.failure) throw new Error(this.failure);
+    if (this.failure !== undefined) throw new Error(this.failure);
     if (!Number.isFinite(now) || now >= this.limits.phaseDeadline) this.fail('phase deadline');
     if (this.sealDeadline !== undefined && !this.done && now >= this.sealDeadline) this.fail('seal deadline');
-    for (const request of this.requests.values()) {
-      if (request.ackDeadline !== undefined && !(request.acked && request.writeAccounted) && now >= request.ackDeadline) {
+    for (const request of this.outstanding) {
+      if (request.ackDeadline !== undefined && now >= request.ackDeadline) {
         this.fail('ack deadline');
       }
     }
@@ -86,10 +92,10 @@ export class ResponseLedger {
     this.check(now);
     if (this.endId !== undefined || this.done || !Number.isSafeInteger(id) || id !== this.lastId + 1 ||
         id > this.limits.maxRequests) this.fail('invalid request id or admission closed');
-    let outstanding = 0;
-    for (const request of this.requests.values()) if (!(request.acked && request.writeAccounted)) outstanding++;
-    if (outstanding >= this.limits.maxOutstanding) this.fail('outstanding limit');
-    this.requests.set(id, { handlerSettled: false, writeAccounted: false, acked: false });
+    if (this.outstanding.size >= this.limits.maxOutstanding) this.fail('outstanding limit');
+    const request: Request = { handlerSettled: false, writeAccounted: false, acked: false };
+    this.requests.set(id, request);
+    this.outstanding.add(request);
     this.lastId = id;
   }
 
@@ -120,9 +126,12 @@ export class ResponseLedger {
     if (!request.digest || request.writeAccounted || !Number.isSafeInteger(byteLength) || byteLength !== request.byteLength) {
       this.fail('invalid write outcome');
     }
+    // Check deadlines before recording the write, but retain its actual outcome on failure.
+    try { this.check(now); } catch { /* poison is rethrown after accounting */ }
     request.writeAccounted = true;
     request.writeError = error;
     this.buffered -= byteLength;
+    if (request.acked) this.outstanding.delete(request);
     if (error) this.poison('response write failed');
     this.check(now);
   }
@@ -132,6 +141,7 @@ export class ResponseLedger {
     const request = this.request(id);
     if (!request.digest || request.acked || request.digest !== responseDigest) this.fail('invalid acknowledgement');
     request.acked = true;
+    if (request.writeAccounted) this.outstanding.delete(request);
   }
 
   seal(now: number): void {
