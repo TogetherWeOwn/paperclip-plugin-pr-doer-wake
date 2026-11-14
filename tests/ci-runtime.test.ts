@@ -59,7 +59,7 @@ type Ledger = {
   deliveries: Record<string, number>;
   hints: Record<string, number>;
   samples: Record<string, Array<{ sha: string; ms: number }>>;
-  prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: string[] }>;
+  prHeadPending?: Record<string, { companyId: string; repo: string; prNumber: number; oldSha: string; newSha: string; observedAt: number; shadowLogged?: string[]; pollOrder?: number }>;
   reviewerWakes?: Record<string, number>;
 };
 const clone = <T>(value: T): T => structuredClone(value);
@@ -897,6 +897,22 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect((wake as { reason: string }).reason).toContain(HEAD.slice(0, 7));
       expect((wake as { reason: string }).reason).toContain(NEXT_HEAD.slice(0, 7));
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
+    it("preserves reviewer queue position when registration retargets a pending head", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      await movedHead(h);
+      await h.runtime.register({ ...registration, headSha: NEXT_HEAD }, run);
+      const key = `${COMPANY}:${REPO}:17`;
+      const ledger = h.ledger();
+      ledger.prHeadPending![key]!.pollOrder = 7;
+      h.seed(ledger);
+      const thirdHead = "c".repeat(40);
+      github.pull.mockResolvedValue(pull({ headSha: thirdHead }));
+
+      await h.runtime.register({ ...registration, headSha: thirdHead }, run);
+
+      expect(h.ledger().prHeadPending![key]).toMatchObject({ newSha: thirdHead, pollOrder: 7 });
     });
 
     it("retargets instead of waking when a push lands during the snapshot", async () => {
