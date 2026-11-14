@@ -34,12 +34,24 @@ static struct timespec deadline(void)
 
 int main(int argc, char **argv)
 {
-    if (argc == 3 && strcmp(argv[1], "fixture") == 0) {
-        int fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (argc == 4 && strcmp(argv[1], "fixture") == 0) {
+        char expected[4096], actual[4096];
+        int fd = open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC);
         if (fd < 0) return 2;
+        ssize_t n = read(fd, actual, sizeof(actual) - 1);
         close(fd);
-        sleep(2);
-        return 0;
+        if (n <= 0) return 3;
+        actual[n] = '\0';
+        int len = snprintf(expected, sizeof(expected), "0::/%s\n", strrchr(argv[3], '/') + 1);
+        if (len < 0 || (size_t)len >= sizeof(expected) || strcmp(actual, expected) != 0) return 4;
+        fd = open(argv[2], O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) return 5;
+        close(fd);
+        for (int i = 0; i < 1000; i++) {
+            if (access(argv[2], F_OK) != 0) return 0;
+            usleep(10000);
+        }
+        return 6;
     }
     assert(argc == 3 && getpid() == 1);
     sigset_t mask;
@@ -48,7 +60,7 @@ int main(int argc, char **argv)
     int dir = open(argv[1], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     int exe = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
     assert(dir >= 0 && exe >= 3);
-    char *args[] = { "fixture", "fixture", argv[2], NULL };
+    char *args[] = { "fixture", "fixture", argv[2], argv[1], NULL };
     char *env[] = { NULL };
     struct sf_child child;
     struct observation o = { .marker = argv[2], .fail = 1 };
@@ -67,15 +79,16 @@ int main(int argc, char **argv)
     ssize_t n = read(procs, buf, sizeof(buf));
     assert(n >= 0 && sf_cgroup_contains(buf, (size_t)n, child.pid) == 1);
     close(procs);
+    for (int i = 0; i < 1000 && access(argv[2], F_OK) != 0; i++) usleep(10000);
+    assert(access(argv[2], F_OK) == 0);
+    assert(unlink(argv[2]) == 0);
     int status;
     assert(waitpid(child.pid, &status, 0) == child.pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    assert(access(argv[2], F_OK) == 0);
     assert(waitpid(-1, NULL, WNOHANG) == -1);
     close(child.pidfd);
     close(exe);
     close(dir);
-    assert(unlink(argv[2]) == 0);
     puts("gated launch: callback refusal reaped; kernel placement and release observed");
     return 0;
 }
