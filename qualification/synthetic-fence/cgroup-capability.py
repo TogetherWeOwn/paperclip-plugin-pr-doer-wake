@@ -60,8 +60,14 @@ def main():
                 if os.fork():
                     os._exit(0)
                 os.setsid()
+                parent = os.getpid()
                 if os.fork():
                     os._exit(0)
+                deadline = time.monotonic() + 5
+                while os.getppid() == parent:
+                    if time.monotonic() >= deadline:
+                        os._exit(5)
+                    time.sleep(0.01)
                 (nested / "cgroup.procs").write_text(str(os.getpid()))
                 os.write(ready_write, b"R")
                 while True:
