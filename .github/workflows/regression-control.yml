@@ -1,0 +1,92 @@
+name: Diagnostic regression controls
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    if: github.event.pull_request.head.ref == 'diagnostic/ci-regression-controls'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - name: cross-lane
+            source: 0088fa09a64e4f1a0ee6c97460349bd84d856034
+            pattern: gives a settled reviewer a turn after CI consumes a full tick
+            expected: 'expected "spy" to be called 1 times, but got 0 times'
+          - name: reviewer-pending
+            source: dc220cc29db8764fa97eb1f7da9c621d74225076
+            pattern: rotates past a saturated reviewer prefix after restart \(pending\)
+            expected: 'expected "spy" to be called 1 times, but got 0 times'
+          - name: reviewer-failure
+            source: dc220cc29db8764fa97eb1f7da9c621d74225076
+            pattern: rotates past a saturated reviewer prefix after restart \(failure\)
+            expected: 'expected "spy" to be called 1 times, but got 0 times'
+          - name: candidate-shadow
+            source: dc220cc29db8764fa97eb1f7da9c621d74225076
+            pattern: stops candidate reads after an admitted read exhausts the tick \(shadow=true\)
+            expected: 'expected "spy" to be called 1 times, but got 2 times'
+          - name: candidate-live
+            source: dc220cc29db8764fa97eb1f7da9c621d74225076
+            pattern: stops candidate reads after an admitted read exhausts the tick \(shadow=false\)
+            expected: 'expected "spy" to be called 1 times, but got 2 times'
+        version: [old, corrected]
+    name: ${{ matrix.case.name }} / ${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: b52fc928151f52bcf9986ba9502ae91717f9d290
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Verify pins and select implementation
+        env:
+          SOURCE: ${{ matrix.case.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -eu
+          fixture=b52fc928151f52bcf9986ba9502ae91717f9d290
+          test "$(git rev-parse HEAD)" = "$fixture"
+          test "$(git rev-parse "$SOURCE^{commit}")" = "$SOURCE"
+          test "$(git hash-object tests/ci-runtime.test.ts)" = "$(git rev-parse "$fixture:tests/ci-runtime.test.ts")"
+          if [ "$VERSION" = old ]; then
+            git show "$SOURCE:src/ci-runtime.ts" > src/ci-runtime.ts
+            implementation="$SOURCE"
+          else
+            implementation="$fixture"
+          fi
+          test "$(git hash-object src/ci-runtime.ts)" = "$(git rev-parse "$implementation:src/ci-runtime.ts")"
+          printf 'fixture=%s implementation=%s\n' "$fixture" "$implementation"
+      - run: npm ci --ignore-scripts
+      - name: Run and classify the behavioral assertion
+        env:
+          PATTERN: ${{ matrix.case.pattern }}
+          EXPECTED: ${{ matrix.case.expected }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set +e
+          npx vitest run tests/ci-runtime.test.ts -t "$PATTERN" --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/result.json"
+          result=$?
+          set -e
+          RESULT="$result" node --input-type=module <<'JS'
+          import { readFileSync } from 'node:fs';
+          const report = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/result.json`, 'utf8'));
+          const tests = report.testResults.flatMap(suite => suite.assertionResults).filter(test => test.status !== 'pending');
+          if (tests.length !== 1) throw new Error(`Expected one executed test, got ${tests.length}`);
+          const test = tests[0];
+          console.log(JSON.stringify({ name: test.fullName, status: test.status, failures: test.failureMessages }, null, 2));
+          if (process.env.VERSION === 'corrected') {
+            if (process.env.RESULT !== '0' || test.status !== 'passed') throw new Error('Corrected control did not pass');
+          } else {
+            if (process.env.RESULT === '0' || test.status !== 'failed' || !test.failureMessages.some(message => message.includes(process.env.EXPECTED))) {
+              throw new Error('Old control did not fail at the expected behavioral assertion');
+            }
+          }
+          JS
