@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "gated-launch.h"
+#include "cgroup-membership.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -7,7 +8,6 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>

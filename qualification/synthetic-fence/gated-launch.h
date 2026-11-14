@@ -1,7 +1,6 @@
 #ifndef SYNTHETIC_FENCE_GATED_LAUNCH_H
 #define SYNTHETIC_FENCE_GATED_LAUNCH_H
 
-#include <stddef.h>
 #include <sys/types.h>
 #include <time.h>
 
@@ -13,9 +12,6 @@ struct sf_child {
     int wait_status;
     int reaped;
 };
-
-/* Pure, bounded parser. 1 = present exactly once; 0 = absent; -1 = malformed. */
-int sf_cgroup_contains(const char *bytes, size_t length, pid_t pid);
 
 /*
  * Single-threaded PID-1 supervisor only. SIGCHLD must be blocked before entry;

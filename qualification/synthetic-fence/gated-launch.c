@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "gated-launch.h"
+#include "cgroup-membership.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,31 +18,22 @@
 
 #define MEMBERSHIP_LIMIT 65536
 
-int sf_cgroup_contains(const char *s, size_t n, pid_t pid)
-{
-    size_t i = 0;
-    int found = 0;
-    if (!s || pid <= 0) return -1;
-    while (i < n) {
-        unsigned long value = 0;
-        size_t start = i;
-        while (i < n && s[i] >= '0' && s[i] <= '9') {
-            unsigned digit = (unsigned)(s[i++] - '0');
-            if (value > ((unsigned long)INT_MAX - digit) / 10) return -1;
-            value = value * 10 + digit;
-        }
-        if (i == start || value == 0 || i == n || s[i++] != '\n') return -1;
-        if (value == (unsigned long)pid && ++found > 1) return -1;
-    }
-    return found;
-}
-
 static int before(const struct timespec *end)
 {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) return 0;
     return now.tv_sec < end->tv_sec ||
         (now.tv_sec == end->tv_sec && now.tv_nsec < end->tv_nsec);
+}
+
+static int no_caught_signals(void)
+{
+    struct sigaction sa;
+    for (int i = 1; i < NSIG; i++) {
+        if (sigaction(i, NULL, &sa) < 0) { if (errno == EINVAL) continue; return 0; }
+        if (sa.sa_handler != SIG_DFL && sa.sa_handler != SIG_IGN) return 0;
+    }
+    return 1;
 }
 
 /* close_range failures are fatal: never exec with unknown inherited fds. */
@@ -123,7 +115,7 @@ int sf_gated_launch(struct sf_child *c, int dirfd, int exe, char *const argv[],
         !record_child || !argv || !argv[0] || !envp || exe < 3 || dirfd < 0 ||
         (exe_flags = fcntl(exe, F_GETFD)) < 0 || !(exe_flags & FD_CLOEXEC) ||
         getpid() != 1 || sigaction(SIGCHLD, NULL, &disposition) < 0 ||
-        disposition.sa_handler == SIG_IGN || (disposition.sa_flags & SA_NOCLDWAIT) ||
+        disposition.sa_handler == SIG_IGN || (disposition.sa_flags & SA_NOCLDWAIT) || !no_caught_signals() ||
         sigprocmask(SIG_SETMASK, NULL, &mask) < 0 || sigismember(&mask, SIGCHLD) != 1 ||
         fstatfs(dirfd, &fs) < 0 || (unsigned long)fs.f_type != CGROUP2_SUPER_MAGIC ||
         !before(deadline)) { errno = EINVAL; return -1; }

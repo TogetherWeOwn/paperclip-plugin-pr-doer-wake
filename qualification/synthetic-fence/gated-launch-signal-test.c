@@ -5,6 +5,7 @@
 #include <assert.h>
 
 static int signal_attempts;
+static void handler(int sig) { (void)sig; }
 
 long test_syscall(long number, ...)
 {
@@ -20,6 +21,10 @@ int main(void)
     char byte;
     struct timespec end;
     struct sf_child child = { .pidfd = -1, .poisoned = 1 };
+    assert(signal(SIGUSR1, handler) != SIG_ERR);
+    assert(!no_caught_signals());
+    assert(signal(SIGUSR1, SIG_DFL) != SIG_ERR);
+    assert(no_caught_signals());
     assert(pipe(ready) == 0);
     child.pid = fork();
     assert(child.pid >= 0);
