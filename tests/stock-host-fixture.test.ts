@@ -13,6 +13,10 @@ describe.skipIf(!process.env.HOST_SQL_SOURCE && !process.env.RELEASE_TEST_DATABA
     await db.migrate(`CREATE TABLE ${db.namespace}.second_rows (id text PRIMARY KEY);`);
     await expect(db.migrate(`CREATE TABLE ${db.namespace}.third_rows (id text); DROP TABLE ${table};`))
       .rejects.toThrow("Destructive plugin migrations are not allowed");
+    await db.migrate(`CREATE TABLE ${db.namespace}.third_rows (id text);`);
+    await expect(db.migrate(`CREATE TABLE ${db.namespace}.fourth_rows (id text); CREATE TABLE ${db.namespace}.second_rows (id text);`))
+      .rejects.toThrow();
+    await db.migrate(`CREATE TABLE ${db.namespace}.fourth_rows (id text);`);
     await expect(db.execute(`UPDATE ${table} SET value = $1`, ["changed", "unused"]))
       .rejects.toThrow("Every ctx.db parameter must be referenced");
     await expect(db.execute("UPDATE public.fixture_rows SET value = 'wrong' WHERE id = 'one'"))

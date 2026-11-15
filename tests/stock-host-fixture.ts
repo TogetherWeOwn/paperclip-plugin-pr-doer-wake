@@ -32,8 +32,8 @@ export function stockHostFixture() {
       await psql(`CREATE SCHEMA IF NOT EXISTS ${namespace}`);
       for (const statement of statements) {
         host.validatePluginMigrationStatement!(statement, namespace, []);
-        await psql(statement);
       }
+      await psql(`BEGIN;\n${statements.join(";\n")};\nCOMMIT;`);
     },
     async execute(sql: string, params: unknown[] = []) {
       host.validatePluginRuntimeExecute!(sql, namespace);
