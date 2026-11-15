@@ -58,6 +58,38 @@ describe('synthetic byte framing', () => {
     expect(countOverflow.events).toEqual(['frame:a', 'error:reentrant input limit']);
   });
 
+  it('releases consumed reentrant buffers during sustained replenishment', () => {
+    let count = 0;
+    const { framer, events } = setup((_, input) => {
+      const state = input as unknown as { queue: (Buffer | null | undefined)[]; queueIndex: number };
+      if (state.queueIndex) expect(state.queue[state.queueIndex - 1]).toBeUndefined();
+      if (++count < 1200) input.data(bytes('x\n'));
+    });
+    framer.data(bytes('x\n'));
+    expect(count).toBe(1200);
+    expect(events).toHaveLength(1200);
+  });
+
+  it('rejects empty reentrant data queued after EOF', () => {
+    const { framer, events } = setup((_, input) => { input.end(); input.data(bytes('')); });
+    framer.data(bytes('a\n'));
+    expect(events).toEqual(['frame:a', 'end', 'error:late stream data']);
+  });
+
+  it('handles a frame delivered byte by byte at the boundary', () => {
+    const { framer, events } = setup(undefined, 4096);
+    for (let i = 0; i < 4096; i++) framer.data(bytes('x'));
+    framer.data(bytes('\n'));
+    expect(events).toEqual([`frame:${'x'.repeat(4096)}`]);
+  });
+
+  it('propagates errors thrown by the error callback consistently', () => {
+    const framer = new ByteFramer(1, 1, () => {}, () => {}, () => { throw new Error('error handler'); });
+    expect(() => framer.data(bytes('xx'))).toThrow('error handler');
+    const invalid = new ByteFramer(1, 1, () => {}, () => {}, () => { throw new Error('error handler'); });
+    expect(() => invalid.data('bad')).toThrow('error handler');
+  });
+
   it('rejects incomplete, repeated and late input', () => {
     const incomplete = setup(); incomplete.framer.data(bytes('x')); incomplete.framer.end();
     expect(incomplete.events).toEqual(['error:premature or incomplete EOF']);
