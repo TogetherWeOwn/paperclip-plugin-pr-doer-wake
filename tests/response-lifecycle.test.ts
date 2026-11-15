@@ -119,6 +119,51 @@ describe('synthetic response lifecycle', () => {
     expect(control.ledger.poisoned).toBe(true);
   });
 
+  it('does not turn a poisoned pending teardown into success', async () => {
+    let complete!: (error?: Error | null) => void;
+    const s = setup(undefined, done => { complete = done; });
+    s.lifecycle.seal();
+    s.input.emit('data', encode('REQUESTS_END', { id: 0 }));
+    const settled = JSON.parse(s.writes[1]!.data.toString());
+    s.input.emit('data', encode('PHASE_DONE', { id: 0, digest: settled.digest }));
+    s.writes[0]!.done(); s.writes[1]!.done();
+    s.input.end(); await new Promise<void>(resolve => setImmediate(resolve));
+    s.writes[0]!.done();
+    complete();
+    expect(await s.lifecycle.result).toBe(false);
+    expect(s.ledger.completed).toBe(false);
+    expect(s.teardown).toHaveBeenCalledOnce();
+  });
+
+  it('treats success as a snapshot, with late stream data still poisoning the ledger', async () => {
+    const s = setup();
+    s.lifecycle.seal();
+    s.input.emit('data', encode('REQUESTS_END', { id: 0 }));
+    const settled = JSON.parse(s.writes[1]!.data.toString());
+    s.input.emit('data', encode('PHASE_DONE', { id: 0, digest: settled.digest }));
+    s.writes[0]!.done(); s.writes[1]!.done();
+    s.input.end(); await new Promise<void>(resolve => setImmediate(resolve));
+    expect(await s.lifecycle.result).toBe(true);
+    s.input.emit('data', encode('REQUEST', { id: 1, payload: null }));
+    expect(await s.lifecycle.failure).toBe('late stream data');
+    expect(s.ledger.completed).toBe(false);
+    expect(s.ledger.snapshot()).toHaveLength(0);
+    expect(s.teardown).toHaveBeenCalledOnce();
+  });
+
+  it('does not mistake close without EOF for terminal completion', async () => {
+    const s = setup();
+    s.lifecycle.seal();
+    s.input.emit('data', encode('REQUESTS_END', { id: 0 }));
+    const settled = JSON.parse(s.writes[1]!.data.toString());
+    s.input.emit('data', encode('PHASE_DONE', { id: 0, digest: settled.digest }));
+    s.writes[0]!.done(); s.writes[1]!.done();
+    s.input.emit('close');
+    expect(await s.lifecycle.result).toBe(false);
+    expect(s.ledger.completed).toBe(false);
+    expect(s.teardown).toHaveBeenCalledOnce();
+  });
+
   it('fails closed at the response deadline even if the writer never calls back', async () => {
     const { lifecycle, ledger, input, time } = setup();
     input.emit('data',encode('REQUEST', { id: 1, payload: null }));
