@@ -2,6 +2,14 @@
 
 Status: implementation review required; this is not Security acceptance. Maintainer role: plugin toolsmith. API targets: stock plugin SDK 2026.1023.0 and GitHub REST 2022-11-28.
 
+## Release lifecycle store (review required)
+
+The namespace-backed store tracks one immutable target per company and confirmation: repository, SHA, staging run and attempt, and expiry. A unique key prevents a conflicting target from replacing a prior confirmation. Create and revoke are conditional bookkeeping operations; terminal rows never return to an earlier state. Claim and consume are disabled: valid requests return `unknown` without accessing the database, because expiry checks after a row-lock wait are not proven safe. Create does not prove continuing freshness. Retain terminal rows: deletion, database restore or rollback can permit replay and require separate reconciliation.
+
+Zero affected rows are **unknown**, not proof of absence: stock host execute converts a missing count to zero. A lost response, malformed count, crash or retry also leaves the outcome unknown. Never interpret `unknown` as success, infer ownership with a read, fall back to application time, or initiate an external release effect. Never retry with a new identity or assume an interrupted external effect did not happen. This adapter does not authenticate a confirmation, protect itself from a compromised worker with raw namespace-write capability, publish a status, or authorize promotion. Authenticated workflow transport, final-side-effect fencing and crash reconciliation remain prerequisites.
+
+The namespace write capability is broader than these methods and must be reviewed with the migration by Security before installation. Host support and affected-row semantics must be demonstrated on the actual installed host; stock-source validation and CI fixtures are not installed-host acceptance. No secret handling, installation, enablement or deployment is added here.
+
 ## Assets and credential ceiling
 
 Assets are the GitHub bearer credential OR App RSA private key and short-lived installation tokens, optional webhook HMAC secret, exact card-to-head registration, host wake budget, and the non-secret wait/audit ledger. The configured credential/private key may be broader than the plugin's repo allowlist; that residual ceiling must be recorded by the Operator and independently dispositioned by Security. App mode exchanges an existing approved key for repository/permission-narrowed tokens; it does not create/rotate an App key, modify installations or authorize additional grants. No billable infrastructure is created, and no builds execute in the credential-bearing worker.

@@ -207,7 +207,8 @@ jobs:
         env:
           HOST_SQL_SOURCE: ../stock-host/server/src/services/plugin-database.ts
           RELEASE_TEST_DATABASE: postgresql://postgres:fixture@localhost:5432/fixture
-        run: npx vitest run tests/stock-host-fixture.test.ts
+        # Both files create the same synthetic namespace; avoid concurrent schema creation.
+        run: npx vitest run --no-file-parallelism tests/stock-host-fixture.test.ts tests/release-store-host.test.ts
 
   check:
     needs: [cgroup-membership-parser, gated-launch-behavior, phase-state-unit, stock-host-sql]

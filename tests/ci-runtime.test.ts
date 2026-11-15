@@ -248,7 +248,7 @@ describe("native CI plugin entrypoint", () => {
       "agent.tools.register", "execution.workspaces.read", "http.outbound", "issues.checkout", "issues.read", "issues.wakeup",
       "jobs.schedule", "plugin.state.read", "plugin.state.write", "secrets.read-ref", "webhooks.receive",
       "issues.create", "issue.documents.read", "issue.documents.write", "issue.relations.read",
-"projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.migrate",
+"projects.read", "project.workspaces.read", "database.namespace.read", "database.namespace.write", "database.namespace.migrate",
       "events.subscribe", "issue.interactions.read", "issues.orchestration.read",
     ].sort());
     expect(manifest.tools).toEqual([registrationTool]);
