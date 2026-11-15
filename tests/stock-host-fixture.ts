@@ -22,7 +22,7 @@ export function stockHostFixture() {
   new Function("exports", "createHash", js)(host, createHash);
   const namespace: string = host.derivePluginDatabaseNamespace!("togetherweown.pr-doer-wake", "pr_custody");
   const psql = async (sql: string) => (await run("psql", ["-X", "-v", "ON_ERROR_STOP=1", "-c", sql], {
-    env: { PATH: process.env.PATH, PGHOST: "localhost", PGPORT: "5432", PGUSER: "postgres", PGPASSWORD: "fixture", PGDATABASE: "fixture" },
+    env: { PATH: process.env.PATH, PGHOST: "localhost", PGPORT: "5432", PGUSER: "postgres", PGPASSWORD: "fixture", PGDATABASE: "fixture", PGOPTIONS: "-c standard_conforming_strings=on" },
   })).stdout;
   return {
     namespace,
@@ -37,17 +37,20 @@ export function stockHostFixture() {
     },
     async execute(sql: string, params: unknown[] = []) {
       host.validatePluginRuntimeExecute!(sql, namespace);
-      // Deliberately limited to synthetic strings and integers, not a production binder.
+      // Parameterized fixture SQL deliberately excludes quoted and commented contexts.
+      if (params.length && /['"\\]|--|\/\*|\$(?![1-9]\d*(?![\w$]))|[\w$]\$\d/.test(sql)) {
+        throw new Error("unsupported parameterized fixture SQL");
+      }
       const seen = new Set<number>();
-      const bound = sql.replace(/\$(\d+)/g, (_, n: string) => {
+      const bound = params.length ? sql.replace(/\$(\d+)/g, (_, n: string) => {
         seen.add(Number(n));
         const value = params[Number(n) - 1];
         if (typeof value !== "string" && !(typeof value === "number" && Number.isSafeInteger(value))) throw new Error("unsupported fixture parameter");
         return `'${String(value).replaceAll("'", "''")}'`;
-      });
+      }) : sql;
       if (params.length && seen.size !== params.length) throw new Error("Every ctx.db parameter must be referenced by a $n placeholder");
       const output = await psql(bound);
-      const count = /(?:INSERT 0|UPDATE|DELETE) (\d+)/.exec(output);
+      const count = /(?:^|\n)(?:INSERT 0|UPDATE|DELETE) (\d+)\s*$/.exec(output);
       if (!count) throw new Error(`missing command count: ${output}`);
       return { rowCount: Number(count[1]) };
     },
