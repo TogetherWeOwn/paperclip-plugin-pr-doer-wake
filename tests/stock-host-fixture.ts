@@ -15,7 +15,7 @@ export function stockHostFixture() {
   const start = source.indexOf("const IDENTIFIER_RE =");
   const end = source.indexOf("function bindSql(");
   if (start < 0 || end <= start) throw new Error("pinned host source layout changed");
-  const js = ts.transpileModule(source.slice(start, end), {
+  const js = ts.transpileModule(`${source.slice(start, end)}\nexport { splitSqlStatements };`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023 },
   }).outputText;
   const host: Record<string, (...args: any[]) => any> = {};
@@ -27,18 +27,25 @@ export function stockHostFixture() {
   return {
     namespace,
     async migrate(sql: string) {
-      host.validatePluginMigrationStatement!(sql, namespace, []);
-      await psql(`CREATE SCHEMA ${namespace}`);
-      await psql(sql);
+      const statements: string[] = host.splitSqlStatements!(sql);
+      if (statements.length === 0) throw new Error("empty fixture migration");
+      await psql(`CREATE SCHEMA IF NOT EXISTS ${namespace}`);
+      for (const statement of statements) {
+        host.validatePluginMigrationStatement!(statement, namespace, []);
+        await psql(statement);
+      }
     },
     async execute(sql: string, params: unknown[] = []) {
       host.validatePluginRuntimeExecute!(sql, namespace);
       // Deliberately limited to synthetic strings and integers, not a production binder.
+      const seen = new Set<number>();
       const bound = sql.replace(/\$(\d+)/g, (_, n: string) => {
+        seen.add(Number(n));
         const value = params[Number(n) - 1];
         if (typeof value !== "string" && !(typeof value === "number" && Number.isSafeInteger(value))) throw new Error("unsupported fixture parameter");
         return `'${String(value).replaceAll("'", "''")}'`;
       });
+      if (params.length && seen.size !== params.length) throw new Error("Every ctx.db parameter must be referenced by a $n placeholder");
       const output = await psql(bound);
       const count = /(?:INSERT 0|UPDATE|DELETE) (\d+)/.exec(output);
       if (!count) throw new Error(`missing command count: ${output}`);
