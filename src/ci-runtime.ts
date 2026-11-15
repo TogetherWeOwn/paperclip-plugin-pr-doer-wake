@@ -507,8 +507,12 @@ export class CiWakeRuntime {
         const { code, reason, auditDetail } = refusalDetail(error);
         const content = `CI registration refused: ${code}. ${reason}`;
         if (ledger === undefined) return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
-        this.audit(ledger, "register", code, run, waitId, auditDetail);
-        await this.save(ledger);
+        // Refusal auditing is best-effort: a state-write failure must not
+        // replace the sanitized refusal with a host exception.
+        try {
+          this.audit(ledger, "register", code, run, waitId, auditDetail);
+          await this.save(ledger);
+        } catch { /* State may be unavailable; never expose its error. */ }
         return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
       }
     });
