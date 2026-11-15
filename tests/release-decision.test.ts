@@ -35,7 +35,7 @@ describe("exact release confirmation extraction", () => {
       { ...target, expiresAt: "2026-11-16T03:00:00Z" }, { ...target, extra: true },
     ]) expect(extractReleaseDecision(interaction(value), rm, now)).toBeNull();
     const value = interaction();
-    value.payload.detailsMarkdown = value.payload.detailsMarkdown.replace('{', '{"version":1,');
+    value.payload.detailsMarkdown = `{"version":1,${value.payload.detailsMarkdown.slice(1)}`;
     expect(extractReleaseDecision(value, rm, now)).toBeNull();
   });
   it("expires at the exact boundary and rejects malformed or future resolution time", () => {
