@@ -5,3 +5,4 @@ export { GatesStatusRuntime, GATES_LIMITS } from "./gates-runtime.js";
 export { extractGatesDecision, gatesDescription, type GatesDecision, type GatesExtraction } from "./gates-decision.js";
 export { CiGithub, CiGithubCache, evaluateReadiness, GATES_CONTEXT } from "./ci-github.js";
 export { parseCiConfig, validateCiConfig, parseRegistration } from "./ci-config.js";
+export { validReleaseIdentity, type ReleaseIdentity } from "./release-identity.js";
