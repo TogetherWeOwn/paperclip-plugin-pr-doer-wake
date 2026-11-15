@@ -11,9 +11,10 @@ const now = Date.parse("2026-11-15T02:30:00Z");
 function interaction(details: unknown = target) {
   return {
     id, kind: "request_confirmation", title: "Accept exact production release?",
-    addresseeAgentId: rm, resolvedByAgentId: rm, status: "accepted",
-    resolvedAt: "2026-11-15T02:20:00Z", result: { outcome: "accepted" },
-    payload: { prompt: "Accept exact production release?", detailsMarkdown: JSON.stringify(details) },
+    addresseeAgentId: rm, addresseeUserId: null, resolvedByAgentId: rm,
+    resolvedByUserId: null, resolvedByRunId: id, status: "accepted",
+    resolvedAt: "2026-11-15T02:20:00.000Z", result: { version: 1, outcome: "accepted" },
+    payload: { version: 1, prompt: "Accept exact production release?", detailsMarkdown: JSON.stringify(details), allowDeclineReason: true },
   };
 }
 
@@ -26,6 +27,15 @@ describe("exact release confirmation extraction", () => {
       { ...interaction(), resolvedByAgentId: id }, { ...interaction(), addresseeAgentId: id },
       { ...interaction(), status: "rejected" }, { ...interaction(), result: { outcome: "superseded_by_comment" } },
       { ...interaction(), payload: { ...interaction().payload, target: {} } },
+      { ...interaction(), payload: { ...interaction().payload, acceptLabel: "Approve another target" } },
+      { ...interaction(), payload: { ...interaction().payload, unknown: true } },
+      { ...interaction(), result: { version: 1, outcome: "accepted", toolAction: {} } },
+      { ...interaction(), resolvedByAgentId: null, resolvedByRunId: null }, // host system sweep
+      { ...interaction(), resolvedByAgentId: null, resolvedByUserId: "board-user", resolvedByRunId: null },
+      { ...interaction(), resolvedByUserId: "board-user" },
+      { ...interaction(), addresseeUserId: "board-user" },
+      { ...interaction(), resolvedByRunId: null },
+      { ...interaction(), result: { outcome: "accepted" } },
     ]) expect(extractReleaseDecision(value, rm, now)).toBeNull();
   });
   it("rejects ambiguous, noncanonical or incomplete target data", () => {

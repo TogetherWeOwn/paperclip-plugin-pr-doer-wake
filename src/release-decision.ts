@@ -26,8 +26,9 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 
 /**
- * Extract a release decision from a trusted host interaction, never caller-supplied
- * result text. This function does not publish or authorize a production operation.
+ * Parse a host interaction, not an authorization. The caller must independently
+ * authenticate the host read and its company/issue context. This parser cannot
+ * establish provenance from caller-supplied objects or authorize an operation.
  */
 export function extractReleaseDecision(raw: unknown, rmId: string, now: number): ReleaseDecision | null {
   const interaction = record(raw);
@@ -40,11 +41,15 @@ export function extractReleaseDecision(raw: unknown, rmId: string, now: number):
       || interaction.addresseeAgentId.toLowerCase() !== rmId.toLowerCase()
       || typeof interaction.resolvedByAgentId !== "string"
       || interaction.resolvedByAgentId.toLowerCase() !== rmId.toLowerCase()
-      || interaction.title !== TITLE || payload.prompt !== TITLE
-      || interaction.summary != null || payload.acceptLabel != null
-      || payload.target != null || payload.toolAction != null
-      || payload.secretProposal != null || payload.connectionAuthorization != null
-      || typeof payload.detailsMarkdown !== "string" || payload.detailsMarkdown.length > 1024) return null;
+      || interaction.addresseeUserId != null || interaction.resolvedByUserId != null
+      || typeof interaction.resolvedByRunId !== "string" || !UUID.test(interaction.resolvedByRunId)
+      || interaction.title !== TITLE || interaction.summary != null
+      || payload.version !== 1 || payload.prompt !== TITLE
+      || Object.keys(payload).some((key) => !["version", "prompt", "detailsMarkdown", "allowDeclineReason"].includes(key))
+      || (payload.allowDeclineReason !== undefined && payload.allowDeclineReason !== true)
+      || typeof payload.detailsMarkdown !== "string" || payload.detailsMarkdown.length > 1024
+      || result.version !== 1 || result.outcome !== "accepted"
+      || Object.keys(result).sort().join(",") !== "outcome,version") return null;
 
   let details: Record<string, unknown> | null;
   try { details = record(JSON.parse(payload.detailsMarkdown)); } catch { return null; }
