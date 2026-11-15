@@ -198,7 +198,7 @@ describe('synthetic response lifecycle', () => {
     expect(s.teardown).toHaveBeenCalledOnce();
   });
 
-  it('treats success as a snapshot, with late stream data still poisoning the ledger', async () => {
+  it.each(['data', 'error'] as const)('treats success as a snapshot, with late stream %s still poisoning the ledger', async event => {
     const s = setup();
     s.lifecycle.seal();
     s.input.emit('data', encode('REQUESTS_END', { id: 0 }));
@@ -207,8 +207,11 @@ describe('synthetic response lifecycle', () => {
     s.writes[0]!.done(); s.writes[1]!.done();
     s.input.end(); await new Promise<void>(resolve => setImmediate(resolve));
     expect(await s.lifecycle.result).toBe(true);
-    s.input.emit('data', encode('REQUEST', { id: 1, payload: null }));
-    expect(await s.lifecycle.failure).toBe('late stream data');
+    if (event === 'data') s.input.emit('data', encode('REQUEST', { id: 1, payload: null }));
+    else s.input.emit('error', new Error('late'));
+    expect(await s.lifecycle.failure).toBe(event === 'data' ? 'late stream data' : 'stream error');
+    expect(await s.lifecycle.result).toBe(true);
+    expect(s.ledger.poisoned).toBe(true);
     expect(s.ledger.completed).toBe(false);
     expect(s.ledger.snapshot()).toHaveLength(0);
     expect(s.teardown).toHaveBeenCalledOnce();

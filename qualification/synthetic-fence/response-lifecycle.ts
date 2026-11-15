@@ -46,7 +46,7 @@ export class ResponseLifecycle {
       () => this.end(), reason => this.fail(reason));
     input.on('data', (chunk: unknown) => framer.data(chunk));
     input.on('end', () => framer.end());
-    input.on('error', () => this.abort('stream error'));
+    input.on('error', () => this.fail('stream error'));
     input.on('close', () => { if (!this.eof) this.abort('stream closed before EOF'); });
     this.schedule();
   }
