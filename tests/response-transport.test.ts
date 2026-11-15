@@ -79,6 +79,18 @@ describe('supervisor response transport', () => {
     expect(ledger.snapshot()[0]).toMatchObject({ handlerSettled: true, effectAttempt: 'attempted' });
   });
 
+  it.each(['outcome', 'effectAttempt'])('accounts a throwing %s accessor as ambiguous', async field => {
+    const ledger = new ResponseLedger(identity, limits, 0);
+    const result = { outcome: 'ok', effectAttempt: 'sent' };
+    Object.defineProperty(result, field, { get: () => { throw new Error('accessor failed'); } });
+    const write = vi.fn();
+    const transport = new ResponseTransport(ledger, () => 1, () => result, write);
+    await expect(transport.receive(request())).rejects.toThrow('handler failed');
+    expect(ledger.snapshot()[0]).toMatchObject({ handlerSettled: true, effectAttempt: 'ambiguous' });
+    expect(ledger.poisoned).toBe(true);
+    expect(write).not.toHaveBeenCalled();
+  });
+
   it('records a late callback and poisons even after an early ACK', async () => {
     const ledger = new ResponseLedger(identity, limits, 0);
     let now = 1, bytes!: Uint8Array;

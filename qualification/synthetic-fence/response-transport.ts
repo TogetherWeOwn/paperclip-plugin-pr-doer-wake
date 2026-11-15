@@ -46,15 +46,17 @@ export class ResponseTransport {
       const ack = JSON.stringify({ ...this.ledger.identity, type: 'ACK', id: frame.id, digest: '0'.repeat(64) });
       if (Buffer.byteLength(ack) > this.ledger.limits.maxFrameBytes) throw new Error('ack frame limit');
       this.ledger.admit(frame.id, this.now());
-      let result: HandlerResult;
+      let outcome: unknown;
+      let effectAttempt: unknown;
       try {
-        result = await this.handler(frame.payload);
+        const result = await this.handler(frame.payload);
+        outcome = result?.outcome;
+        effectAttempt = result?.effectAttempt;
       } catch (error) {
         this.ledger.handlerSettled(frame.id, error, 'ambiguous');
         throw new Error('handler failed');
       }
-      const outcome = result?.outcome;
-      this.ledger.handlerSettled(frame.id, outcome, result?.effectAttempt);
+      this.ledger.handlerSettled(frame.id, outcome, effectAttempt);
       this.ledger.checkDeadline(this.now());
       // This slice admits only scalar outcomes, bounding serialization before allocation.
       const max = this.ledger.limits.maxFrameBytes;
