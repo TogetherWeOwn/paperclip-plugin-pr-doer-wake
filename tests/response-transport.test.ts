@@ -11,6 +11,27 @@ const request = (id = 1) => frame('REQUEST', id, { payload: 'input' });
 const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes.subarray(0, bytes.length - 1)).digest('hex');
 
 describe('supervisor response transport', () => {
+  it('rejects an unreceivable ACK before dispatch', async () => {
+    const maxFrameBytes = request().byteLength;
+    const ledger = new ResponseLedger(identity, { ...limits, maxFrameBytes }, 0);
+    const handler = vi.fn();
+    const transport = new ResponseTransport(ledger, () => 1, handler, () => {});
+    await expect(transport.receive(request())).rejects.toThrow('ack frame limit');
+    expect(handler).not.toHaveBeenCalled();
+    expect(ledger.snapshot()).toEqual([]);
+    await expect(transport.failure).resolves.toBe('ack frame limit');
+  });
+
+  it('notifies the owner when its scheduled deadline check fails', async () => {
+    const ledger = new ResponseLedger(identity, limits, 0);
+    let now = 1;
+    const transport = new ResponseTransport(ledger, () => now, () => ({ outcome: 'ok', effectAttempt: 'none' }), () => {});
+    await transport.receive(request());
+    now = 1001;
+    expect(() => transport.checkDeadline()).toThrow('ack deadline');
+    await expect(transport.failure).resolves.toBe('ack deadline');
+    expect(ledger.poisoned).toBe(true);
+  });
   it.each(['ack-first', 'write-first'])('requires both write and consumer ACK in %s order', async order => {
     const ledger = new ResponseLedger(identity, limits, 0);
     let bytes!: Uint8Array;

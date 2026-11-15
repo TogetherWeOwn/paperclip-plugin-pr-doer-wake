@@ -23,6 +23,15 @@ export class ResponseTransport {
     private readonly write: Writer,
   ) {}
 
+  /** The owner schedules deadlines through this method, not directly on the ledger. */
+  checkDeadline(): void {
+    try { this.ledger.checkDeadline(this.now()); }
+    catch (error) {
+      this.fail(error instanceof Error ? error.message : 'deadline check failed');
+      throw error;
+    }
+  }
+
   /** Input is one undelimited frame. Admission happens before dispatch. */
   async receive(bytes: Uint8Array): Promise<void> {
     try {
@@ -33,6 +42,9 @@ export class ResponseTransport {
         return;
       }
       if (frame.type !== 'REQUEST') throw new Error('terminal exchange not supported');
+      // An ACK has a fixed-length digest; ensure it can be received before any effect.
+      const ack = JSON.stringify({ ...this.ledger.identity, type: 'ACK', id: frame.id, digest: '0'.repeat(64) });
+      if (Buffer.byteLength(ack) > this.ledger.limits.maxFrameBytes) throw new Error('ack frame limit');
       this.ledger.admit(frame.id, this.now());
       let result: HandlerResult;
       try {
