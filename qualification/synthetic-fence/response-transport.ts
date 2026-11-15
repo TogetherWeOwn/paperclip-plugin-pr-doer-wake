@@ -7,6 +7,15 @@ type Writer = (bytes: Uint8Array, complete: (error?: Error | null) => void) => v
 
 /** Synthetic supervisor response accounting; the owner still controls framing, deadlines and teardown. */
 export class ResponseTransport {
+  private notifyFailure!: (reason: string) => void;
+  /** Resolves on the first failure, including callbacks arriving after receive returns. */
+  readonly failure = new Promise<string>(resolve => { this.notifyFailure = resolve; });
+
+  private fail(reason: string): void {
+    this.ledger.poison(reason);
+    this.notifyFailure(reason);
+  }
+
   constructor(
     readonly ledger: ResponseLedger,
     private readonly now: () => number,
@@ -35,6 +44,13 @@ export class ResponseTransport {
       const outcome = result?.outcome;
       this.ledger.handlerSettled(frame.id, outcome, result?.effectAttempt);
       this.ledger.checkDeadline(this.now());
+      // This slice admits only scalar outcomes, bounding serialization before allocation.
+      const max = this.ledger.limits.maxFrameBytes;
+      if ((outcome !== null && !['string', 'number', 'boolean'].includes(typeof outcome)) ||
+          (typeof outcome === 'string' && outcome.length > max) ||
+          Object.values(this.ledger.identity).some(value => typeof value === 'string' && value.length > max)) {
+        throw new Error('invalid response outcome or identity size');
+      }
       const json = JSON.stringify({ ...this.ledger.identity, type: 'RESPONSE', id: frame.id, outcome });
       const encoded = JSON.parse(json);
       if (!Object.hasOwn(encoded, 'outcome') || !isDeepStrictEqual(outcome, encoded.outcome)) {
@@ -44,17 +60,17 @@ export class ResponseTransport {
       this.ledger.response(frame.id, response, this.now());
       let completed = false;
       this.write(Buffer.concat([response, Buffer.from('\n')]), error => {
-        if (completed) { this.ledger.poison('duplicate write callback'); return; }
+        if (completed) { this.fail('duplicate write callback'); return; }
         completed = true;
         try { this.ledger.writeOutcome(frame.id, response.byteLength, !!error, this.now()); }
-        catch { /* ledger retains poison and the actual callback result */ }
+        catch (failure) { this.fail(failure instanceof Error ? failure.message : 'write accounting failed'); }
       });
     } catch (error) {
-      this.ledger.poison(error instanceof Error ? error.message : 'transport failure');
+      this.fail(error instanceof Error ? error.message : 'transport failure');
       throw error;
     }
   }
 
-  /** Call on close, EOF, stream error or any unresolved teardown. */
-  abort(reason: string): void { this.ledger.poison(reason || 'channel aborted'); }
+  /** Call on an error or premature close/EOF, not a successful terminal teardown. */
+  abort(reason: string): void { this.fail(reason || 'channel aborted'); }
 }

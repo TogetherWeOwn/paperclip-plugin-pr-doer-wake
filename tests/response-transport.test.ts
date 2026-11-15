@@ -68,6 +68,7 @@ describe('supervisor response transport', () => {
     now = 1001;
     complete();
     expect(ledger.poisoned).toBe(true);
+    await expect(transport.failure).resolves.toBe('ack deadline');
     expect(ledger.snapshot()[0]).toMatchObject({ writeAccounted: true, writeError: false, acked: true });
   });
 
@@ -78,6 +79,15 @@ describe('supervisor response transport', () => {
     await expect(transport.receive(request())).rejects.toThrow('invalid response outcome');
     expect(ledger.snapshot()[0]).toMatchObject({ handlerSettled: true, outcome: NaN });
     expect(write).not.toHaveBeenCalled();
+  });
+
+  it.each(['x'.repeat(65537), { nested: 'not supported' }])('rejects unbounded or non-scalar outcomes', async outcome => {
+    const ledger = new ResponseLedger(identity, limits, 0);
+    const write = vi.fn();
+    const transport = new ResponseTransport(ledger, () => 1, () => ({ outcome, effectAttempt: 'none' }), write);
+    await expect(transport.receive(request())).rejects.toThrow('invalid response outcome');
+    expect(write).not.toHaveBeenCalled();
+    expect(ledger.poisoned).toBe(true);
   });
 
   it('retains ambiguous delivery when the writer throws before its callback', async () => {
@@ -94,6 +104,7 @@ describe('supervisor response transport', () => {
     await transport.receive(request());
     expect(ledger.snapshot()[0]).toMatchObject({ writeAccounted: true, writeError: true });
     expect(ledger.poisoned).toBe(true);
+    await expect(transport.failure).resolves.toBe('response write failed');
     const other = new ResponseLedger(identity, limits, 0);
     const handler = vi.fn();
     const invalid = new ResponseTransport(other, () => 1, handler, () => {});
