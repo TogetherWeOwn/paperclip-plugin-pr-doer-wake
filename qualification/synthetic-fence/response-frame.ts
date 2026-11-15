@@ -14,6 +14,8 @@ export function decodeResponseFrame(bytes: Uint8Array, identity: Identity, maxFr
   let value: unknown;
   try {
     value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    // Compare bytes, not decoded text: TextDecoder otherwise strips a UTF-8 BOM.
+    if (!Buffer.from(JSON.stringify(value)).equals(Buffer.from(bytes))) throw new Error('noncanonical frame');
   } catch {
     throw new Error('malformed frame');
   }

@@ -16,6 +16,22 @@ describe('response frame validation', () => {
   ])('rejects invalid identity and frame fields', frame => {
     expect(() => decodeResponseFrame(encode(frame), identity, 65536)).toThrow();
   });
+  it('accepts canonical nested payloads and frames at the byte limit', () => {
+    const request = { ...identity, id: 1, type: 'REQUEST', payload: { text: 'é', nested: [null, true, 1] } };
+    const bytes = encode(request);
+    expect(decodeResponseFrame(bytes, identity, bytes.byteLength)).toEqual(request);
+    expect(() => decodeResponseFrame(bytes, identity, bytes.byteLength - 1)).toThrow('frame limit');
+  });
+  it.each([
+    JSON.stringify(ack).replace('"id":1', '"id":1,"id":1'),
+    JSON.stringify({ ...identity, id: 1, type: 'REQUEST', payload: { a: 1 } }).replace('"a":1', '"a":1,"a":1'),
+    JSON.stringify(ack).replace('"id":1', '"id":1.0'),
+    JSON.stringify(ack).replace('"caseId":"case"', '"caseId":"\\u0063ase"'),
+    JSON.stringify(ack).replace('"id":1', '"id": 1'),
+    '﻿' + JSON.stringify(ack),
+  ])('rejects duplicate keys and noncanonical encodings', frame => {
+    expect(() => decodeResponseFrame(Buffer.from(frame), identity, 65536)).toThrow('malformed');
+  });
   it('rejects malformed, incomplete and oversized frames', () => {
     expect(() => decodeResponseFrame(Buffer.from([0xff]), identity, 65536)).toThrow('malformed');
     expect(() => decodeResponseFrame(Buffer.from('{'), identity, 65536)).toThrow('malformed');
