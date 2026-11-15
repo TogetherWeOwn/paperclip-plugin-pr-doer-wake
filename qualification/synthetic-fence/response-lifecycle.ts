@@ -70,7 +70,7 @@ export class ResponseLifecycle {
     for (const r of this.ledger.snapshot()) if (r.ackDeadline !== undefined && (!r.acked || !r.writeAccounted)) deadlines.push(r.ackDeadline);
     this.timer = setTimeout(() => {
       try { this.transport.checkDeadline(); this.advance(); } catch { this.fail('deadline'); }
-    }, Math.max(0, Math.min(...deadlines) - this.now()));
+    }, Math.min(2_147_483_647, Math.max(0, Math.min(...deadlines) - this.now())));
   }
 
   private control(type: string, fields: Record<string, unknown> = {}): void {
@@ -102,7 +102,6 @@ export class ResponseLifecycle {
   private data(chunk: Uint8Array): void {
     if (this.closed || this.eof) { this.fail('late stream data'); return; }
     try {
-      if (chunk.length > this.ledger.limits.maxBufferedBytes) throw new Error('stream chunk limit');
       let start = 0;
       for (let i = 0; i < chunk.length; i++) {
         if (chunk[i] !== 10) continue;

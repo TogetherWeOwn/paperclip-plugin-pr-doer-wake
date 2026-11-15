@@ -108,6 +108,36 @@ describe('synthetic response lifecycle', () => {
     expect(s.ledger.poisoned).toBe(true);
   });
 
+  it('accepts coalesced valid frames regardless of stream chunk size', async () => {
+    const s = setup();
+    const frames = Array.from({ length: 4 }, (_, index) => {
+      const empty = encode('REQUEST', { id: index + 1, payload: '' });
+      return encode('REQUEST', { id: index + 1, payload: 'x'.repeat(limits.maxFrameBytes + 1 - empty.length) });
+    });
+    const chunk = Buffer.concat(frames);
+    expect(chunk.length).toBeGreaterThan(limits.maxBufferedBytes);
+    s.input.emit('data', chunk);
+    expect(s.ledger.snapshot()).toHaveLength(4);
+    expect(s.ledger.poisoned).toBe(false);
+    s.lifecycle.abort('test cleanup');
+    expect(await s.lifecycle.result).toBe(false);
+  });
+
+  it('caps long deadline timers at the Node maximum', async () => {
+    vi.useFakeTimers();
+    const spy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      const ledger = new ResponseLedger(identity, { ...limits, phaseDeadline: 2_147_483_649 }, 1);
+      const lifecycle = new ResponseLifecycle(ledger, new PassThrough(), () => 1, async () => ({ outcome: 'ok', effectAttempt: 'confirmed' }), () => {}, done => done());
+      expect(spy).toHaveBeenLastCalledWith(expect.any(Function), 2_147_483_647);
+      lifecycle.abort('test cleanup');
+      expect(await lifecycle.result).toBe(false);
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('bounds framing and observes control write failures', async () => {
     const oversized = setup();
     oversized.input.emit('data',Buffer.alloc(limits.maxFrameBytes + 1, 120));
