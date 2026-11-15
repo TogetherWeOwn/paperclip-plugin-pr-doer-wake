@@ -6,4 +6,4 @@ export { extractGatesDecision, gatesDescription, type GatesDecision, type GatesE
 export { CiGithub, CiGithubCache, evaluateReadiness, GATES_CONTEXT } from "./ci-github.js";
 export { parseCiConfig, validateCiConfig, parseRegistration } from "./ci-config.js";
 export { ReleaseStore, type NamespaceDatabase, type TransitionResult } from "./release-store.js";
-export { type ReleaseIdentity } from "./release-identity.js";
+export { validReleaseIdentity, type ReleaseIdentity } from "./release-identity.js";

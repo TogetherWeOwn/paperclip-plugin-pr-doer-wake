@@ -68,7 +68,7 @@ Do not erase the ledger to replay an unconfirmed wake or reinstall the old owner
 
 ## Custody expansion: not accepted for installation
 
-Provider: same configured existing GitHub read credential, with organization repository listing and generated GraphQL activity queries added to the read surface. Native capability additions: issue creation, document read/write, relation/project/workspace reads, restricted core table reads, and stock-schema-required namespace migrate. The active migration directory contains the release lifecycle schema; a separately authorized installation may apply it. Source authority remains build/test/review only, never installation, credential creation/rotation/widening, or automatic PR disposition.
+Provider: same configured existing GitHub read credential, with organization repository listing and generated GraphQL activity queries added to the read surface. Native capability additions: issue creation, document read/write, relation/project/workspace reads, restricted core table reads, namespace write for lifecycle create and revoke, and stock-schema-required namespace migrate. The active migration directory contains the release lifecycle schema; a separately authorized installation may apply it. Source authority remains build/test/review only, never installation, credential creation/rotation/widening, or automatic PR disposition.
 
 | Boundary | Changed fixture / evidence |
 | --- | --- |
