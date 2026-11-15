@@ -14,13 +14,23 @@ function interaction(details: unknown = target) {
     addresseeAgentId: rm, addresseeUserId: null, resolvedByAgentId: rm,
     resolvedByUserId: null, resolvedByRunId: id, status: "accepted",
     resolvedAt: "2026-11-15T02:20:00.000Z", result: { version: 1, outcome: "accepted" },
-    payload: { version: 1, prompt: "Accept exact production release?", detailsMarkdown: JSON.stringify(details), allowDeclineReason: true },
+    payload: { version: 1, prompt: "Accept exact production release?", detailsMarkdown: JSON.stringify(details), allowDeclineReason: true, supersedeOnUserComment: false },
   };
 }
 
 describe("exact release confirmation extraction", () => {
   it("binds the accepted confirmation to the complete target shown to the RM", () => {
     expect(extractReleaseDecision(interaction(), rm, now)).toEqual({ confirmationId: id, target, state: "accepted" });
+  });
+  it("accepts only a host-normalized boolean supersession setting", () => {
+    for (const supersedeOnUserComment of [false, true]) {
+      const value = { ...interaction(), payload: { ...interaction().payload, supersedeOnUserComment } };
+      expect(extractReleaseDecision(value, rm, now)?.state).toBe("accepted");
+    }
+    for (const supersedeOnUserComment of [undefined, null, 0, "false", {}, []]) {
+      const value = { ...interaction(), payload: { ...interaction().payload, supersedeOnUserComment } };
+      expect(extractReleaseDecision(value, rm, now)).toBeNull();
+    }
   });
   it("fails closed for wrong resolver, addressee, outcome or enriched confirmation", () => {
     for (const value of [

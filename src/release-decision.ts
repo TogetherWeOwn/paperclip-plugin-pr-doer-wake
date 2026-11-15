@@ -46,7 +46,8 @@ export function extractReleaseDecision(raw: unknown, rmId: string, now: number):
       || typeof interaction.resolvedByRunId !== "string" || !UUID.test(interaction.resolvedByRunId)
       || interaction.title !== TITLE || interaction.summary != null
       || payload.version !== 1 || payload.prompt !== TITLE
-      || Object.keys(payload).some((key) => !["version", "prompt", "detailsMarkdown", "allowDeclineReason"].includes(key))
+      || Object.keys(payload).some((key) => !["version", "prompt", "detailsMarkdown", "allowDeclineReason", "supersedeOnUserComment"].includes(key))
+      || typeof payload.supersedeOnUserComment !== "boolean"
       || (payload.allowDeclineReason !== undefined && payload.allowDeclineReason !== true)
       || typeof payload.detailsMarkdown !== "string" || payload.detailsMarkdown.length > 1024
       || result.version !== 1 || result.outcome !== "accepted"
