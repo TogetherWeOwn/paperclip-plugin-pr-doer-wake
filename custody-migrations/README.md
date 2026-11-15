@@ -1,6 +1,6 @@
-# Read-only core access
+# Plugin namespace migrations
 
-The stock manifest requires a migrations directory for a database declaration.
-This directory intentionally contains no SQL migrations. Custody uses only the
-three declared core-read tables; all plugin receipts live in plugin state.
+This directory contains the release lifecycle table in the stock host's derived
+plugin namespace. Custody still reads only the three declared core tables.
 Historical migrations in `../migrations` are not activated by this declaration.
+The lifecycle is not promotion authorization and is not installed by this source change.
