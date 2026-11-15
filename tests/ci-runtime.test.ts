@@ -343,6 +343,55 @@ describe("CI registration and configuration parsing", () => {
 });
 
 describe("CI runtime registration authorization", () => {
+  it("allows the pending reviewer to register without checkout", async () => {
+    const h = setup();
+    Object.assign(h.issue, { status: "in_review", executionState: { status: "pending", currentStageId: OTHER, currentParticipant: { type: "agent", agentId: AGENT } } });
+    expect(await h.runtime.register(registration, run)).toMatchObject({ data: { status: "open" } });
+    expect(h.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(h.ledger().waits[0]).toMatchObject({ reviewerRegistration: true, agentId: AGENT });
+  });
+
+  it("wakes a reviewer when later CI settles on the unchanged head", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.poll();
+    Object.assign(h.issue, { status: "in_review", executionState: { status: "pending", currentStageId: OTHER, currentParticipant: { type: "agent", agentId: AGENT } } });
+    await h.runtime.register(registration, { ...run, runId: NEXT_RUN });
+    github.readiness.mockReturnValue(verdict("pending"));
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    github.readiness.mockReturnValue(verdict("pass"));
+    await h.runtime.poll();
+    await h.runtime.poll();
+    expect(h.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(h.ledger().waits[1]).toMatchObject({ status: "woken", reviewerRegistration: true });
+  });
+
+  it.each([
+    { status: "pending", currentStageId: OTHER, currentParticipant: { type: "agent", agentId: OTHER } },
+    { status: "pending", currentStageId: OTHER, currentParticipant: { type: "user", agentId: AGENT } },
+    { status: "pending", currentStageId: null, currentParticipant: { type: "agent", agentId: AGENT } },
+    { status: "completed", currentStageId: OTHER, currentParticipant: { type: "agent", agentId: AGENT } },
+  ])("refuses a non-current review participant before credential access", async (executionState) => {
+    const h = setup();
+    Object.assign(h.issue, { status: "in_review", executionState });
+    expect(await h.runtime.register(registration, run)).toMatchObject({ data: { code: "checkout_refused" } });
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+  });
+
+  it("refuses registration if the reviewer changes during the GitHub read", async () => {
+    const h = setup();
+    const executionState = { status: "pending", currentStageId: OTHER, currentParticipant: { type: "agent", agentId: AGENT } };
+    Object.assign(h.issue, { status: "in_review", executionState });
+    github.pull.mockImplementationOnce(async () => {
+      executionState.currentParticipant.agentId = OTHER;
+      return pull();
+    });
+    expect(await h.runtime.register(registration, run)).toMatchObject({ data: { code: "checkout_refused" } });
+    expect(h.ledger().waits).toEqual([]);
+  });
+
   it("registers with an explicit custody flag in the combined configuration", async () => {
     const h = setup({ custodyEnabled: false });
     const result = await h.runtime.register(registration, run);
@@ -698,9 +747,15 @@ describe("CI runtime polling and durable wake outcomes", () => {
         },
       });
     }
+    // Model the author registering before the card enters review.
+    async function registerAsOwner(h: ReturnType<typeof setup>, params = registration) {
+      const status = h.issue.status;
+      h.issue.status = "in_progress";
+      try { return await h.runtime.register(params, run); } finally { h.issue.status = status; }
+    }
     // Register against HEAD, then move the live PR head to NEXT_HEAD.
     async function movedHead(h: ReturnType<typeof setup>) {
-      await h.runtime.register(registration, run);
+      await registerAsOwner(h);
       github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
     }
 
@@ -885,7 +940,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
       inReviewIssue(h, OTHER);
       github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
-      await h.runtime.register({ ...registration, headSha: NEXT_HEAD }, run); // head B
+      await registerAsOwner(h, { ...registration, headSha: NEXT_HEAD }); // head B
       expect(h.ledger().prHeadPending).toMatchObject({ [`${COMPANY}:${REPO}:17`]: { oldSha: HEAD, newSha: NEXT_HEAD } });
       const wakesBefore = h.requestWakeup.mock.calls.length;
       await h.runtime.poll();
@@ -990,7 +1045,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     it("gives a settled reviewer head a turn despite continuously deferred CI wakes", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
-      await h.runtime.register(registration, run);
+      await registerAsOwner(h);
       const ledger = h.ledger();
       const wait = ledger.waits[0]!;
       // All CI attempts remain open and consume the entire wake budget each tick.
