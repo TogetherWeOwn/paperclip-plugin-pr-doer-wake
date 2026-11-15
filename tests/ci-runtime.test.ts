@@ -565,6 +565,34 @@ describe("CI runtime registration authorization", () => {
     expect(JSON.stringify(result)).not.toContain("unexpected host detail");
   });
 
+  it("returns a sanitized refusal when intent and refusal audit writes both fail", async () => {
+    const h = setup();
+    const sentinel = "ghp_secret_shaped_state_failure_sentinel";
+    h.set.mockRejectedValue(new Error(sentinel));
+
+    const result = await h.runtime.register(registration, run);
+
+    expect(result).toMatchObject({ error: "CI registration refused: registration_refused", data: { code: "registration_refused" } });
+    expect(JSON.stringify(result)).not.toContain(sentinel);
+    expect(h.set).toHaveBeenCalledTimes(2);
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(github.construct).not.toHaveBeenCalled();
+    expect(github.pull).not.toHaveBeenCalled();
+    expect(h.fetch).not.toHaveBeenCalled();
+    expect(h.ledger()).toBeNull();
+  });
+
+  it("preserves the original refusal when its audit write fails", async () => {
+    const h = setup();
+    h.rawConfig.allowedRepos = ["acme/other"];
+    h.set.mockRejectedValue(new Error("ghp_secret_shaped_audit_failure"));
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ error: "CI registration refused: repo_refused", data: { code: "repo_refused" } });
+    expect(JSON.stringify(result)).not.toContain("ghp_secret_shaped_audit_failure");
+    expect(h.resolveSecret).not.toHaveBeenCalled();
+    expect(github.pull).not.toHaveBeenCalled();
+  });
+
   it("returns invalid_ledger without saving over a malformed persisted ledger", async () => {
     const h = setup();
     h.seed({ version: 1, waits: [], audits: [] } as unknown as Ledger);
