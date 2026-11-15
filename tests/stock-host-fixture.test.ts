@@ -10,12 +10,13 @@ describe.skipIf(!process.env.HOST_SQL_SOURCE && !process.env.RELEASE_TEST_DATABA
     await db.migrate(`CREATE TABLE ${table} (id text PRIMARY KEY, value text NOT NULL);`);
     expect(await db.execute(`INSERT INTO ${table} (id, value) VALUES ($1, $2)`, ["one", "it's synthetic"])).toEqual({ rowCount: 1 });
     expect(await db.execute(`UPDATE ${table} SET value = $1 WHERE id = $2`, ["changed", "missing"])).toEqual({ rowCount: 0 });
-    await db.migrate(`CREATE TABLE ${db.namespace}.second_rows (id text PRIMARY KEY);`);
+    await db.migrate(`CREATE TABLE ${db.namespace}.second_rows (id text PRIMARY KEY) -- first comment
+; CREATE TABLE ${db.namespace}.comment_rows (id text) -- last comment`);
     await expect(db.migrate(`CREATE TABLE ${db.namespace}.third_rows (id text); DROP TABLE ${table};`))
       .rejects.toThrow("Destructive plugin migrations are not allowed");
     await db.migrate(`CREATE TABLE ${db.namespace}.third_rows (id text);`);
     await expect(db.migrate(`CREATE TABLE ${db.namespace}.fourth_rows (id text); CREATE TABLE ${db.namespace}.second_rows (id text);`))
-      .rejects.toThrow();
+      .rejects.toThrow(/relation "second_rows" already exists/);
     await db.migrate(`CREATE TABLE ${db.namespace}.fourth_rows (id text);`);
     await expect(db.execute(`UPDATE ${table} SET value = $1`, ["changed", "unused"]))
       .rejects.toThrow("Every ctx.db parameter must be referenced");

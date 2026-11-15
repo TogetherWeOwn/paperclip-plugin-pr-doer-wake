@@ -33,7 +33,7 @@ export function stockHostFixture() {
       for (const statement of statements) {
         host.validatePluginMigrationStatement!(statement, namespace, []);
       }
-      await psql(`BEGIN;\n${statements.join(";\n")};\nCOMMIT;`);
+      await psql(`BEGIN;\n${statements.join("\n;\n")}\n;\nCOMMIT;`);
     },
     async execute(sql: string, params: unknown[] = []) {
       host.validatePluginRuntimeExecute!(sql, namespace);
