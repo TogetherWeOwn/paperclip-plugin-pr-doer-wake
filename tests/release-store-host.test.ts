@@ -18,7 +18,7 @@ describe.skipIf(!enabled)("stock validator and PostgreSQL lifecycle", () => {
     const start = source.indexOf("const IDENTIFIER_RE =");
     const end = source.indexOf("function bindSql(");
     if (start < 0 || end <= start) throw new Error("pinned host source layout changed");
-    const js = ts.transpileModule(source.slice(start, end), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText;
+    const js = ts.transpileModule(source.slice(start, end), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023 } }).outputText;
     const exports: Record<string, (...args: any[]) => any> = {};
     new Function("exports", "createHash", js)(exports, createHash);
     expect(exports.derivePluginDatabaseNamespace!("togetherweown.pr-doer-wake", "pr_custody")).toBe(namespace);
