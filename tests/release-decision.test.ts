@@ -50,6 +50,14 @@ describe("exact release confirmation extraction", () => {
   });
   it("expires at the exact boundary and rejects malformed or future resolution time", () => {
     expect(extractReleaseDecision(interaction(), rm, Date.parse(target.expiresAt))?.state).toBe("expired");
+    const marchTarget = { ...target, expiresAt: "2026-03-02T03:00:00Z" };
+    const marchNow = Date.parse("2026-03-02T02:30:00Z");
+    for (const resolvedAt of ["2026-02-30T02:20:00Z", "2026-02-30T02:20:00.000Z", "2026-03-02T02:20:00+00:00"]) {
+      expect(extractReleaseDecision({ ...interaction(marchTarget), resolvedAt }, rm, marchNow)).toBeNull();
+    }
+    for (const resolvedAt of ["2026-03-02T02:20:00Z", "2026-03-02T02:20:00.123Z"]) {
+      expect(extractReleaseDecision({ ...interaction(marchTarget), resolvedAt }, rm, marchNow)?.state).toBe("accepted");
+    }
     expect(extractReleaseDecision({ ...interaction(), resolvedAt: "bad" }, rm, now)).toBeNull();
     expect(extractReleaseDecision({ ...interaction(), resolvedAt: "2026-11-15T02:40:00Z" }, rm, now)).toBeNull();
   });

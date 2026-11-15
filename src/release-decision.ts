@@ -19,6 +19,7 @@ export interface ReleaseDecision {
 const TITLE = "Accept exact production release?";
 const MAX_TTL_MS = 24 * 60 * 60 * 1000;
 const UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+const RESOLVED_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/;
 
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -63,9 +64,13 @@ export function extractReleaseDecision(raw: unknown, rmId: string, now: number):
       || (details.stagingRunAttempt as number) > 2147483647
       || typeof details.expiresAt !== "string" || !UTC.test(details.expiresAt)) return null;
   const expiresMs = Date.parse(details.expiresAt);
-  const resolvedMs = typeof interaction.resolvedAt === "string" ? Date.parse(interaction.resolvedAt) : NaN;
+  const resolvedAt = interaction.resolvedAt;
+  if (typeof resolvedAt !== "string" || !RESOLVED_UTC.test(resolvedAt)) return null;
+  const resolvedMs = Date.parse(resolvedAt);
+  const canonicalResolvedAt = resolvedAt.length === 20 ? resolvedAt.replace("Z", ".000Z") : resolvedAt;
   if (!Number.isFinite(expiresMs) || new Date(expiresMs).toISOString().replace(".000Z", "Z") !== details.expiresAt
-      || !Number.isFinite(resolvedMs) || resolvedMs > now || expiresMs <= resolvedMs
+      || !Number.isFinite(resolvedMs) || new Date(resolvedMs).toISOString() !== canonicalResolvedAt
+      || resolvedMs > now || expiresMs <= resolvedMs
       || expiresMs - resolvedMs > MAX_TTL_MS) return null;
   if (interaction.status !== "accepted" || result.outcome !== "accepted") return null;
   return {
