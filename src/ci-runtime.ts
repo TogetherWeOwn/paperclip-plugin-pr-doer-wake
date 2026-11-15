@@ -30,6 +30,8 @@ export interface Wait extends Registration {
    * pusher agent and are treated as ambiguous (prefer waking).
    */
   agentId?: string;
+  /** Reviewer registrations are not evidence of authorship. */
+  reviewerRegistration?: boolean;
   /**
    * Binding proof for custody: true only when the workspace branch observed
    * before and after the GitHub read equals the live PR head branch. Repo-only
@@ -417,6 +419,17 @@ export class CiWakeRuntime {
     }
   }
 
+  private async registrationActor(issueId: string, run: ToolRunContext): Promise<"reviewer" | "owner"> {
+    const issue = await this.ctx.issues.get(issueId, run.companyId) as any;
+    if (issue?.id === issueId && issue.companyId === run.companyId && issue.status === "in_review") {
+      const state = issue.executionState;
+      if (state?.status === "pending" && state.currentStageId && state.currentParticipant?.type === "agent" && state.currentParticipant.agentId === run.agentId) return "reviewer";
+      throw new Error("checkout_refused");
+    }
+    await this.checkoutOwner(issueId, run);
+    return "owner";
+  }
+
   async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
     return this.serialized(async () => {
       // The ledger load lives inside the refusal boundary: a malformed
@@ -433,7 +446,7 @@ export class CiWakeRuntime {
         if (![run.companyId, run.agentId, run.runId, run.projectId].every((s) => UUID.test(s))) throw new Error("invalid_run_context");
         const config = await this.config(run.companyId);
         if (!config.allowedRepos.includes(registration.repo)) throw new Error("repo_refused");
-        await this.checkoutOwner(registration.issueId, run);
+        const actor = await this.registrationActor(registration.issueId, run);
         const binding = await this.binding(registration, run.companyId, run.projectId);
         waitId = createHash("sha256").update(JSON.stringify([run.companyId, run.runId, registration.issueId, registration.repo, registration.prNumber, registration.headSha])).digest("hex");
         const existing = ledger.waits.find((w) => w.waitId === waitId || w.aliases.includes(waitId!));
@@ -463,7 +476,7 @@ export class CiWakeRuntime {
         const pr = await github.pull(registration.repo, registration.prNumber);
         if (pr.number !== registration.prNumber || pr.state !== "open" || pr.merged || pr.headSha !== registration.headSha || pr.headRepo?.toLowerCase() !== registration.repo) throw new Error("pr_binding_refused");
         // Checkout ownership may have changed while GitHub answered.
-        await this.checkoutOwner(registration.issueId, run);
+        if (await this.registrationActor(registration.issueId, run) !== actor) throw new Error("checkout_refused");
         const current = await this.binding(registration, run.companyId, run.projectId);
         if (current.workspaceId !== binding.workspaceId) throw new Error("binding_changed");
         // Custody binding proof, not a ci-wake gate: ci-wake still registers
@@ -482,7 +495,7 @@ export class CiWakeRuntime {
           .filter((w) => w.companyId === run.companyId && w.repo === registration.repo && w.prNumber === registration.prNumber && w.issueId === registration.issueId)
           .sort((a, b) => b.registeredAt - a.registeredAt)[0];
         if (prior) this.noteHeadChange(ledger, run.companyId, registration.repo, registration.prNumber, prior.headSha, registration.headSha);
-        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
+        ledger.waits.push({ ...registration, ...binding, branchVerified, waitId, companyId: run.companyId, runId: run.runId, agentId: run.agentId.toLowerCase(), reviewerRegistration: actor === "reviewer", aliases: [], registeredAt: now, expiresAt: now + LIMITS.waitMs, status: "open" });
         this.audit(ledger, "register", "registered", run, waitId);
         await this.save(ledger);
         return { content: "CI wait registered", data: { waitId, status: "open", expiresAt: now + LIMITS.waitMs, dryRun: config.dryRun } };
@@ -543,7 +556,7 @@ export class CiWakeRuntime {
     if (!UUID.test(agent)) return false;
     const authors = new Set<string>();
     for (const wait of ledger.waits) {
-      if (wait.companyId === entry.companyId && wait.repo === entry.repo && wait.prNumber === entry.prNumber && wait.agentId) authors.add(wait.agentId.toLowerCase());
+      if (wait.companyId === entry.companyId && wait.repo === entry.repo && wait.prNumber === entry.prNumber && wait.agentId && !wait.reviewerRegistration) authors.add(wait.agentId.toLowerCase());
     }
     const returnAgent = issue?.executionState?.returnAssignee?.agentId;
     if (typeof returnAgent === "string" && UUID.test(returnAgent)) authors.add(returnAgent.toLowerCase());
