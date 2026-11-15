@@ -14,6 +14,9 @@ import { ResponseTransport } from './response-transport.js';
 export class ResponseLifecycle {
   readonly transport: ResponseTransport;
   private partial = Buffer.alloc(0);
+  private processingInput = false;
+  private pendingInput: (Buffer | null)[] = [];
+  private pendingBytes = 0;
   private ended = false;
   private eof = false;
   private terminal = false;
@@ -43,9 +46,9 @@ export class ResponseLifecycle {
     void this.transport.failure.then(reason => this.fail(reason));
     input.on('data', (chunk: unknown) => {
       if (!(chunk instanceof Uint8Array)) this.fail('non-byte stream data');
-      else this.data(chunk);
+      else this.enqueueInput(chunk);
     });
-    input.on('end', () => this.end());
+    input.on('end', () => this.enqueueInput(null));
     input.on('error', () => this.abort('stream error'));
     input.on('close', () => { if (!this.eof) this.abort('stream closed before EOF'); });
     this.schedule();
@@ -98,6 +101,37 @@ export class ResponseLifecycle {
     } catch (error) { this.fail(error instanceof Error ? error.message : 'seal failed'); }
   }
 
+  private enqueueInput(chunk: Uint8Array | null): void {
+    if (this.processingInput) {
+      if (chunk && chunk.length === 0) return;
+      if (chunk && this.pendingBytes + chunk.length > this.ledger.limits.maxBufferedBytes) {
+        this.fail('reentrant input limit');
+        return;
+      }
+      if (this.pendingInput.length >= this.ledger.limits.maxBufferedBytes) {
+        this.fail('reentrant input limit');
+        return;
+      }
+      this.pendingInput.push(chunk === null ? null : Buffer.from(chunk));
+      this.pendingBytes += chunk?.length ?? 0;
+      return;
+    }
+    this.processingInput = true;
+    try {
+      let next: Uint8Array | null | undefined = chunk;
+      let index = 0;
+      while (next !== undefined) {
+        if (next === null) this.end(); else this.data(next);
+        if (this.closed) break;
+        next = this.pendingInput[index++];
+      }
+    } finally {
+      this.pendingInput = [];
+      this.pendingBytes = 0;
+      this.processingInput = false;
+    }
+  }
+
   /** Feed bytes from one supervisor-owned readable stream. Frames are canonical UTF-8 JSON plus LF. */
   private data(chunk: Uint8Array): void {
     if (this.closed || this.eof) { this.fail('late stream data'); return; }
@@ -110,6 +144,7 @@ export class ResponseLifecycle {
         const frame = Buffer.concat([this.partial, chunk.subarray(start, i)], length);
         this.partial = Buffer.alloc(0);
         this.frame(frame);
+        if (this.closed) return;
         start = i + 1;
       }
       if (this.partial.length + chunk.length - start > this.ledger.limits.maxFrameBytes) throw new Error('frame limit');

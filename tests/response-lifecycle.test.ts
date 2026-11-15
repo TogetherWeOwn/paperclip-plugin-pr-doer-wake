@@ -123,6 +123,39 @@ describe('synthetic response lifecycle', () => {
     expect(await s.lifecycle.result).toBe(false);
   });
 
+  it('serializes reentrant input after the entire current chunk, including its partial frame', async () => {
+    let input!: PassThrough;
+    const seen: unknown[] = [];
+    const third = encode('REQUEST', { id: 3, payload: 'third' });
+    const s = setup(async payload => {
+      seen.push(payload);
+      if (payload === 'first') input.emit('data', third.subarray(8));
+      return { outcome: 'ok', effectAttempt: 'confirmed' };
+    });
+    input = s.input;
+    input.emit('data', Buffer.concat([
+      encode('REQUEST', { id: 1, payload: 'first' }),
+      encode('REQUEST', { id: 2, payload: 'second' }),
+      third.subarray(0, 8),
+    ]));
+    expect(seen).toEqual(['first', 'second', 'third']);
+    expect(s.ledger.poisoned).toBe(false);
+    s.lifecycle.abort('test cleanup');
+    expect(await s.lifecycle.result).toBe(false);
+  });
+
+  it('fails closed when reentrant input exceeds the buffer bound', async () => {
+    let input!: PassThrough;
+    const s = setup(async () => {
+      input.emit('data', Buffer.alloc(limits.maxBufferedBytes + 1));
+      return { outcome: 'ok', effectAttempt: 'confirmed' };
+    });
+    input = s.input;
+    input.emit('data', encode('REQUEST', { id: 1, payload: null }));
+    expect(await s.lifecycle.result).toBe(false);
+    expect(s.ledger.poisoned).toBe(true);
+  });
+
   it('caps long deadline timers at the Node maximum', async () => {
     vi.useFakeTimers();
     const spy = vi.spyOn(globalThis, 'setTimeout');
