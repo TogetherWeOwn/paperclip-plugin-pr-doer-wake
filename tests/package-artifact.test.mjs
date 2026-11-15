@@ -63,14 +63,13 @@ test("allows only the intended package payload", () => {
   assert.throws(() => validatePaths(Array(101).fill("dist/index.js")), /count/);
 });
 
-test("requires the declared custody migration and README", () => {
-  const custodyPaths = paths;
+test("requires only the declared custody migration and README", () => {
   for (const required of ["custody-migrations/README.md", "custody-migrations/001_release_lifecycle.sql"]) {
     assert.throws(() => validatePaths(paths.filter((path) => path !== required)), /Missing/);
   }
   for (const unexpected of ["custody-migrations/001.sql", "custody-migrations/.env",
     "custody-migrations/nested/README.md", "custody-migrations/../README.md"]) {
-    assert.throws(() => validatePaths([...custodyPaths, unexpected]), /Unexpected package member/);
+    assert.throws(() => validatePaths([...paths, unexpected]), /Unexpected package member/);
   }
 });
 
