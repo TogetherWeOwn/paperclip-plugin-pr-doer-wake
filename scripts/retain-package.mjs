@@ -6,13 +6,14 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const requiredFiles = ["package.json", "LICENSE", "README.md", "THREAT-MODEL.md", "ACCEPTANCE.md",
-  "migrations/001_wake_ledger.sql", "migrations/002_wake_phases.sql"];
+  "migrations/001_wake_ledger.sql", "migrations/002_wake_phases.sql",
+  "custody-migrations/README.md", "custody-migrations/001_release_lifecycle.sql"];
 
 export function validatePaths(paths) {
   assert(paths.length > 0 && paths.length <= 100, "Unexpected package file count");
   assert.equal(new Set(paths).size, paths.length, "Duplicate package member");
   for (const path of paths) {
-    assert(requiredFiles.includes(path) || path === "custody-migrations/README.md" || /^dist\/[a-z][a-z-]*(?:\.js|\.d\.ts)$/.test(path),
+    assert(requiredFiles.includes(path) || /^dist\/[a-z][a-z-]*(?:\.js|\.d\.ts)$/.test(path),
       `Unexpected package member: ${path}`);
   }
   for (const path of requiredFiles) assert(paths.includes(path), `Missing ${path}`);
