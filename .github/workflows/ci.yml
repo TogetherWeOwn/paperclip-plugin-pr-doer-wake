@@ -172,8 +172,45 @@ jobs:
           node -e 'const r=require(process.argv[1]); const t=r.testResults.flatMap(f=>f.assertionResults).filter(t=>t.fullName.includes("suppresses protected directives") && t.status==="failed"); if(t.length!==3 || t.some(x=>!x.failureMessages.some(m=>m.includes("to be null")))) process.exit(1); console.log("separator regressions:", t.length)' "$RUNNER_TEMP/baseline.json"
           npx vitest run tests/custody-policy.test.ts -t 'suppresses protected directives'
 
+  stock-host-sql:
+    name: Stock host SQL fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: fixture
+          POSTGRES_DB: fixture
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fixture"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: paperclipai/paperclip
+          ref: d69631b01b9c658f80bf8bed389863dce82643e1 # v2026.1106.0
+          path: stock-host
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - working-directory: candidate
+        run: npm ci --ignore-scripts
+      - working-directory: candidate
+        env:
+          HOST_SQL_SOURCE: ../stock-host/server/src/services/plugin-database.ts
+          RELEASE_TEST_DATABASE: postgresql://postgres:fixture@localhost:5432/fixture
+        run: npx vitest run tests/stock-host-fixture.test.ts
+
   check:
-    needs: [cgroup-membership-parser, gated-launch-behavior, phase-state-unit, release-store-host]
+    needs: [cgroup-membership-parser, gated-launch-behavior, phase-state-unit, stock-host-sql]
     if: ${{ always() }}
     # Required status check on main. Renaming this changes the check context
     # and blocks every merge until the ruleset is updated to match.
@@ -183,7 +220,7 @@ jobs:
     steps:
       - name: Require parser test success
         env:
-          PARSER_RESULT: ${{ needs.cgroup-membership-parser.result }}:${{ needs.gated-launch-behavior.result }}:${{ needs.phase-state-unit.result }}:${{ needs.release-store-host.result }}
+          PARSER_RESULT: ${{ needs.cgroup-membership-parser.result }}:${{ needs.gated-launch-behavior.result }}:${{ needs.phase-state-unit.result }}:${{ needs.stock-host-sql.result }}
         run: test "$PARSER_RESULT" = success:success:success:success
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -225,43 +262,6 @@ jobs:
             cat "$RUNNER_TEMP/ci-wake-artifact/SHA256SUMS"
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"
-
-  release-store-host:
-    name: Release lifecycle stock SQL validation
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: fixture
-          POSTGRES_DB: fixture
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres -d fixture"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          path: candidate
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: paperclipai/paperclip
-          ref: d69631b01b9c658f80bf8bed389863dce82643e1 # v2026.1106.0
-          path: stock-host
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
-      - working-directory: candidate
-        run: npm ci --ignore-scripts
-      - working-directory: candidate
-        env:
-          HOST_SQL_SOURCE: ../stock-host/server/src/services/plugin-database.ts
-          RELEASE_TEST_DATABASE: postgresql://postgres:fixture@localhost:5432/fixture
-        run: npx vitest run tests/release-store-host.test.ts
 
   sdk-compat:
     name: SDK 2026.1106.0 compatibility
