@@ -1,62 +1,55 @@
-import { readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
-import ts from "typescript";
 import { describe, expect, it } from "vitest";
-import { ReleaseStore, type NamespaceDatabase } from "../src/release-store.js";
+import { ReleaseStore } from "../src/release-store.js";
+import { stockHostFixture } from "./stock-host-fixture.js";
 
-const namespace = "plugin_pr_custody_2a97cdbae1";
 const company = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const otherCompany = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+const claim = "11111111-1111-1111-1111-111111111111";
 const identity = { confirmationId: "cccccccc-cccc-cccc-cccc-cccccccccccc", repo: "example/repo", sha: "a".repeat(40), stagingRunId: "123", stagingRunAttempt: 1, expiresAt: "" };
-const enabled = process.env.HOST_SQL_SOURCE && process.env.RELEASE_TEST_DATABASE;
+const enabled = process.env.HOST_SQL_SOURCE || process.env.RELEASE_TEST_DATABASE;
 
 describe.skipIf(!enabled)("stock validator and PostgreSQL lifecycle", () => {
-  it("validates migration and statements and serializes independent workers", async () => {
-    if (process.env.GITHUB_ACTIONS !== "true" || process.env.RUNNER_ENVIRONMENT !== "github-hosted") throw new Error("synthetic hosted runner only");
-    const source = readFileSync(process.env.HOST_SQL_SOURCE!, "utf8");
-    const start = source.indexOf("const IDENTIFIER_RE =");
-    const end = source.indexOf("function bindSql(");
-    if (start < 0 || end <= start) throw new Error("pinned host source layout changed");
-    const js = ts.transpileModule(source.slice(start, end), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023 } }).outputText;
-    const exports: Record<string, (...args: any[]) => any> = {};
-    new Function("exports", "createHash", js)(exports, createHash);
-    expect(exports.derivePluginDatabaseNamespace!("togetherweown.pr-doer-wake", "pr_custody")).toBe(namespace);
-    const run = promisify(execFile);
-    const psql = async (sql: string) => (await run("psql", [process.env.RELEASE_TEST_DATABASE!, "-X", "-v", "ON_ERROR_STOP=1", "-c", sql])).stdout;
-    const migration = readFileSync("custody-migrations/001_release_lifecycle.sql", "utf8");
-    exports.validatePluginMigrationStatement!(migration, namespace, []);
-    await psql(`CREATE SCHEMA ${namespace}`);
-    await psql(migration);
-    const execute = async (sql: string, params: unknown[] = []) => {
-      exports.validatePluginRuntimeExecute!(sql, namespace);
-      // Synthetic fixture parameters only; production binding is the host's parameter binder.
-      const bound = sql.replace(/\$(\d+)/g, (_, n: string) => `'${String(params[Number(n) - 1]).replaceAll("'", "''")}'`);
-      const output = await psql(bound);
-      const count = /(?:INSERT 0|UPDATE) (\d+)/.exec(output);
-      if (!count) throw new Error(`missing command count: ${output}`);
-      return { rowCount: Number(count[1]) };
-    };
-    const db: NamespaceDatabase = { namespace, execute };
+  it("validates transitions and leaves disabled operations unchanged", async () => {
+    // The fixture checks the hosted runner and exact disposable database before any SQL.
+    const db = stockHostFixture();
+    const table = `${db.namespace}.release_lifecycle`;
+    await db.migrate(readFileSync("custody-migrations/001_release_lifecycle.sql", "utf8"));
+    const store = new ReleaseStore(db);
     const target = { ...identity, expiresAt: new Date(Date.now() + 3_600_000).toISOString().replace(/\.\d{3}Z$/, "Z") };
-    expect(await new ReleaseStore(db).create(company, target)).toBe("applied");
-    expect(await new ReleaseStore(db).create(company, { ...target, sha: "b".repeat(40) })).toBe("unknown");
-    const ids = ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"];
-    const results = await Promise.all(ids.map((id) => new ReleaseStore(db).claim(company, target, id)));
-    expect(results.filter((r) => r === "applied")).toHaveLength(1);
-    const winner = ids[results.indexOf("applied")]!;
-    expect(await new ReleaseStore(db).consume(company, { ...target, sha: "b".repeat(40) }, winner)).toBe("unknown");
-    expect(await new ReleaseStore(db).consume(company, target, winner)).toBe("applied");
-    expect(await new ReleaseStore(db).revoke(company, target)).toBe("unknown");
-    expect(await new ReleaseStore(db).claim(company, target, winner)).toBe("unknown");
-    const second = { ...target, confirmationId: "dddddddd-dddd-dddd-dddd-dddddddddddd" };
-    expect(await new ReleaseStore(db).create(company, second)).toBe("applied");
-    expect(await new ReleaseStore(db).claim("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", second, winner)).toBe("unknown");
-    expect(await new ReleaseStore(db).claim(company, second, winner)).toBe("applied");
-    const race = await Promise.all([new ReleaseStore(db).consume(company, second, winner), new ReleaseStore(db).revoke(company, second)]);
-    expect(race.filter((r) => r === "applied")).toHaveLength(1);
-    expect(await new ReleaseStore(db).claim(company, second, winner)).toBe("unknown");
+    const run = promisify(execFile);
+    const snapshot = async () => (await run("psql", ["-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", `SELECT row_to_json(t)::text FROM ${table} t ORDER BY company_id, confirmation_id`], {
+      env: { PATH: process.env.PATH, PGHOST: "localhost", PGPORT: "5432", PGUSER: "postgres", PGPASSWORD: "fixture", PGDATABASE: "fixture", PGOPTIONS: "-c standard_conforming_strings=on" },
+    })).stdout;
+
+    expect(await store.create(company, target)).toBe("applied");
+    const countSql = `UPDATE ${table} SET state = $1 WHERE company_id = $2::uuid AND confirmation_id = $3::uuid`;
+    expect(await db.execute(countSql, ["available", company, target.confirmationId])).toEqual({ rowCount: 1 });
+    expect(await db.execute(countSql, ["available", otherCompany, target.confirmationId])).toEqual({ rowCount: 0 });
+    expect(await store.create(company, { ...target, sha: "b".repeat(40) })).toBe("unknown");
+    expect(await store.create(otherCompany, target)).toBe("applied");
+    expect(await store.revoke(otherCompany, { ...target, sha: "b".repeat(40) })).toBe("unknown");
+    const available = await snapshot();
+    expect(await store.claim(company, target, claim)).toBe("unknown");
+    expect(await store.consume(company, target, claim)).toBe("unknown");
+    expect(await snapshot()).toBe(available);
+
+    // Seed a claimed row through the validated synthetic fixture only.
+    expect(await db.execute(`UPDATE ${table} SET state = $1, claim_id = $2::uuid WHERE company_id = $3::uuid AND confirmation_id = $4::uuid`, ["claimed", claim, company, target.confirmationId])).toEqual({ rowCount: 1 });
+    const claimed = await snapshot();
+    expect(claimed).not.toBe(available);
+    expect(await store.claim(company, target, claim)).toBe("unknown");
+    expect(await store.consume(company, target, claim)).toBe("unknown");
+    expect(await snapshot()).toBe(claimed);
+
+    const race = await Promise.all([store.revoke(company, target), store.revoke(company, target)]);
+    expect(race.filter((result) => result === "applied")).toHaveLength(1);
+    expect(race.filter((result) => result === "unknown")).toHaveLength(1);
+    expect(await store.revoke(company, target)).toBe("unknown");
+    expect(await store.revoke(otherCompany, target)).toBe("applied");
     const past = { ...target, confirmationId: "ffffffff-ffff-ffff-ffff-ffffffffffff", expiresAt: "2020-01-01T00:00:00Z" };
-    expect(await new ReleaseStore(db).create(company, past)).toBe("unknown");
+    expect(await store.create(company, past)).toBe("unknown");
   });
 });

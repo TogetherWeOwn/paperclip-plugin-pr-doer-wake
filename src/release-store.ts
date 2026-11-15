@@ -20,19 +20,14 @@ export class ReleaseStore {
         || companyId !== companyId.toLowerCase() || !validReleaseIdentity(identity)
         || ((operation === "claim" || operation === "consume")
           && (typeof claimId !== "string" || !UUID.test(claimId) || claimId !== claimId.toLowerCase()))) return "rejected";
+    // Expiry cannot yet be checked safely after a row-lock wait on the stock host.
+    if (operation === "claim" || operation === "consume") return "unknown";
     const args: unknown[] = [companyId, identity.confirmationId, identity.repo, identity.sha,
       identity.stagingRunId, identity.stagingRunAttempt, identity.expiresAt];
-    let sql: string;
-    if (operation === "create") {
-      sql = `INSERT INTO ${TABLE} (company_id, confirmation_id, repo, sha, staging_run_id, staging_run_attempt, expires_at, state) SELECT $1::uuid, $2::uuid, $3, $4, $5, $6, $7::timestamptz, 'available' WHERE $7::timestamptz > CURRENT_TIMESTAMP AND $7::timestamptz <= CURRENT_TIMESTAMP + interval '24 hours' ON CONFLICT (confirmation_id) DO NOTHING`;
-    } else if (operation === "revoke") {
-      sql = `UPDATE ${TABLE} SET state = 'revoked' WHERE ${MATCH} AND state IN ('available', 'claimed')`;
-    } else {
-      args.push(claimId);
-      sql = operation === "claim"
-        ? `UPDATE ${TABLE} SET state = 'claimed', claim_id = $8::uuid WHERE ${MATCH} AND state = 'available' AND expires_at > CURRENT_TIMESTAMP`
-        : `UPDATE ${TABLE} SET state = 'consumed' WHERE ${MATCH} AND state = 'claimed' AND claim_id = $8::uuid AND expires_at > CURRENT_TIMESTAMP`;
-    }
+    const sql = operation === "create"
+      ? `INSERT INTO ${TABLE} (company_id, confirmation_id, repo, sha, staging_run_id, staging_run_attempt, expires_at, state) SELECT $1::uuid, $2::uuid, $3, $4, $5, $6, $7::timestamptz, $8 WHERE $7::timestamptz > CURRENT_TIMESTAMP AND $7::timestamptz <= CURRENT_TIMESTAMP + $9::interval ON CONFLICT (company_id, confirmation_id) DO NOTHING`
+      : `UPDATE ${TABLE} SET state = $8 WHERE ${MATCH} AND state IN ($9, $10)`;
+    args.push(...(operation === "create" ? ["available", "24 hours"] : ["revoked", "available", "claimed"]));
     try {
       const result = await this.db.execute(sql, args);
       // Stock hosts may convert a missing database count to zero.

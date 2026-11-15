@@ -8,5 +8,5 @@ CREATE TABLE plugin_pr_custody_2a97cdbae1.release_lifecycle (
   expires_at timestamptz NOT NULL,
   state text NOT NULL CHECK (state IN ('available', 'claimed', 'consumed', 'revoked')),
   claim_id uuid,
-  PRIMARY KEY (confirmation_id)
+  PRIMARY KEY (company_id, confirmation_id)
 );

@@ -9,6 +9,7 @@ import { inspectManifest, validatePaths, validateEntrypoints } from "../scripts/
 
 const paths = ["package.json", "LICENSE", "README.md", "THREAT-MODEL.md", "ACCEPTANCE.md",
   "migrations/001_wake_ledger.sql", "migrations/002_wake_phases.sql",
+  "custody-migrations/README.md", "custody-migrations/001_release_lifecycle.sql",
   "dist/index.js", "dist/index.d.ts", "dist/manifest.js", "dist/worker.js", "dist/ci-runtime.js"];
 const pkg = {
   version: "0.2.0", main: "./dist/index.js", types: "./dist/index.d.ts",
@@ -62,9 +63,11 @@ test("allows only the intended package payload", () => {
   assert.throws(() => validatePaths(Array(101).fill("dist/index.js")), /count/);
 });
 
-test("allows only the declared custody migration and README", () => {
-  const custodyPaths = [...paths, "custody-migrations/README.md", "custody-migrations/001_release_lifecycle.sql"];
-  validatePaths(custodyPaths);
+test("requires the declared custody migration and README", () => {
+  const custodyPaths = paths;
+  for (const required of ["custody-migrations/README.md", "custody-migrations/001_release_lifecycle.sql"]) {
+    assert.throws(() => validatePaths(paths.filter((path) => path !== required)), /Missing/);
+  }
   for (const unexpected of ["custody-migrations/001.sql", "custody-migrations/.env",
     "custody-migrations/nested/README.md", "custody-migrations/../README.md"]) {
     assert.throws(() => validatePaths([...custodyPaths, unexpected]), /Unexpected package member/);
