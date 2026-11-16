@@ -1323,6 +1323,32 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_001);
     expect(h.ledger().report.complete).toBe(true);
   });
+  it("retains a repository's priority when the second request guard refuses before transport", async () => {
+    const h = fixture({ dryRun: true, open: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [
+      { projectId, repoUrl: "https://github.com/example/project" },
+      { projectId, repoUrl: "https://github.com/example/tail" },
+    ]);
+    h.listing.mockImplementation(async (repo, status) => status === "open"
+      ? [pull({ repo, headRepo: repo })] : []);
+    h.seedHead.mockImplementationOnce(async function (this: any) {
+      const before = this.beforeRequest;
+      this.beforeRequest = () => { before(); h.advance(240_000); };
+      try { await this.attempt("https://api.github.com/graphql", {}); }
+      finally { this.beforeRequest = before; }
+      return NOW;
+    });
+    await h.runtime.poll();
+    expect(h.ctx.http.fetch).not.toHaveBeenCalled();
+    expect(h.ledger().report.unknownReasons).toContain("tick_budget");
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().attempted["example/project"]).toBeUndefined();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    h.listing.mockClear();
+    await h.restart().poll();
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/project");
+  });
   it("rotates past a partially serviced repository under repeated budget exhaustion", async () => {
     const h = fixture({ dryRun: true });
     vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);

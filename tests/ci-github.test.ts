@@ -867,7 +867,7 @@ describe("CiGithub caching, backoff, and caps", () => {
     await github.pull(REPO, 1);
     await expect(github.pull(REPO, 1)).rejects.toMatchObject({ code: "budget" });
     expect(github.requestCount).toBe(2);
-    expect(events).toEqual(["save:1", "http", "save:2", "http"]);
+    expect(events).toEqual(["save:0", "http", "save:1", "http"]);
   });
 
   it("applies caller admission to cached conditional failures and each unconditional retry without phantom requests", async () => {
@@ -915,9 +915,25 @@ describe("CiGithub caching, backoff, and caps", () => {
     await github.pull(REPO, 1);
     fail = true;
     await expect(github.pull(REPO, 1)).rejects.toThrow("storage unavailable");
-    expect(github.requestCount).toBe(2);
+    expect(github.requestCount).toBe(1);
     expect(admitted).toHaveBeenCalledTimes(2);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("reserves budget while admission is pending and releases it on refusal", async () => {
+    let rejectAdmission!: (error: Error) => void;
+    const fetch = vi.fn(async () => response(pullData()));
+    const github = new CiGithub(fetch, TOKEN, {
+      maxRequests: 1, onRequestAdmitted: () => new Promise<void>((_resolve, reject) => { rejectAdmission = reject; }),
+    });
+    const first = github.pull(REPO, 1).catch((error: unknown) => error);
+    await vi.waitFor(() => expect(rejectAdmission).toBeTypeOf("function"));
+    await expect(github.pull(REPO, 2)).rejects.toMatchObject({ code: "budget" });
+    expect(github.requestCount).toBe(0);
+    rejectAdmission(new Error("refused"));
+    expect(await first).toMatchObject({ message: "refused" });
+    expect(github.requestCount).toBe(0);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("finishes admission persistence before starting a non-retrying transport timeout", async () => {
