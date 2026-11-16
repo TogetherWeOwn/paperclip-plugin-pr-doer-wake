@@ -80,7 +80,7 @@ jobs:
             ln -s "$PWD/packages/plugins/sdk" "$package/node_modules/@paperclipai/plugin-sdk"
           done
           cp ../qualification/cross-version/stock-lifecycle.test.ts server/src/__tests__/stock-lifecycle.test.ts
-      - name: Run partial stock-manager lifecycle control
+      - name: Run stock-manager rollback lifecycle rehearsal
         working-directory: stock-host
         env:
           INSTALLED_PACKAGE_ROOT: ${{ runner.temp }}/installed-package
@@ -88,8 +88,8 @@ jobs:
         run: |
           set -euo pipefail
           pnpm exec vitest run server/src/__tests__/stock-lifecycle.test.ts --reporter=verbose 2>&1 | tee "$RUNNER_TEMP/stock-lifecycle.log"
-          printf '%s\n' 'Partial lifecycle control only; representative rollback behavior is not yet qualified.'
-      - name: Retain partial lifecycle output
+          printf '%s\n' 'Disposable synthetic-effects lifecycle passed; production rollback is not exercised.'
+      - name: Retain lifecycle output
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
