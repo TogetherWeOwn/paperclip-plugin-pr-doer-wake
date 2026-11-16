@@ -23,9 +23,11 @@ Retries in the same run return the original wait ID without extending its seven-
 
 ## Readiness and delivery
 
-The SDK job `ci-wake-poll` runs every fifteen minutes as a **backstop** over registered open waits; signed webhook deliveries (phase two below) are the primary trigger so agents only run when CI has actually settled. Conditional REST reads use ETag / `If-None-Match`; a 304 reuses only the corresponding successfully cached response. All pages of check runs, suites, statuses and applicable branch rules are read, with finite page, byte, time and request limits. A failed/incomplete read is pending, never green. Rate limits defer work; they do not create an LLM retry loop.
+The SDK job `ci-wake-poll` runs every fifteen minutes as a **backstop** over registered open waits; signed webhook deliveries (phase two below) are the primary trigger for a readiness recheck. Conditional REST reads use ETag / `If-None-Match`; a 304 reuses only the corresponding successfully cached response. All pages of check runs, suites, statuses and applicable branch rules are read, with finite page, byte, time and request limits. A failed/incomplete read is pending, never green. Rate limits defer work; they do not create an LLM retry loop.
 
-Required status-check contexts come from the **PR base branch's effective rules** plus classic branch protection, including required app identity. The latest run per name/app wins, so a queued rerun supersedes its earlier green result. All required contexts must finish before a normal pass/fail wake:
+Required status-check contexts come from the **PR base branch's effective rules** plus classic branch protection, including required app identity. The latest run per name/app wins, so a queued rerun supersedes its earlier green result. On an unchanged head, a normal wake reports the observed verdict of the latest visible applicable required contexts at read time. A required aggregate created later may not yet exist in that snapshot and can be missed. A wake is only a prompt to look, not proof that all workflows or independent review gates have settled or passed. Reviewers must independently check every applicable gate on the exact head, including Security, QA and Release Manager order, and retain their dated backstop; if the head is not settled, retain the review stage and re-arm the backstop.
+
+For the required contexts observed in the readiness read:
 
 - Pass: `success`, `neutral`, `skipped`.
 - Fail: `failure`, `cancelled`, `timed_out`, `action_required`, `startup_failure` (commit statuses `failure`/`error` also fail).
