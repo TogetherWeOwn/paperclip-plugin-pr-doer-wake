@@ -236,10 +236,10 @@ describe("scheduled pr-custody job over the real SDK/host contract", () => {
       await h.send("initialize-budget", "initialize", initialize);
       await h.send("config-budget", "configChanged", { config: custodyConfig, companyId: COMPANY });
       const job = h.send("job-budget", "runJob", runJob);
-      if (extra) await expect(job).rejects.toThrow("total byte budget exceeded");
+      if (extra) await expect(job).rejects.toThrow("custody_inventory_failed:other");
       else await job;
       if (extra) {
-        expect(h.ledger()?.report).toMatchObject({ complete: false, unknown: ["inventory"], effects: 0, failure: "UNKNOWN custody snapshot: total byte budget exceeded", rows: [] });
+        expect(h.ledger()?.report).toMatchObject({ complete: false, unknown: ["inventory"], unknownReasons: ["other"], effects: 0, failure: "other", rows: [] });
       } else {
         expect(h.ledger()?.report).toMatchObject({ complete: true, unknown: [], effects: 0, rows: [
           { pr: "example/project#42", cardId: fixtureId(1), mapping: "url", triggers: [] },
