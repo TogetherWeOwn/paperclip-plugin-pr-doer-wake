@@ -118,6 +118,7 @@ it("preserves migration and instance state across installed, previous, and resto
         previousState = await db.select().from(pluginState).where(eq(pluginState.pluginId, pluginId));
         const row = previousState.find((s: any) => s.namespace === "ci-wake-v1" && s.stateKey === "ledger");
         const wait = (row?.valueJson as any)?.waits.find((entry: any) => entry.waitId === waitId);
+        console.info("rollback-poll", JSON.stringify({ phase: index, wait, audits: (row?.valueJson as any)?.audits, requests, wakeups: wakeups.length }));
         expect(wait).toMatchObject({ waitId, issueId, companyId, repo, prNumber: 17, headSha: sha, status: index === 0 ? "open" : "woken" });
         expect(wakeups).toHaveLength(index === 0 ? 0 : 1);
         console.info("rollback-start", JSON.stringify({ phase: index, pluginId, configuredCompanies: configRows.map((row) => row.companyId), namespace: namespace!.namespaceName, pid: started.pid, ledger: ledger.map(({ migrationKey, checksum, status }) => ({ migrationKey, checksum, status })), stateRows: previousState.length }));
