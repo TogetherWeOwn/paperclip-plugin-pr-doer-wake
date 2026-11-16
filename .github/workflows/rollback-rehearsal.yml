@@ -1,0 +1,49 @@
+name: rollback rehearsal
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/rollback-rehearsal.yml'
+      - 'qualification/cross-version/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  retained-packages:
+    name: Verify retained package inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fetch exact retained archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/retained-archives"
+          for record in \
+            'installed 14208841476 43831163440 356a733ad1e2aee3b289b4812429b85d7bac29a2' \
+            'previous 14186900141 43776281685 2ed5a9840e005c082733135f2b3a395d348ed116'; do
+            read -r kind artifact run source <<< "$record"
+            metadata="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact")"
+            jq -e --argjson id "$artifact" --argjson run "$run" \
+              '.id == $id and .workflow_run.id == $run and .expired == false' <<< "$metadata" > /dev/null
+            attempt="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/attempts/1")"
+            jq -e --arg source "$source" \
+              '.run_attempt == 1 and .head_sha == $source and .status == "completed" and .conclusion == "success"' <<< "$attempt" > /dev/null
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > "$RUNNER_TEMP/retained-archives/$kind.zip"
+          done
+      - name: Test non-executing package verifier
+        run: python3 -I qualification/cross-version/test_verify_retained.py
+      - name: Verify and extract exact packages without executing workers
+        run: |
+          set -euo pipefail
+          python3 -I qualification/cross-version/verify-retained.py installed "$RUNNER_TEMP/retained-archives/installed.zip" "$RUNNER_TEMP/installed-package"
+          python3 -I qualification/cross-version/verify-retained.py previous "$RUNNER_TEMP/retained-archives/previous.zip" "$RUNNER_TEMP/previous-package"
+          printf '%s\n' 'Package validation only; no rollback lifecycle was exercised.'
