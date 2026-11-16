@@ -11,7 +11,7 @@ function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
 }
 
-export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, registrationAdmissionMs: 3_000, registrationBudgetMs: 22_000, registrationAuditFloorMs: 3_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
+export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, registrationAdmissionMs: 3_000, registrationBudgetMs: 22_000, registrationResponseMs: 26_000, registrationAuditFloorMs: 3_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
 export interface CiWakeRuntimeOptions {
   /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
   secretResolveTimeoutMs?: number;
@@ -27,6 +27,12 @@ export interface CiWakeRuntimeOptions {
    * 30-second tool-call timeout room for the final ledger write.
    */
   registrationBudgetMs?: number;
+  /**
+   * Hard response deadline for one registration, counted from arrival; default
+   * 26 seconds, at most 28. A ledger write still in flight then keeps the lock
+   * until it settles, while the caller gets the retriable registration_pending.
+   */
+  registrationResponseMs?: number;
 }
 const KEY = { scopeKind: "instance" as const, namespace: "ci-wake-v1", stateKey: "ledger" };
 type WaitStatus = "open" | "waking" | "woken" | "would_wake" | "unconfirmed" | "retired";
@@ -110,7 +116,7 @@ const REFUSAL_CODES = new Set([
   "binding_changed", "registration_requires_new_run", "wait_alias_capacity",
   "wait_capacity", "github_backoff", "github_backoff_capacity",
   "secret_resolution_timeout", "credential_unavailable",
-  "invalid_ledger", "ledger_busy", "registration_deadline", "registration_refused",
+  "invalid_ledger", "ledger_busy", "registration_deadline", "registration_pending", "registration_refused",
 ]);
 
 function refusalCode(error: unknown): string {
@@ -156,6 +162,7 @@ const REFUSAL_REASONS: Record<string, string> = {
   invalid_ledger: "The stored CI ledger is invalid; ask the operator to inspect it.",
   ledger_busy: "The CI ledger is busy with a poll step; retry registration in a few seconds.",
   registration_deadline: "Registration ran out of time waiting on a host or GitHub read; retry shortly.",
+  registration_pending: "Registration is still being recorded; retry shortly to confirm it (a retry returns the recorded wait).",
   registration_refused: "Registration refused.",
 };
 
@@ -244,6 +251,7 @@ export class CiWakeRuntime {
   private readonly secretResolveTimeoutMs: number;
   private readonly registrationAdmissionMs: number;
   private readonly registrationBudgetMs: number;
+  private readonly registrationResponseMs: number;
 
   constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now, options: CiWakeRuntimeOptions = {}) {
     const timeoutMs = options.secretResolveTimeoutMs ?? LIMITS.secretResolveMs;
@@ -255,6 +263,9 @@ export class CiWakeRuntime {
     const budgetMs = options.registrationBudgetMs ?? LIMITS.registrationBudgetMs;
     if (!Number.isSafeInteger(budgetMs) || budgetMs < admissionMs || budgetMs > 25_000) throw new Error("invalid_registration_budget");
     this.registrationBudgetMs = budgetMs;
+    const responseMs = options.registrationResponseMs ?? LIMITS.registrationResponseMs;
+    if (!Number.isSafeInteger(responseMs) || responseMs < budgetMs || responseMs > 28_000) throw new Error("invalid_registration_response");
+    this.registrationResponseMs = responseMs;
   }
 
   /**
@@ -346,7 +357,19 @@ export class CiWakeRuntime {
         if (timer !== undefined) clearTimeout(timer);
       }
     };
-    try { return await fn(within, left); } finally { this.release(); }
+    // The body owns the lock until every write it started has settled; only the
+    // caller's answer is bounded. A write that is still in flight at the response
+    // deadline therefore cannot be overwritten by queued poll or registration work.
+    const work = (async () => { try { return await fn(within, left); } finally { this.release(); } })();
+    work.catch(() => undefined);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const pending = new Promise<ToolResult>((resolve) => {
+      timer = setTimeout(() => {
+        const { code, reason } = refusalDetail(new Error("registration_pending"));
+        resolve({ content: `CI registration refused: ${code}. ${reason}`, error: `CI registration refused: ${code}`, data: { code, reason } });
+      }, Math.max(0, this.registrationResponseMs - (performance.now() - arrived)));
+    });
+    try { return await Promise.race([work, pending]); } finally { if (timer !== undefined) clearTimeout(timer); }
   }
 
   /**

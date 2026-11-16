@@ -86,7 +86,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function setup(overrides: Record<string, unknown> = {}, runtimeOptions?: { secretResolveTimeoutMs?: number; registrationAdmissionMs?: number; registrationBudgetMs?: number }) {
+function setup(overrides: Record<string, unknown> = {}, runtimeOptions?: { secretResolveTimeoutMs?: number; registrationAdmissionMs?: number; registrationBudgetMs?: number; registrationResponseMs?: number }) {
   let durable: Ledger | null = null;
   let now = START;
   let failWakingWrite = false;
@@ -1882,6 +1882,27 @@ describe("CI wait identity and serialization", () => {
     // refusal skips its full-ledger audit write instead of risking the host deadline.
     expect(h.ledger().waits.map((wait) => wait.headSha)).toEqual([HEAD]);
     expect(h.ledger().audits.filter((entry) => entry.operation === "register").map((entry) => entry.outcome)).not.toContain("registration_deadline");
+  }, 10_000);
+
+  it("answers registration_pending at the response deadline while a slow ledger write keeps the lock until it settles", async () => {
+    const h = setup({}, { registrationAdmissionMs: 100, registrationBudgetMs: 300, registrationResponseMs: 500 });
+    const write = h.set.getMockImplementation()!;
+    let written = false;
+    // The final registration write is slow but finite; earlier writes are fast.
+    h.set.mockImplementation(async (key, value) => {
+      if ((value as Ledger).audits.at(-1)?.outcome === "registered") { await new Promise((done) => setTimeout(done, 1_500)); written = true; }
+      return write(key, value);
+    });
+    const started = performance.now();
+    const result = await h.runtime.register(registration, run);
+    expect(result).toMatchObject({ error: "CI registration refused: registration_pending", data: { code: "registration_pending" } });
+    expect(performance.now() - started).toBeLessThan(1_200);
+    expect(written).toBe(false);
+    // Queued poll work waits for the in-flight write instead of overwriting it with a stale ledger.
+    await h.runtime.poll();
+    expect(written).toBe(true);
+    expect(h.ledger().waits).toEqual([expect.objectContaining({ headSha: HEAD, status: "open" })]);
+    expect(await h.runtime.register(registration, run)).toMatchObject({ content: "CI wait already registered" });
   }, 10_000);
 
   it("ends the poll without writing a stale ledger when the save at a yield fails", async () => {
