@@ -1779,6 +1779,72 @@ describe("CI wait identity and serialization", () => {
     expect(h.requestWakeup).toHaveBeenCalledTimes(2);
   });
 
+  function twoWaitSetup(otherHead: string) {
+    const h = setup();
+    const otherWorkspace = { ...h.workspace, id: "66666666-6666-4666-8666-666666666667", branchName: "feature/second-opaque-branch" };
+    const otherIssue = { ...h.issue, id: OTHER, executionWorkspaceId: otherWorkspace.id };
+    h.issueGet.mockImplementation(async (id) => clone(id === OTHER ? otherIssue : h.issue));
+    h.workspaceGet.mockImplementation(async (id) => clone(id === otherWorkspace.id ? otherWorkspace : h.workspace));
+    h.assertCheckoutOwner.mockImplementation(async (input) => {
+      if (![ISSUE, OTHER].includes(input.issueId) || input.companyId !== COMPANY || input.actorAgentId !== AGENT || input.actorRunId !== RUN) throw new Error("not the checkout owner");
+    });
+    const otherPull = (headSha: string) => pull({ number: 18, headSha, headBranch: otherWorkspace.branchName });
+    github.pull.mockImplementation(async (_repo, number) => number === 18 ? otherPull(otherHead) : pull());
+    return { h, otherPull };
+  }
+
+  it("lets a queued registration run between per-wait poll steps instead of waiting for the whole poll", async () => {
+    const { h, otherPull } = twoWaitSetup(NEXT_HEAD);
+    await h.runtime.register(registration, run);
+    await h.runtime.register({ ...registration, issueId: OTHER, prNumber: 18, headSha: NEXT_HEAD }, run);
+    const firstEntered = deferred();
+    const firstRelease = deferred();
+    const secondEntered = deferred();
+    const secondRelease = deferred();
+    github.pull.mockImplementation(async (_repo, number) => {
+      if (number === 18) { secondEntered.resolve(); await secondRelease.promise; return otherPull(NEXT_HEAD); }
+      firstEntered.resolve(); await firstRelease.promise; return pull();
+    });
+    const poll = h.runtime.poll();
+    await firstEntered.promise;
+    let registered = false;
+    // An exact duplicate needs no GitHub read, so only the ledger lock gates it.
+    const retry = h.runtime.register(registration, run).then((result) => { registered = true; return result; });
+    firstRelease.resolve();
+    await secondEntered.promise;
+    // The poll is now blocked on its second wait; the registration must already be done.
+    expect(registered).toBe(true);
+    expect(await retry).toMatchObject({ content: "CI wait already registered" });
+    secondRelease.resolve();
+    await poll;
+    // The poll continued on a fresh ledger: the registration's audit survives its later writes.
+    expect(h.ledger().audits.filter((entry) => entry.operation === "register").map((entry) => entry.outcome)).toContain("duplicate");
+    expect(h.ledger().waits.map((wait) => wait.status)).toEqual(["open", "open"]);
+  });
+
+  it("skips a wait superseded by a registration that ran during a poll yield", async () => {
+    const third = "c".repeat(40);
+    const { h, otherPull } = twoWaitSetup(NEXT_HEAD);
+    await h.runtime.register(registration, run);
+    await h.runtime.register({ ...registration, issueId: OTHER, prNumber: 18, headSha: NEXT_HEAD }, run);
+    github.readiness.mockReturnValue(verdict("pass"));
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementation(async (_repo, number) => {
+      if (number === 18) return otherPull(third);
+      entered.resolve(); await release.promise; return pull();
+    });
+    const poll = h.runtime.poll();
+    await entered.promise;
+    const superseding = h.runtime.register({ ...registration, issueId: OTHER, prNumber: 18, headSha: third }, run);
+    release.resolve();
+    await Promise.all([poll, superseding]);
+    // The stale NEXT_HEAD wait is never polled or woken, and the new wait is not lost.
+    expect(github.snapshot.mock.calls.map(([, sha]) => sha)).toEqual([HEAD]);
+    expect(h.requestWakeup.mock.calls.map(([issueId]) => issueId)).toEqual([ISSUE]);
+    expect(h.ledger().waits.map((wait) => [wait.headSha, wait.status])).toEqual([[HEAD, "woken"], [NEXT_HEAD, "retired"], [third, "open"]]);
+  });
+
   it("coalesces an overlapping poll while a terminal poll and registration retry are in flight", async () => {
     const h = setup();
     await h.runtime.register(registration, run);

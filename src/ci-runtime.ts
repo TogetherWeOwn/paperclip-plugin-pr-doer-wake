@@ -215,7 +215,8 @@ function webhookHeadSha(event: string | undefined, rawBody: string): string | nu
 
 /** One host-managed worker owns this ledger. All entrypoints share its lock, including overlapping job callbacks. */
 export class CiWakeRuntime {
-  private lock: Promise<unknown> = Promise.resolve();
+  private locked = false;
+  private lockWaiters: Array<() => void> = [];
   private pollInFlight = false;
   private targetedPoll = false;
   private fullPollRequested = false;
@@ -256,10 +257,36 @@ export class CiWakeRuntime {
     }
   }
 
-  private serialized<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.lock.then(fn, fn);
-    this.lock = next.catch(() => undefined);
-    return next;
+  // FIFO mutex. Ownership passes straight to the next waiter on release, so
+  // a released holder cannot barge back in ahead of queued work.
+  private async acquire(): Promise<void> {
+    if (!this.locked) { this.locked = true; return; }
+    await new Promise<void>((resolve) => this.lockWaiters.push(resolve));
+  }
+
+  private release(): void {
+    const next = this.lockWaiters.shift();
+    if (next) next(); else this.locked = false;
+  }
+
+  private async serialized<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try { return await fn(); } finally { this.release(); }
+  }
+
+  /**
+   * A full poll can run for the whole tick budget, longer than the host's
+   * tool-call timeout. Between per-wait steps the poll persists its ledger and
+   * lets queued registrations and webhooks run, then continues on a freshly
+   * loaded ledger so their writes are never overwritten by a stale copy.
+   * Returns the ledger to continue with.
+   */
+  private async yieldToQueued(ledger: Ledger): Promise<Ledger> {
+    if (!this.lockWaiters.length) return ledger;
+    await this.save(ledger);
+    this.release();
+    await this.acquire();
+    return this.load();
   }
 
   private async load(): Promise<Ledger> {
@@ -608,7 +635,7 @@ export class CiWakeRuntime {
   }
 
   private async pollLocked(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
-    const ledger = await this.load();
+    let ledger = await this.load();
     this.compact(ledger);
     await this.save(ledger);
     const started = this.now();
@@ -630,8 +657,12 @@ export class CiWakeRuntime {
     };
     // Oldest last-attempt first prevents one unavailable repository starving others.
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
-    for (const wait of pending) {
+    for (const queued of pending) {
       if (requests >= ciRequestLimit || wakes >= ciWakeLimit || this.now() - started >= LIMITS.tickMs) break;
+      ledger = await this.yieldToQueued(ledger);
+      // A registration that ran during the yield may have superseded or retired this wait.
+      const wait = ledger.waits.find((w) => w.waitId === queued.waitId);
+      if (!wait || wait.status !== "open") continue;
       try {
         wait.lastAttemptAt = this.now();
         const config = await this.config(wait.companyId, false);
@@ -747,8 +778,12 @@ export class CiWakeRuntime {
         .sort((a, b) => a[1].pollOrder! - b[1].pollOrder!);
       if (allEntries.length) await this.save(ledger);
       const reviewerStartRequests = requests;
-      for (const [key, entry] of entries) {
+      for (const [key] of entries) {
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+        ledger = await this.yieldToQueued(ledger);
+        // A registration during the yield may have retargeted this entry to a newer head.
+        const entry = ledger.prHeadPending[key];
+        if (!entry || entry.pollOrder === undefined || (only && entry.newSha !== only.sha)) continue;
         const entryStartRequests = requests;
         const previousOrder = entry.pollOrder!;
         entry.pollOrder = ++sequence;
