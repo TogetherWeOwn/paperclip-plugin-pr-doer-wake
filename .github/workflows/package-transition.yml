@@ -1,0 +1,52 @@
+name: exact package transition control
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/package-transition.yml'
+      - 'tests/ci-ledger.test.ts'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  synthetic-transition:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - name: Download and verify exact retained packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fetch_package() {
+            local label="$1" artifact="$2" archive="$3" tgz="$4" source="$5" run="$6"
+            local dir="$RUNNER_TEMP/$label"
+            mkdir "$dir"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact" > "$dir/metadata.json"
+            node -e 'const [p,sha,run]=process.argv.slice(1); const m=require(p); if(m.expired || m.workflow_run.head_sha!==sha || String(m.workflow_run.id)!==run) process.exit(1)' "$dir/metadata.json" "$source" "$run"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > "$dir/archive.zip"
+            printf '%s  %s\n' "$archive" "$dir/archive.zip" | sha256sum -c -
+            unzip -p "$dir/archive.zip" togetherweown-paperclip-plugin-pr-doer-wake-0.3.0.tgz > "$dir/package.tgz"
+            printf '%s  %s\n' "$tgz" "$dir/package.tgz" | sha256sum -c -
+            mkdir "$dir/extracted"
+            tar -xzf "$dir/package.tgz" -C "$dir/extracted"
+            ln -s "$GITHUB_WORKSPACE/node_modules" "$dir/extracted/package/node_modules"
+          }
+          fetch_package installed 14210779665 68a379fa17927b1d90a07490d3262c46ab7c5fdc14d2285e7191963190fd7091 c839010aa32de13ed805e870888e145f3218ed7c549e38c83add4a42439cee7a 356a733ad1e2aee3b289b4812429b85d7bac29a2 43831163440
+          fetch_package candidate 14186900141 360a6aba6a269a36adc1deda53d92a96fb8d6ec56736a7fb08969eeb5b76b771 716d17cb204f60482eb680f616a59312a5fde0df2f954bd1841877e2940a7110 2ed5a9840e005c082733135f2b3a395d348ed116 43776281685
+      - name: Run sequential in-memory recovery controls
+        env:
+          INSTALLED_RUNTIME: ${{ runner.temp }}/installed/extracted/package/dist/ci-runtime.js
+          CANDIDATE_RUNTIME: ${{ runner.temp }}/candidate/extracted/package/dist/ci-runtime.js
+        run: npx vitest run tests/ci-ledger.test.ts -t 'exact-package sequential recovery' --reporter=verbose

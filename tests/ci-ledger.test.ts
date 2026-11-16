@@ -115,7 +115,7 @@ function setup(app = false) {
     http: { fetch }, logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
   } as unknown as PluginContext;
   return {
-    runtime: () => new CiWakeRuntime(ctx, () => now),
+    runtime: (Runtime: typeof CiWakeRuntime = CiWakeRuntime) => new Runtime(ctx, () => now),
     ledger: () => clone(durable!), effects, requestWakeup, fetch, resolveSecret,
     advance: () => { now += 20_000; }, terminal: () => { terminal = true; },
     reply: (value: typeof reply) => { reply = value; },
@@ -125,6 +125,43 @@ function setup(app = false) {
     installation: (id: string) => { if (app) auth.githubInstallationId = id; },
   };
 }
+
+const packagePaths = [process.env.INSTALLED_RUNTIME, process.env.CANDIDATE_RUNTIME];
+const packageTest = packagePaths.every(Boolean) ? it : it.skip;
+
+describe("exact-package sequential recovery", () => {
+  packageTest.each([
+    [0, 1, "ambiguous"], [1, 0, "ambiguous"],
+    [0, 1, "crash-after-dispatch"], [1, 0, "crash-after-dispatch"],
+  ] as const)("recovers package %i to %i after %s", async (from, to, reply) => {
+    const Producer = (await import(/* @vite-ignore */ packagePaths[from]!)).CiWakeRuntime as typeof CiWakeRuntime;
+    const Consumer = (await import(/* @vite-ignore */ packagePaths[to]!)).CiWakeRuntime as typeof CiWakeRuntime;
+    const h = setup();
+    const original = h.runtime(Producer);
+    expect(await original.register(registration, run)).toMatchObject({ data: { status: "open" } });
+    h.terminal();
+    h.reply(reply);
+    if (reply === "crash-after-dispatch") {
+      await expect(original.poll()).rejects.toThrow("synthetic durable-state outage");
+      expect(h.ledger().waits[0]?.status).toBe("waking");
+    } else {
+      await original.poll();
+      expect(h.ledger().waits[0]?.status).toBe("unconfirmed");
+    }
+    expect(h.effects).toHaveLength(1);
+    h.recoverState();
+    h.reply("queued");
+    const recovered = h.runtime(Consumer);
+    expect(await recovered.register(registration, run)).toMatchObject({ data: { status: "unconfirmed" } });
+    await recovered.poll();
+    await recovered.webhook(signedHint(1));
+    expect(h.ledger().waits[0]?.status).toBe("unconfirmed");
+    expect(h.effects).toHaveLength(1);
+    expect(h.ledger().audits.filter((audit) => audit.operation === "wake").map((audit) => audit.outcome)).toEqual(
+      reply === "ambiguous" ? ["intent", "unconfirmed"] : ["intent"],
+    );
+  });
+});
 
 describe("plugin ledger without host idempotency", () => {
   it("shares installation backoff across companies before resolving another key", async () => {
