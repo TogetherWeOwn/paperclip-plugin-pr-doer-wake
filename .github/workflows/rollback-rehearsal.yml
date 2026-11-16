@@ -65,6 +65,10 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          for package in "$RUNNER_TEMP/installed-package" "$RUNNER_TEMP/previous-package"; do
+            mkdir -p "$package/node_modules/@paperclipai"
+            ln -s "$PWD/packages/plugins/sdk" "$package/node_modules/@paperclipai/plugin-sdk"
+          done
           cp ../qualification/cross-version/stock-lifecycle.test.ts server/src/__tests__/stock-lifecycle.test.ts
       - name: Run partial stock-manager lifecycle control
         working-directory: stock-host

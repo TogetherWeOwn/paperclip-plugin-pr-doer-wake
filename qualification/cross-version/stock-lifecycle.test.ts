@@ -35,6 +35,7 @@ it("preserves migration and instance state across installed, previous, and resto
   const workspaceId = randomUUID();
   const repo = "example/project";
   const sha = "a".repeat(40);
+  const release = { confirmationId: randomUUID(), repo, sha, stagingRunId: "123", stagingRunAttempt: 1, expiresAt: new Date(Date.now() + 3_600_000).toISOString().replace(/\.\d{3}Z$/, "Z") };
   const wakeups: any[] = [];
   const requests: string[] = [];
   let waitId: string;
@@ -78,6 +79,12 @@ it("preserves migration and instance state across installed, previous, and resto
       expect(ledger[0]).toMatchObject({ migrationKey: "001_release_lifecycle.sql", status: "applied", namespaceName: namespace!.namespaceName });
       if (previousLedger) expect(ledger).toEqual(previousLedger);
       previousLedger = ledger;
+      const { ReleaseStore } = await import(pathToFileURL(join(root, "dist/release-store.js")).href);
+      const releaseStore = new ReleaseStore({ namespace: namespace!.namespaceName, execute: (statement: string, params: unknown[]) => database.execute(pluginId, statement, params) });
+      if (index === 0) expect(await releaseStore.create(companyId, release)).toBe("applied");
+      const releaseRows = Array.from(await db.execute(sql`select company_id, confirmation_id, repo, sha, state from plugin_pr_custody_2a97cdbae1.release_lifecycle`));
+      expect(releaseRows).toEqual([{ company_id: companyId, confirmation_id: release.confirmationId, repo, sha, state: "available" }]);
+      expect(await releaseStore.claim(companyId, release, randomUUID())).toBe("unknown");
       const stateBefore = await db.select().from(pluginState).where(eq(pluginState.pluginId, pluginId));
       if (previousState) expect(stateBefore).toEqual(previousState);
       const handlers = createHostClientHandlers({ pluginId: manifest.id, capabilities: [...manifest.capabilities], services });
@@ -116,7 +123,7 @@ it("preserves migration and instance state across installed, previous, and resto
     expect(wakeups[0].reason).toMatch(/^CI pass example\/project@aaaaaaa/);
     expect(requests).toContain(`/repos/${repo}/commits/${sha}/statuses`);
     const result = await db.execute(sql`select count(*)::int as count from plugin_pr_custody_2a97cdbae1.release_lifecycle`);
-    expect(Array.from(result)[0]).toMatchObject({ count: 0 });
+    expect(Array.from(result)[0]).toMatchObject({ count: 1 });
   } finally {
     await manager.stopAll();
     services.dispose();
