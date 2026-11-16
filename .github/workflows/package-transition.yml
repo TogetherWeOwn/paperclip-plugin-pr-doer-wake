@@ -1,5 +1,8 @@
 name: exact package transition control
 
+# Historical qualification of two specific packages, not a permanent PR gate.
+# The retained artifacts expire on 2026-12-15 and 2026-12-16; after expiry
+# this control cannot be rerun without obtaining the exact packages.
 on:
   pull_request:
     paths:
@@ -14,6 +17,7 @@ permissions:
 
 jobs:
   synthetic-transition:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 87
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

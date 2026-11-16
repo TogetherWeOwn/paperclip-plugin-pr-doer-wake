@@ -7,6 +7,9 @@ const COMPANY = "aaaaaaaa-0000-4000-8000-000000000001";
 const AGENT = "cccccccc-0000-4000-8000-000000000001";
 const ISSUE = "bbbbbbbb-0000-4000-8000-000000000001";
 const NOW = Date.parse("2026-10-20T12:00:00Z");
+const COMMENT = "dddddddd-0000-4000-8000-000000000001";
+const DIRECTIVE = "PR disposition: example/project#42 finish; next actor contributor; revisit event";
+const dispositionId = createHash("sha256").update(JSON.stringify([ISSUE, `comment:${COMMENT}`, DIRECTIVE])).digest("hex");
 const ledgerKey = { scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:live" };
 const paths = [process.env.INSTALLED_CUSTODY_RUNTIME, process.env.CANDIDATE_CUSTODY_RUNTIME];
 const packageTest = paths.every(Boolean) ? it : it.skip;
@@ -20,6 +23,7 @@ function fixture() {
   let failArchive = false;
   let writeBeforeFailure = false;
   let active = false;
+  let directive = false;
   const reads: string[] = [];
   const wake = vi.fn(async () => ({ queued: true, runId: ISSUE }));
   const ctx = {
@@ -39,6 +43,9 @@ function fixture() {
       status: "in_progress", status_version: 1, assignee_agent_id: AGENT, assignee_user_id: null,
       origin_kind: "manual", conversation_agent_id: null, conversation_user_id: null, conversation_state: null,
       updated_at: "2026-10-10T00:00:00Z", completed_at: null, cancelled_at: null,
+    }] : active && directive && sql.includes("public.issue_comments") ? [{
+      id: COMMENT, company_id: COMPANY, issue_id: ISSUE, body: DIRECTIVE, author_agent_id: AGENT, author_user_id: null,
+      author_type: "agent", deleted_at: null, updated_at: "2026-10-20T12:00:00Z",
     }] : [] },
     projects: { get: vi.fn(), listWorkspaces: vi.fn() },
     issues: { get: async () => ({ id: ISSUE, companyId: COMPANY, workProducts: [] }), requestWakeup: wake },
@@ -69,11 +76,11 @@ function fixture() {
   } as unknown as PluginContext;
   return {
     state, wake, reads,
-    activate: () => { active = true; },
+    activate: (withDirective = false) => { active = true; directive = withDirective; },
     runtime: (Runtime: RuntimeClass) => { const runtime = new Runtime(ctx, () => NOW); runtime.setCustodyCompanyId(COMPANY); return runtime; },
-    seed: (target = "target") => {
+    seed: (target = "target", dispositionTarget = "target", dispositionAt = NOW - 2000) => {
       const receipts: Record<string, unknown> = { [target]: { at: NOW - 1000, status: "woken" }, pending: { at: NOW, status: "pending" }, uncertain: { at: NOW, status: "unconfirmed", phase: "wake" } };
-      const dispositions: Record<string, number> = { target: NOW - 2000 };
+      const dispositions: Record<string, number> = { [dispositionTarget]: dispositionAt };
       for (let i = 0; i < 19_871; i++) { receipts[`history-${i}`] = { at: NOW, status: "cleared" }; dispositions[`history-${i}`] = NOW; }
       state.set(JSON.stringify(ledgerKey), { version: 1, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions, receipts, audits: [] });
     },
@@ -96,6 +103,23 @@ describe("exact-package custody compaction", () => {
     expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: "example/project#42", cardId: ISSUE, triggers: [trigger] })]);
     expect(h.reads).toContain(archiveKey("receipt", trigger));
     expect(h.ledger().receipts[trigger]).toBeUndefined();
+    expect(h.wake).not.toHaveBeenCalled();
+  });
+
+  packageTest.each([[0, 1], [1, 0]] as const)("uses an archived disposition clock from package %i to %i", async (from, to) => {
+    const Producer = (await import(/* @vite-ignore */ paths[from]!)).CustodyRuntime as RuntimeClass;
+    const Consumer = (await import(/* @vite-ignore */ paths[to]!)).CustodyRuntime as RuntimeClass;
+    const clock = Date.parse("2026-10-08T00:00:00Z");
+    const trigger = `example/project#42|idle|${clock}`;
+    const h = fixture(); h.seed(trigger, dispositionId, clock);
+    await h.runtime(Producer).poll();
+    expect(h.ledger().dispositions[dispositionId]).toBeUndefined();
+    expect(h.state.get(archiveKey("disposition", dispositionId))?.value).toBe(clock);
+    h.activate(true); h.reads.length = 0;
+    await h.runtime(Consumer).poll();
+    expect(h.reads).toContain(archiveKey("disposition", dispositionId));
+    expect(h.ledger().dispositions[dispositionId]).toBeUndefined();
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: "example/project#42", cardId: ISSUE, triggers: [trigger] })]);
     expect(h.wake).not.toHaveBeenCalled();
   });
 
