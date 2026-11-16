@@ -86,7 +86,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function setup(overrides: Record<string, unknown> = {}, runtimeOptions?: { secretResolveTimeoutMs?: number }) {
+function setup(overrides: Record<string, unknown> = {}, runtimeOptions?: { secretResolveTimeoutMs?: number; registrationAdmissionMs?: number }) {
   let durable: Ledger | null = null;
   let now = START;
   let failWakingWrite = false;
@@ -1820,6 +1820,59 @@ describe("CI wait identity and serialization", () => {
     // The poll continued on a fresh ledger: the registration's audit survives its later writes.
     expect(h.ledger().audits.filter((entry) => entry.operation === "register").map((entry) => entry.outcome)).toContain("duplicate");
     expect(h.ledger().waits.map((wait) => wait.status)).toEqual(["open", "open"]);
+  });
+
+  it("refuses a registration with retriable ledger_busy while one slow poll step keeps the lock", async () => {
+    const h = setup({}, { registrationAdmissionMs: 20 });
+    await h.runtime.register(registration, run);
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementation(async () => { entered.resolve(); await release.promise; return pull(); });
+    const poll = h.runtime.poll();
+    await entered.promise;
+    const auditsBefore = h.ledger().audits.length;
+    // The same step is still in flight: admission must give up instead of outliving the host timeout.
+    const busy = await h.runtime.register(registration, run);
+    expect(busy).toMatchObject({ error: "CI registration refused: ledger_busy", data: { code: "ledger_busy" } });
+    release.resolve();
+    await poll;
+    expect(h.ledger().audits.slice(auditsBefore).some((entry) => entry.operation === "register")).toBe(false);
+    expect(await h.runtime.register(registration, run)).toMatchObject({ content: "CI wait already registered" });
+  });
+
+  it("ends the poll without writing a stale ledger when the save at a yield fails", async () => {
+    const { h } = twoWaitSetup(NEXT_HEAD);
+    await h.runtime.register(registration, run);
+    await h.runtime.register({ ...registration, issueId: OTHER, prNumber: 18, headSha: NEXT_HEAD }, run);
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    const poll = h.runtime.poll();
+    await entered.promise;
+    const retry = h.runtime.register(registration, run);
+    // The next write is the poll's save before it yields to the queued registration.
+    h.set.mockImplementationOnce(async () => { throw new Error("state unavailable at yield"); });
+    release.resolve();
+    await expect(poll).resolves.toBeUndefined();
+    expect(await retry).toMatchObject({ content: "CI wait already registered" });
+    expect(github.snapshot.mock.calls.map(([, sha]) => sha)).toEqual([HEAD]);
+  });
+
+  it("stops the poll when the tick budget expires during a yield to a queued registration", async () => {
+    const { h } = twoWaitSetup(NEXT_HEAD);
+    await h.runtime.register(registration, run);
+    await h.runtime.register({ ...registration, issueId: OTHER, prNumber: 18, headSha: NEXT_HEAD }, run);
+    const entered = deferred();
+    const release = deferred();
+    github.pull.mockImplementationOnce(async () => { entered.resolve(); await release.promise; return pull(); });
+    const poll = h.runtime.poll();
+    await entered.promise;
+    // Only the queued registration checks checkout ownership; it outlasts the tick.
+    h.assertCheckoutOwner.mockImplementation(async () => { h.advance(LIMITS.tickMs); });
+    const retry = h.runtime.register(registration, run);
+    release.resolve();
+    await Promise.all([poll, retry]);
+    expect(github.snapshot.mock.calls.map(([, sha]) => sha)).toEqual([HEAD]);
   });
 
   it("skips a wait superseded by a registration that ran during a poll yield", async () => {

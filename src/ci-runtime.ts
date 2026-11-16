@@ -11,10 +11,16 @@ function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
 }
 
-export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
+export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, registrationAdmissionMs: 3_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
 export interface CiWakeRuntimeOptions {
   /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
   secretResolveTimeoutMs?: number;
+  /**
+   * How long a registration waits for the ledger lock before a retriable
+   * refusal; default 3 seconds, at most 5. The wait adds to the registration's
+   * own bounded work, so it stays small against the host's 30-second timeout.
+   */
+  registrationAdmissionMs?: number;
 }
 const KEY = { scopeKind: "instance" as const, namespace: "ci-wake-v1", stateKey: "ledger" };
 type WaitStatus = "open" | "waking" | "woken" | "would_wake" | "unconfirmed" | "retired";
@@ -98,7 +104,7 @@ const REFUSAL_CODES = new Set([
   "binding_changed", "registration_requires_new_run", "wait_alias_capacity",
   "wait_capacity", "github_backoff", "github_backoff_capacity",
   "secret_resolution_timeout", "credential_unavailable",
-  "invalid_ledger", "registration_refused",
+  "invalid_ledger", "ledger_busy", "registration_refused",
 ]);
 
 function refusalCode(error: unknown): string {
@@ -142,6 +148,7 @@ const REFUSAL_REASONS: Record<string, string> = {
   secret_resolution_timeout: "GitHub credential unavailable; retry shortly.",
   credential_unavailable: "GitHub credential unavailable; retry shortly.",
   invalid_ledger: "The stored CI ledger is invalid; ask the operator to inspect it.",
+  ledger_busy: "The CI ledger is busy with a poll step; retry registration in a few seconds.",
   registration_refused: "Registration refused.",
 };
 
@@ -228,11 +235,15 @@ export class CiWakeRuntime {
   private webhookBudget = { since: 0, used: 0 };
 
   private readonly secretResolveTimeoutMs: number;
+  private readonly registrationAdmissionMs: number;
 
   constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now, options: CiWakeRuntimeOptions = {}) {
     const timeoutMs = options.secretResolveTimeoutMs ?? LIMITS.secretResolveMs;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("invalid_secret_resolve_timeout");
     this.secretResolveTimeoutMs = timeoutMs;
+    const admissionMs = options.registrationAdmissionMs ?? LIMITS.registrationAdmissionMs;
+    if (!Number.isSafeInteger(admissionMs) || admissionMs < 1 || admissionMs > 5_000) throw new Error("invalid_registration_admission");
+    this.registrationAdmissionMs = admissionMs;
   }
 
   /**
@@ -264,6 +275,25 @@ export class CiWakeRuntime {
     await new Promise<void>((resolve) => this.lockWaiters.push(resolve));
   }
 
+  /** Like acquire, but gives up after `ms` without ever taking the lock. */
+  private async tryAcquire(ms: number): Promise<boolean> {
+    if (!this.locked) { this.locked = true; return true; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let waiter!: () => void;
+    const acquired = await new Promise<boolean>((resolve) => {
+      waiter = () => { clearTimeout(timer); resolve(true); };
+      this.lockWaiters.push(waiter);
+      timer = setTimeout(() => {
+        const index = this.lockWaiters.indexOf(waiter);
+        // Already handed the lock: the hand-off resolves true instead.
+        if (index < 0) return;
+        this.lockWaiters.splice(index, 1);
+        resolve(false);
+      }, ms);
+    });
+    return acquired;
+  }
+
   private release(): void {
     const next = this.lockWaiters.shift();
     if (next) next(); else this.locked = false;
@@ -275,18 +305,33 @@ export class CiWakeRuntime {
   }
 
   /**
+   * Registration admission. One poll step can hold the lock for several
+   * sequential GitHub reads; a registration that cannot take the lock within
+   * the admission bound gets a retriable refusal instead of outliving the
+   * host's 30-second tool-call timeout. It never queued, so nothing is audited.
+   */
+  private async admitted(fn: () => Promise<ToolResult>): Promise<ToolResult> {
+    if (!await this.tryAcquire(this.registrationAdmissionMs)) {
+      const { code, reason } = refusalDetail(new Error("ledger_busy"));
+      return { content: `CI registration refused: ${code}. ${reason}`, error: `CI registration refused: ${code}`, data: { code, reason } };
+    }
+    try { return await fn(); } finally { this.release(); }
+  }
+
+  /**
    * A full poll can run for the whole tick budget, longer than the host's
    * tool-call timeout. Between per-wait steps the poll persists its ledger and
    * lets queued registrations and webhooks run, then continues on a freshly
    * loaded ledger so their writes are never overwritten by a stale copy.
-   * Returns the ledger to continue with.
+   * Returns the ledger to continue with, or null when the save or reload
+   * failed: the caller must then stop without writing its stale copy.
    */
-  private async yieldToQueued(ledger: Ledger): Promise<Ledger> {
+  private async yieldToQueued(ledger: Ledger): Promise<Ledger | null> {
     if (!this.lockWaiters.length) return ledger;
-    await this.save(ledger);
+    try { await this.save(ledger); } catch { return null; }
     this.release();
     await this.acquire();
-    return this.load();
+    try { return await this.load(); } catch { return null; }
   }
 
   private async load(): Promise<Ledger> {
@@ -458,7 +503,7 @@ export class CiWakeRuntime {
   }
 
   async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
-    return this.serialized(async () => {
+    return this.admitted(async () => {
       // The ledger load lives inside the refusal boundary: a malformed
       // persisted ledger (invalid_ledger) or a host state-read failure must
       // return { code } instead of escaping as a rejection that could leak
@@ -643,9 +688,9 @@ export class CiWakeRuntime {
     let wakes = 0;
     // Reserve half of each count budget for reviewer work when both lanes
     // have work. The shared time budget remains an absolute limit.
-    const hasReviewerWork = Object.values(ledger.prHeadPending).some((e) => !only || e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha);
-    const ciRequestLimit = hasReviewerWork ? Math.floor(LIMITS.requestsPerTick / 2) : LIMITS.requestsPerTick;
-    const ciWakeLimit = hasReviewerWork ? Math.floor(LIMITS.wakePerTick / 2) : LIMITS.wakePerTick;
+    const hasReviewerWork = () => Object.values(ledger.prHeadPending).some((e) => !only || e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha);
+    let ciRequestLimit = hasReviewerWork() ? Math.floor(LIMITS.requestsPerTick / 2) : LIMITS.requestsPerTick;
+    let ciWakeLimit = hasReviewerWork() ? Math.floor(LIMITS.wakePerTick / 2) : LIMITS.wakePerTick;
     let requestLimit: number = ciRequestLimit;
     // Tokens are reusable only within this bounded poll, never a runtime field/state.
     const cycle = new Map<string, CiAppAuth>();
@@ -659,7 +704,14 @@ export class CiWakeRuntime {
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const queued of pending) {
       if (requests >= ciRequestLimit || wakes >= ciWakeLimit || this.now() - started >= LIMITS.tickMs) break;
-      ledger = await this.yieldToQueued(ledger);
+      const fresh = await this.yieldToQueued(ledger);
+      // A failed save or reload at a yield ends this poll without further writes.
+      if (!fresh) return;
+      ledger = fresh;
+      if (this.now() - started >= LIMITS.tickMs) break;
+      // A registration during the yield may have added reviewer work: reserve its share.
+      if (hasReviewerWork()) { ciRequestLimit = Math.min(ciRequestLimit, Math.floor(LIMITS.requestsPerTick / 2)); ciWakeLimit = Math.min(ciWakeLimit, Math.floor(LIMITS.wakePerTick / 2)); requestLimit = ciRequestLimit; }
+      if (requests >= ciRequestLimit || wakes >= ciWakeLimit) break;
       // A registration that ran during the yield may have superseded or retired this wait.
       const wait = ledger.waits.find((w) => w.waitId === queued.waitId);
       if (!wait || wait.status !== "open") continue;
@@ -780,7 +832,10 @@ export class CiWakeRuntime {
       const reviewerStartRequests = requests;
       for (const [key] of entries) {
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
-        ledger = await this.yieldToQueued(ledger);
+        const fresh = await this.yieldToQueued(ledger);
+        if (!fresh) return;
+        ledger = fresh;
+        if (this.now() - started >= LIMITS.tickMs) break;
         // A registration during the yield may have retargeted this entry to a newer head.
         const entry = ledger.prHeadPending[key];
         if (!entry || entry.pollOrder === undefined || (only && entry.newSha !== only.sha)) continue;
