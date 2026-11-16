@@ -15,7 +15,7 @@ jobs:
   retained-packages:
     name: Verify retained package inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,6 +39,15 @@ jobs:
               '.run_attempt == 1 and .head_sha == $source and .status == "completed" and .conclusion == "success"' <<< "$attempt" > /dev/null
             gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > "$RUNNER_TEMP/retained-archives/$kind.zip"
           done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: paperclipai/paperclip
+          ref: d69631b01b9c658f80bf8bed389863dce82643e1
+          path: stock-host
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.21.0
       - name: Test non-executing package verifier
         run: python3 -I qualification/cross-version/test_verify_retained.py
       - name: Verify and extract exact packages without executing workers
@@ -47,3 +56,44 @@ jobs:
           python3 -I qualification/cross-version/verify-retained.py installed "$RUNNER_TEMP/retained-archives/installed.zip" "$RUNNER_TEMP/installed-package"
           python3 -I qualification/cross-version/verify-retained.py previous "$RUNNER_TEMP/retained-archives/previous.zip" "$RUNNER_TEMP/previous-package"
           printf '%s\n' 'Package validation only; no rollback lifecycle was exercised.'
+      - name: Prepare pinned stock host
+        working-directory: stock-host
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = d69631b01b9c658f80bf8bed389863dce82643e1
+          test "$(git hash-object pnpm-lock.yaml)" = 95c28f080c25654038e6e4ed641a017835f7eea4
+          test "$(git hash-object packages/plugins/sdk/package.json)" = 1dd9473bdc6296126230ffd9320d480e0ae596b8
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          # Workers run in plain Node, so use the stock shared package's published
+          # exports rather than its workspace-only TypeScript source exports.
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const path = "packages/shared/package.json";
+            const manifest = JSON.parse(fs.readFileSync(path, "utf8"));
+            manifest.exports = manifest.publishConfig.exports;
+            fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + "\n");
+          '
+          for package in "$RUNNER_TEMP/installed-package" "$RUNNER_TEMP/previous-package"; do
+            mkdir -p "$package/node_modules/@paperclipai"
+            ln -s "$PWD/packages/plugins/sdk" "$package/node_modules/@paperclipai/plugin-sdk"
+          done
+          cp ../qualification/cross-version/stock-lifecycle.test.ts server/src/__tests__/stock-lifecycle.test.ts
+      - name: Run stock-manager rollback lifecycle rehearsal
+        working-directory: stock-host
+        env:
+          INSTALLED_PACKAGE_ROOT: ${{ runner.temp }}/installed-package
+          PREVIOUS_PACKAGE_ROOT: ${{ runner.temp }}/previous-package
+        run: |
+          set -euo pipefail
+          pnpm exec vitest run server/src/__tests__/stock-lifecycle.test.ts --reporter=verbose 2>&1 | tee "$RUNNER_TEMP/stock-lifecycle.log"
+          printf '%s\n' 'Disposable synthetic-effects lifecycle passed; production rollback is not exercised.'
+      - name: Retain lifecycle output
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stock-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stock-lifecycle.log
+          if-no-files-found: warn
+          retention-days: 7
