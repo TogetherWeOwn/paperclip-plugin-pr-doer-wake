@@ -1841,7 +1841,7 @@ describe("CI wait identity and serialization", () => {
   });
 
   it("refuses an admitted near-threshold registration with registration_deadline before the whole-call budget ends", async () => {
-    const h = setup({}, { registrationAdmissionMs: 40, registrationBudgetMs: 150 });
+    const h = setup({}, { registrationAdmissionMs: 1_000, registrationBudgetMs: 2_000 });
     await h.runtime.register(registration, run);
     const entered = deferred();
     const release = deferred();
@@ -1850,26 +1850,28 @@ describe("CI wait identity and serialization", () => {
       calls += 1;
       if (calls === 1) { entered.resolve(); await release.promise; return pull(); }
       // The admitted registration's own PR read is slow but within its per-request deadline.
-      await new Promise((done) => setTimeout(done, 400));
+      await new Promise((done) => setTimeout(done, 3_000));
       return pull({ headSha: NEXT_HEAD });
     });
-    h.resolveSecret.mockImplementation(async () => { await new Promise((done) => setTimeout(done, 60)); return TOKEN; });
+    h.resolveSecret.mockImplementation(async () => { await new Promise((done) => setTimeout(done, 200)); return TOKEN; });
     const poll = h.runtime.poll();
     await entered.promise;
     const started = performance.now();
     const pending = h.runtime.register({ ...registration, headSha: NEXT_HEAD }, run);
     // Admitted just before the admission bound expires.
-    setTimeout(() => release.resolve(), 30);
+    setTimeout(() => release.resolve(), 100);
     const result = await pending;
     const elapsed = performance.now() - started;
     await poll;
     expect(result).toMatchObject({ error: "CI registration refused: registration_deadline", data: { code: "registration_deadline" } });
-    expect(elapsed).toBeLessThan(300);
-    await new Promise((done) => setTimeout(done, 450));
-    // The late PR answer is discarded: no wait for the new head, refusal audited.
+    expect(elapsed).toBeGreaterThanOrEqual(1_900);
+    expect(elapsed).toBeLessThan(2_900);
+    await new Promise((done) => setTimeout(done, 1_600));
+    // The late PR answer is discarded: no wait for the new head. With the budget spent, the
+    // refusal skips its full-ledger audit write instead of risking the host deadline.
     expect(h.ledger().waits.map((wait) => wait.headSha)).toEqual([HEAD]);
-    expect(h.ledger().audits.filter((entry) => entry.operation === "register").map((entry) => entry.outcome)).toContain("registration_deadline");
-  });
+    expect(h.ledger().audits.filter((entry) => entry.operation === "register").map((entry) => entry.outcome)).not.toContain("registration_deadline");
+  }, 10_000);
 
   it("ends the poll without writing a stale ledger when the save at a yield fails", async () => {
     const { h } = twoWaitSetup(NEXT_HEAD);

@@ -11,7 +11,7 @@ function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
 }
 
-export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, registrationAdmissionMs: 3_000, registrationBudgetMs: 25_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
+export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, registrationAdmissionMs: 3_000, registrationBudgetMs: 22_000, registrationAuditFloorMs: 3_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
 export interface CiWakeRuntimeOptions {
   /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
   secretResolveTimeoutMs?: number;
@@ -23,8 +23,8 @@ export interface CiWakeRuntimeOptions {
   registrationAdmissionMs?: number;
   /**
    * Whole-call budget for one registration, counted from arrival: admission
-   * plus every read it makes. Default 25 seconds, at most 28, under the host's
-   * 30-second tool-call timeout.
+   * plus every read it makes. Default 22 seconds, at most 25, leaving the host's
+   * 30-second tool-call timeout room for the final ledger write.
    */
   registrationBudgetMs?: number;
 }
@@ -253,7 +253,7 @@ export class CiWakeRuntime {
     if (!Number.isSafeInteger(admissionMs) || admissionMs < 1 || admissionMs > 5_000) throw new Error("invalid_registration_admission");
     this.registrationAdmissionMs = admissionMs;
     const budgetMs = options.registrationBudgetMs ?? LIMITS.registrationBudgetMs;
-    if (!Number.isSafeInteger(budgetMs) || budgetMs < admissionMs || budgetMs > 28_000) throw new Error("invalid_registration_budget");
+    if (!Number.isSafeInteger(budgetMs) || budgetMs < admissionMs || budgetMs > 25_000) throw new Error("invalid_registration_budget");
     this.registrationBudgetMs = budgetMs;
   }
 
@@ -323,9 +323,11 @@ export class CiWakeRuntime {
    * Once admitted, the body races each host or GitHub read against what is
    * left of the whole-call budget (`within`); a read that loses throws the
    * retriable registration_deadline refusal while the lock is still held, and
-   * its late result is discarded without any ledger write.
+   * its late result is discarded without any ledger write. (A late GitHub
+   * answer may still update the shared response cache and rate-limit backoff,
+   * which record real GitHub state, never the ledger.)
    */
-  private async admitted(fn: (within: <T>(read: Promise<T>) => Promise<T>) => Promise<ToolResult>): Promise<ToolResult> {
+  private async admitted(fn: (within: <T>(read: Promise<T>) => Promise<T>, left: () => number) => Promise<ToolResult>): Promise<ToolResult> {
     const arrived = performance.now();
     const left = () => this.registrationBudgetMs - (performance.now() - arrived);
     if (!await this.tryAcquire(Math.max(1, Math.min(this.registrationAdmissionMs, Math.floor(left()))))) {
@@ -344,7 +346,7 @@ export class CiWakeRuntime {
         if (timer !== undefined) clearTimeout(timer);
       }
     };
-    try { return await fn(within); } finally { this.release(); }
+    try { return await fn(within, left); } finally { this.release(); }
   }
 
   /**
@@ -532,7 +534,7 @@ export class CiWakeRuntime {
   }
 
   async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
-    return this.admitted(async (within) => {
+    return this.admitted(async (within, left) => {
       // The ledger load lives inside the refusal boundary: a malformed
       // persisted ledger (invalid_ledger) or a host state-read failure must
       // return { code } instead of escaping as a rejection that could leak
@@ -607,7 +609,8 @@ export class CiWakeRuntime {
         // channel) and `data`; the audit row records both for triage.
         const { code, reason, auditDetail } = refusalDetail(error);
         const content = `CI registration refused: ${code}. ${reason}`;
-        if (ledger === undefined) return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
+        // Too little budget left for a full-ledger write: return the code unaudited.
+        if (ledger === undefined || left() < LIMITS.registrationAuditFloorMs) return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
         // Refusal auditing is best-effort: a state-write failure must not
         // replace the sanitized refusal with a host exception.
         try {
