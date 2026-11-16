@@ -44,7 +44,7 @@ function fixture() {
     seed: () => {
       const receipts: Record<string, unknown> = { target: { at: NOW - 1000, status: "woken" }, pending: { at: NOW, status: "pending" }, uncertain: { at: NOW, status: "unconfirmed", phase: "wake" } };
       const dispositions: Record<string, number> = { target: NOW - 2000 };
-      for (let i = 0; i < 19_870; i++) { receipts[`history-${i}`] = { at: NOW, status: "cleared" }; dispositions[`history-${i}`] = NOW; }
+      for (let i = 0; i < 19_871; i++) { receipts[`history-${i}`] = { at: NOW, status: "cleared" }; dispositions[`history-${i}`] = NOW; }
       state.set(JSON.stringify(ledgerKey), { version: 1, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions, receipts, audits: [] });
     },
     ledger: () => state.get(JSON.stringify(ledgerKey)),
