@@ -62,8 +62,8 @@ it("preserves migration and instance state across installed, previous, and resto
     if (parsed.pathname === `/repos/${repo}/pulls/17`) body = { number: 17, state: "open", draft: false, merged: false, mergeable: true, user: { login: "fixture" }, head: { sha, ref: "feature", repo: { full_name: repo } }, base: { ref: "main", repo: { full_name: repo } } };
     else if (parsed.pathname === `/repos/${repo}/rules/branches/main`) body = [];
     else if (parsed.pathname === `/repos/${repo}/branches/main/protection/required_status_checks`) body = { contexts: ["build"] };
-    else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-runs`) body = { check_runs: [] };
-    else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-suites`) body = { check_suites: [] };
+    else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-runs`) body = { total_count: 0, check_runs: [] };
+    else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-suites`) body = { total_count: 0, check_suites: [] };
     else if (parsed.pathname === `/repos/${repo}/commits/${sha}/statuses`) body = [{ id: 1, context: "build", state: "success" }];
     else throw new Error(`unexpected synthetic endpoint ${parsed.pathname}`);
     return { status: 200, statusText: "OK", headers: {}, body: JSON.stringify(body) };
