@@ -307,8 +307,8 @@ describe("coverage, summary and cursor controls", () => {
   it("surfaces UNKNOWN as a failed job run with the reason recorded, never silent success", async () => {
     const h = fixture();
     vi.mocked(loadCustodyCards).mockRejectedValue(new Error("incomplete"));
-    await expect(h.runtime.poll()).rejects.toThrow("incomplete");
-    expect(h.ledger().report).toMatchObject({ complete: false, unknown: ["inventory"], failure: "incomplete" });
+    await expect(h.runtime.poll()).rejects.toThrow("custody_inventory_failed:other");
+    expect(h.ledger().report).toMatchObject({ complete: false, unknown: ["inventory"], unknownReasons: ["other"], failure: "other" });
     expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
@@ -849,7 +849,7 @@ describe("coverage, summary and cursor controls", () => {
       if (key.stateKey.includes(":receipt:")) throw new Error("archive reply failed");
       return set(key, value);
     });
-    await expect(h.restart().poll()).rejects.toThrow("archive reply failed");
+    await expect(h.restart().poll()).rejects.toThrow("custody_inventory_failed:other");
     expect(h.ledger().dispositions).toEqual(clocks);
     expect(h.ledger().report.complete).toBe(false);
     h.ctx.state.set.mockImplementation(set);
@@ -871,7 +871,7 @@ describe("coverage, summary and cursor controls", () => {
     const h = fixture({ cards: [owner] }); await h.runtime.poll();
     const clocks = structuredClone(h.ledger().dispositions); for (let i = 0; i < 19_999; i++) h.ledger().dispositions[`history-${i}`] = NOW;
     const set = h.ctx.state.set.getMockImplementation()!; h.ctx.state.set.mockImplementation(async (key, value) => { if (key.stateKey.includes(":disposition:")) throw new Error("archive failed"); return set(key, value); });
-    await expect(h.restart().poll()).rejects.toThrow("archive failed"); expect(h.ledger().dispositions).toMatchObject(clocks);
+    await expect(h.restart().poll()).rejects.toThrow("custody_inventory_failed:other"); expect(h.ledger().dispositions).toMatchObject(clocks);
     h.ctx.state.set.mockImplementation(set); await h.restart().poll(); expect(h.ledger().report.complete).toBe(true);
   });
   it("isolates physical-line clocks when one of two directives gains a comment", async () => {
@@ -1060,11 +1060,11 @@ describe("coverage, summary and cursor controls", () => {
     });
     // The archive failure surfaces as a failed run (never silent success)
     // and must not evict the hot tombstone it failed to archive.
-    await expect(h.restart().poll()).rejects.toThrow("archive reply failed");
+    await expect(h.restart().poll()).rejects.toThrow("custody_inventory_failed:other");
     expect(Object.keys(h.ledger().receipts)).toHaveLength(20_000);
     expect(h.ledger().receipts[`example/project#42|idle|${NOW - 8 * DAY}`].status).toBe("woken");
     expect(h.ledger().report.complete).toBe(false);
-    expect(h.ledger().report.failure).toBe("archive reply failed");
+    expect(h.ledger().report.failure).toBe("other");
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
   });
   it("coalesces overlapping scheduled callbacks into one tick", async () => {
@@ -1305,6 +1305,31 @@ describe("work-product discovery from a cold ledger", () => {
     h.listing.mockClear();
     await h.restart().poll();
     expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+  });
+  it("retains priority when an admitted evidence operation reaches the request gate", async () => {
+    const h = fixture({ dryRun: true });
+    h.seedHead.mockImplementationOnce(async function (this: any) {
+      h.advance(210_000);
+      await this.attempt("https://api.github.com/graphql", {});
+      return NOW;
+    });
+    await h.runtime.poll();
+    expect(h.ledger().attempted["example/project"]).toBeUndefined();
+    expect(h.ledger().report.unknown).toEqual(["example/project#42"]);
+    expect(h.ledger().report.unknownReasons).toEqual(["inventory_budget"]);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    await h.restart().poll();
+    expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_000);
+    expect(h.ledger().report.complete).toBe(true);
+  });
+  it("classifies unexpected evidence errors without retaining their contents", async () => {
+    const h = fixture({ dryRun: true });
+    h.seedHead.mockRejectedValue(new Error("secret https://example.invalid/token"));
+    await h.runtime.poll();
+    expect(h.ledger().report.unknownReasons).toEqual(["other"]);
+    expect(h.ledger().report.complete).toBe(false);
+    expect(JSON.stringify([...h.state.values(), h.ctx.logger.info.mock.calls])).not.toContain("secret https://example.invalid/token");
   });
   it("treats workProducts omitted on every read as tier-unavailable: no UNKNOWN, effects not deferred", async () => {
     // Paperclip 1106 omits workProducts from issue reads; plugins cannot read

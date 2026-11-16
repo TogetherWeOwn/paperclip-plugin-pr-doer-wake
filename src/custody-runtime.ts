@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { retryableBeforeQueue } from "./native-wake.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
-import { CiGithubCache } from "./ci-github.js";
+import { CiGithubCache, CiGithubError } from "./ci-github.js";
 import { workspaceRepo, UUID } from "./ci-config.js";
 import { parseCustodyConfig, type CustodyConfig } from "./custody-config.js";
 import { CustodyAppAuth } from "./custody-auth.js";
@@ -16,6 +16,19 @@ type Receipt = { at: number; turn?: number; status: "pending" | "attempting" | "
 function delivered(receipt: Receipt): boolean { return receipt.status === "woken"; }
 interface InventoryRow { pr: string; state: string; cardId: string | null; mapping: string; triggers: string[]; unknown?: boolean }
 interface Audit { at: number; operation: string; outcome: string; key?: string }
+type UnknownReason = "inventory_budget" | "tick_budget" | "github_budget" | "github_backoff" | "github_auth" | "github_http" | "github_network" | "github_timeout" | "github_response" | "github_pages" | "head_evidence_missing" | "work_product" | "disposition" | "dispatch" | "other";
+function unknownReason(error: unknown, fallback: UnknownReason = "other"): UnknownReason {
+  if (error instanceof Error) {
+    if (error.message === "inventory_budget" || error.message === "custody_request_budget") return "inventory_budget";
+    if (error.message === "custody_tick_budget") return "tick_budget";
+  }
+  if (error instanceof CiGithubError) {
+    switch (error.code) {
+      case "budget": case "backoff": case "auth": case "http": case "network": case "timeout": case "response": case "pages": return `github_${error.code}`;
+    }
+  }
+  return fallback;
+}
 interface Ledger {
   version: 1;
   receipts: Record<string, Receipt>;
@@ -31,7 +44,7 @@ interface Ledger {
   // and candidate text loads to PR count, not company history size.
   prToCards: Record<string, string>;
   audits: Audit[];
-  report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; effects: number; failure?: string };
+  report: { at: number; complete: boolean; rows: InventoryRow[]; unknown: string[]; unknownReasons?: UnknownReason[]; effects: number; failure?: string };
 }
 const empty = (now: number): Ledger => ({ version: 1, receipts: {}, cursors: {}, attempted: {}, activityAfter: {}, dispatchSequence: 0, heads: {}, dispositions: {}, prToCards: {}, audits: [], report: { at: now, complete: false, rows: [], unknown: [], effects: 0 } });
 
@@ -151,7 +164,7 @@ export class CustodyRuntime {
     ledger.prToCards ??= {};
     ledger.dispatchSequence ??= 0;
     for (const receipt of Object.values(ledger.receipts)) if (receipt.status === "attempting") receipt.status = "unconfirmed";
-    ledger.report = { at: this.now(), complete: false, rows: [], unknown: [], effects: 0 };
+    ledger.report = { at: this.now(), complete: false, rows: [], unknown: [], unknownReasons: [], effects: 0 };
     const started = this.now();
     let reads = 0;
     let dispatching = false;
@@ -202,7 +215,13 @@ export class CustodyRuntime {
         if (++moved >= 128) break;
       }
     };
-    const unknown = (scope: string) => { if (!ledger.report.unknown.includes(scope)) ledger.report.unknown.push(scope); };
+    // Reasons are fixed vocabulary, aligned by index with the existing unknown scopes.
+    const unknown = (scope: string, reason: UnknownReason = "other") => {
+      if (!ledger.report.unknown.includes(scope)) {
+        ledger.report.unknown.push(scope);
+        ledger.report.unknownReasons!.push(reason);
+      }
+    };
     try {
       guard();
       const current = parseCustodyConfig(await this.ctx.config.get(config.companyId));
@@ -290,7 +309,7 @@ export class CustodyRuntime {
           const closed = await github.pulls(repo, "closed", ledger.cursors[repo] ?? config.closedSince);
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
           inventories.set(repo, { open, closed, until });
-        } catch { unknown(repo); }
+        } catch (error) { unknown(repo, unknownReason(error)); }
       }
       // Phase B: explicit-tier mapping over metadata only, then bounded
       // evidence loads for mapped candidates only.
@@ -332,21 +351,21 @@ export class CustodyRuntime {
           // issue the snapshot still lists). Such a card yields no work-product
           // data, exactly like an omitted field, so it joins the tier decision below.
           if (fresh === null) { omitted.push(cardId); continue; }
-          if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
+          if (!fresh || fresh.companyId !== config.companyId) { unknown(`work_product:${cardId}`, "work_product"); enrichmentUnknown = true; continue; }
           // The host omits workProducts from issue reads (Paperclip 1106); see
           // the tier decision after this loop. A present but malformed field fails closed.
           if (!("workProducts" in fresh) || (fresh as { workProducts?: unknown }).workProducts === undefined) { omitted.push(cardId); continue; }
           tierServed = true;
           const bindings = parseWorkProductBindings((fresh as { workProducts?: unknown }).workProducts);
-          if (bindings === null) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; continue; }
+          if (bindings === null) { unknown(`work_product:${cardId}`, "work_product"); enrichmentUnknown = true; continue; }
           card.workProducts = bindings;
-        } catch { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
+        } catch { unknown(`work_product:${cardId}`, "work_product"); enrichmentUnknown = true; }
       }
       // Omitted or unreadable on every read: the tier is unavailable, so map
       // through the remaining tiers. Served on some reads: an unread binding
       // could outrank a lower-tier match, so those cards are UNKNOWN and
       // effects are deferred.
-      if (omitted.length && tierServed) for (const cardId of omitted) { unknown(`work_product:${cardId}`); enrichmentUnknown = true; }
+      if (omitted.length && tierServed) for (const cardId of omitted) { unknown(`work_product:${cardId}`, "work_product"); enrichmentUnknown = true; }
       else if (omitted.length) audit("inventory", "work_product_tier_unavailable");
       const candidates = new Map<string, CustodyCard>();
       const seenPrs = new Set<string>();
@@ -391,7 +410,7 @@ export class CustodyRuntime {
             const owner = mapping.card;
             let disposition: Disposition | null;
             try { disposition = await this.dispositionClock(owner, pr, ledger, async (id) => await archived("disposition", id) as number | null); }
-            catch { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr)); continue; }
+            catch (error) { if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr), unknownReason(error, "disposition")); continue; }
             let activity: number | null = null;
             let closure: string[] | null = null;
             try {
@@ -459,14 +478,15 @@ export class CustodyRuntime {
                 }
                 if (head.at === null) {
                   row.unknown = true;
-                  unknown(prReference(pr));
+                  unknown(prReference(pr), "head_evidence_missing");
                 } else {
                   activity = await github.activity(pr, head.at);
                 }
               } else if (!pr.merged) closure = await github.closureTexts(pr);
             } catch (error) {
-              if (error instanceof Error && error.message === "inventory_budget") budgetDenied = true;
-              if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr));
+              const reason = unknownReason(error);
+              if (reason === "inventory_budget" || reason === "tick_budget" || reason === "github_budget") budgetDenied = true;
+              if (pr.state === "closed") complete = false; row.unknown = true; unknown(prReference(pr), reason);
             }
             // Missing activity cannot erase an independently established terminal-card trigger.
             const triggers = custodyTriggers(pr, owner, activity, closure, this.now(), disposition);
@@ -479,7 +499,7 @@ export class CustodyRuntime {
           // stamping a Phase B-starved repo would freshen its stamp so it
           // sorts last again next tick and never advances.
           if (!budgetDenied) ledger.attempted[repo] = this.now();
-        } catch { unknown(repo); }
+        } catch (error) { unknown(repo, unknownReason(error)); }
       }
       // Persist discovery clocks/removals as one batch before any effect can depend on them.
       await save();
@@ -610,11 +630,12 @@ export class CustodyRuntime {
       // Surface the reason as a failed job run, never as silent success
       // (TWO-5928): record it in the ledger report, persist best-effort,
       // then rethrow so the scheduler records this run as failed.
-      unknown("inventory");
-      ledger.report.failure = error instanceof Error ? error.message : String(error);
+      const reason = unknownReason(error);
+      unknown("inventory", reason);
+      ledger.report.failure = reason;
       audit("inventory", "unknown");
-      try { await save(); } catch { /* The rethrown error is the failure signal. */ }
-      throw error;
+      try { await save(); } catch { /* The sanitized error is the failure signal. */ }
+      throw new Error(`custody_inventory_failed:${reason}`);
     }
     this.ctx.logger.info("pr-custody: inventory", { complete: ledger.report.complete, prs: ledger.report.rows.length, unknown: ledger.report.unknown.length, effects: ledger.report.effects, dryRun: config.dryRun });
   }
