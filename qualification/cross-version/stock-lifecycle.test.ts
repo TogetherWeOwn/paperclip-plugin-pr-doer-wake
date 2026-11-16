@@ -1,5 +1,5 @@
 // Copied into the pinned stock host's server tests by Actions.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
@@ -40,40 +40,50 @@ it("preserves migration and instance state across installed, previous, and resto
   const wakeups: any[] = [];
   const requests: string[] = [];
   let waitId: string;
+  let ambiguousWaitId: string;
   expect(manifests.map((m) => m.id)).toEqual(Array(roots.length).fill("togetherweown.pr-doer-wake"));
   await db.insert(companies).values({ id: companyId, name: "Synthetic company", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
   await db.insert(plugins).values({ id: pluginId, pluginKey: manifests[0].id, packageName: "@togetherweown/paperclip-plugin-pr-doer-wake", version: manifests[0].version, apiVersion: 1, manifestJson: manifests[0] });
   const config = { enabled: true, dryRun: false, allowedRepos: [repo], githubTokenSecretRef: { type: "secret_ref", secretId: randomUUID() } };
-  const registry = pluginRegistryService(db);
-  await registry.upsertConfig(pluginId, companyId, { configJson: config });
+  await pluginRegistryService(db).upsertConfig(pluginId, companyId, { configJson: config });
   const events = { forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }) };
-  const services = buildHostServices(db, pluginId, manifests[0].id, events as any);
-  services.secrets.resolve = async () => "synthetic-token";
-  services.issues.get = async () => ({ id: issueId, companyId, projectId: runContext.projectId, executionWorkspaceId: workspaceId }) as any;
-  services.issues.assertCheckoutOwner = async () => undefined as any;
-  services.executionWorkspaces.get = async () => ({ id: workspaceId, companyId, projectId: runContext.projectId, repoUrl: `https://github.com/${repo}.git`, branchName: "feature" }) as any;
-  services.issues.requestWakeup = async (params) => { wakeups.push(params); return { queued: true } as any; };
-  services.issues.requestWakeups = async () => { throw new Error("unexpected wake requests"); };
-  services.http.fetch = async ({ url, init }) => {
-    const parsed = new URL(url);
-    if (parsed.origin !== "https://api.github.com" || (init?.method && init.method !== "GET")) throw new Error("unexpected HTTP request");
-    requests.push(parsed.pathname);
-    let body: unknown;
-    if (parsed.pathname === `/repos/${repo}/pulls/17`) body = { number: 17, state: "open", draft: false, merged: false, mergeable: true, user: { login: "fixture" }, head: { sha, ref: "feature", repo: { full_name: repo } }, base: { ref: "main", repo: { full_name: repo } } };
-    else if (parsed.pathname === `/repos/${repo}/rules/branches/main`) body = [];
-    else if (parsed.pathname === `/repos/${repo}/branches/main/protection/required_status_checks`) body = { contexts: ["build"] };
-    else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-runs`) body = { total_count: 0, check_runs: [] };
-    else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-suites`) body = { total_count: 0, check_suites: [] };
-    else if (parsed.pathname === `/repos/${repo}/commits/${sha}/statuses`) body = [{ id: 1, context: "build", state: "success" }];
-    else throw new Error(`unexpected synthetic endpoint ${parsed.pathname}`);
-    return { status: 200, statusText: "OK", headers: {}, body: JSON.stringify(body) };
-  };
-  const database = pluginDatabaseService(db);
   const manager = createPluginWorkerManager();
   let previousLedger: unknown[] | undefined;
   let previousState: any;
   try {
     for (const [index, root] of roots.entries()) {
+      const registry = pluginRegistryService(db);
+      const services = buildHostServices(db, pluginId, manifests[0].id, events as any);
+      services.secrets.resolve = async () => "synthetic-token";
+      services.issues.get = async () => ({ id: issueId, companyId, projectId: runContext.projectId, executionWorkspaceId: workspaceId }) as any;
+      services.issues.assertCheckoutOwner = async () => undefined as any;
+      services.executionWorkspaces.get = async () => ({ id: workspaceId, companyId, projectId: runContext.projectId, repoUrl: `https://github.com/${repo}.git`, branchName: "feature" }) as any;
+      services.issues.requestWakeup = async (params) => {
+        wakeups.push(params);
+        if (wakeups.length === 1) throw new Error("synthetic reply lost after dispatch");
+        return { queued: true } as any;
+      };
+      services.issues.requestWakeups = async () => { throw new Error("unexpected wake requests"); };
+      services.http.fetch = async ({ url, init }) => {
+        const parsed = new URL(url);
+        if (parsed.origin !== "https://api.github.com" || (init?.method && init.method !== "GET")) throw new Error("unexpected HTTP request");
+        requests.push(parsed.pathname);
+        let body: unknown;
+        if (parsed.pathname === `/repos/${repo}/pulls/17`) body = { number: 17, state: "open", draft: false, merged: false, mergeable: true, user: { login: "fixture" }, head: { sha, ref: "feature", repo: { full_name: repo } }, base: { ref: "main", repo: { full_name: repo } } };
+        else if (parsed.pathname === `/repos/${repo}/rules/branches/main`) body = [];
+        else if (parsed.pathname === `/repos/${repo}/branches/main/protection/required_status_checks`) body = { contexts: ["build"] };
+        else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-runs`) body = { total_count: 0, check_runs: [] };
+        else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-suites`) body = { total_count: 0, check_suites: [] };
+        else if (parsed.pathname === `/repos/${repo}/commits/${sha}/statuses`) body = [{ id: 1, context: "build", state: "success" }];
+        else throw new Error(`unexpected synthetic endpoint ${parsed.pathname}`);
+        return { status: 200, statusText: "OK", headers: {}, body: JSON.stringify(body) };
+      };
+      const archiveId = "synthetic-completed-receipt";
+      const archiveKey = { scopeKind: "company" as const, scopeId: companyId, namespace: "pr-custody-v1", stateKey: `example:live:receipt:${createHash("sha256").update(archiveId).digest("hex")}` };
+      const archiveValue = { version: 1, key: archiveId, value: { at: 1, status: "woken" } };
+      if (index === 0) await services.state.set({ ...archiveKey, value: archiveValue });
+      expect(await services.state.get(archiveKey)).toEqual(archiveValue);
+      const database = pluginDatabaseService(db);
       const manifest = manifests[index];
       const namespace = await database.applyMigrations(pluginId, manifest, root);
       expect(namespace?.namespaceName).toBe("plugin_pr_custody_2a97cdbae1");
@@ -110,8 +120,14 @@ it("preserves migration and instance state across installed, previous, and resto
         if (index === 0) {
           const result = await manager.call(manifest.id, "executeTool", { toolName: "ci_wait_register", parameters: { issueId, repo, prNumber: 17, headSha: sha }, runContext });
           expect(result.data).toMatchObject({ status: "open" });
-          waitId = result.data.waitId as string;
+          ambiguousWaitId = result.data.waitId as string;
+          expect(ambiguousWaitId).toBeTruthy();
+          await manager.call(manifest.id, "runJob", { job: { jobKey: "ci-wake-poll", runId: randomUUID(), trigger: "manual", scheduledAt: new Date().toISOString() } });
+          const pending = await manager.call(manifest.id, "executeTool", { toolName: "ci_wait_register", parameters: { issueId, repo, prNumber: 17, headSha: sha }, runContext: { ...runContext, runId: randomUUID() } });
+          expect(pending.data).toMatchObject({ status: "open" });
+          waitId = pending.data.waitId as string;
           expect(waitId).toBeTruthy();
+          expect(waitId).not.toBe(ambiguousWaitId);
         } else {
           await manager.call(manifest.id, "runJob", { job: { jobKey: "ci-wake-poll", runId: randomUUID(), trigger: "manual", scheduledAt: new Date().toISOString() } });
         }
@@ -120,22 +136,28 @@ it("preserves migration and instance state across installed, previous, and resto
         const wait = (row?.valueJson as any)?.waits.find((entry: any) => entry.waitId === waitId);
         console.info("rollback-poll", JSON.stringify({ phase: index, wait, audits: (row?.valueJson as any)?.audits, requests, wakeups: wakeups.length }));
         expect(wait).toMatchObject({ waitId, issueId, companyId, repo, prNumber: 17, headSha: sha, status: index === 0 ? "open" : "woken" });
-        expect(wakeups).toHaveLength(index === 0 ? 0 : 1);
+        expect((row?.valueJson as any)?.waits.find((entry: any) => entry.waitId === ambiguousWaitId)).toMatchObject({ status: "unconfirmed" });
+        expect(wakeups).toHaveLength(index === 0 ? 1 : 2);
         console.info("rollback-start", JSON.stringify({ phase: index, pluginId, configuredCompanies: configRows.map((row) => row.companyId), namespace: namespace!.namespaceName, pid: started.pid, ledger: ledger.map(({ migrationKey, checksum, status }) => ({ migrationKey, checksum, status })), stateRows: previousState.length }));
       } finally {
         await manager.stopWorker(manifest.id);
         const stopped = handle.diagnostics();
         console.info("rollback-stop", JSON.stringify({ phase: index, status: stopped.status, pid: stopped.pid, pendingRequests: stopped.pendingRequests }));
         expect(stopped).toMatchObject({ status: "stopped", pid: null, pendingRequests: 0 });
+        services.dispose();
       }
+      await db.$client.end({ timeout: 5 });
+      db = createDb(tempDb.connectionString);
+      console.info("rollback-reconnect", JSON.stringify({ phase: index }));
     }
-    expect(wakeups[0]).toMatchObject({ issueId, companyId, contextSource: "plugin.ci-wake", idempotencyKey: `ci-wake:${repo}:${sha}:${waitId!}` });
-    expect(wakeups[0].reason).toMatch(/^CI pass example\/project@aaaaaaa/);
+    expect(wakeups[0]).toMatchObject({ issueId, companyId, idempotencyKey: `ci-wake:${repo}:${sha}:${ambiguousWaitId!}` });
+    expect(wakeups[1]).toMatchObject({ issueId, companyId, contextSource: "plugin.ci-wake", idempotencyKey: `ci-wake:${repo}:${sha}:${waitId!}` });
+    expect(wakeups[1].reason).toMatch(/^CI pass example\/project@aaaaaaa/);
     expect(requests).toContain(`/repos/${repo}/commits/${sha}/statuses`);
     const result = await db.execute(sql`select count(*)::int as count from plugin_pr_custody_2a97cdbae1.release_lifecycle`);
     expect(Array.from(result)[0]).toMatchObject({ count: 1 });
   } finally {
     await manager.stopAll();
-    services.dispose();
+    await db.$client.end({ timeout: 5 });
   }
 }, 180_000);
