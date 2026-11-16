@@ -1658,6 +1658,17 @@ describe("CI wait identity and serialization", () => {
     }));
   });
 
+  it("persists a binding-changed retirement even when too little budget remains for refusal audits", async () => {
+    const h = setup({}, { registrationAdmissionMs: 1_000, registrationBudgetMs: 2_000 });
+    await h.runtime.register(registration, run);
+    h.issue.executionWorkspaceId = OTHER;
+    h.workspace.id = OTHER;
+    // Slow but in-budget binding reads leave less than the audit floor.
+    h.workspaceGet.mockImplementation(async () => { await new Promise((done) => setTimeout(done, 300)); return clone(h.workspace); });
+    expect(await h.runtime.register(registration, run)).toMatchObject({ data: { code: "registration_requires_new_run" } });
+    expect(h.ledger().waits).toEqual([expect.objectContaining({ status: "retired", reason: "binding_changed" })]);
+  });
+
   it("refuses a same-run workspace replacement, retaining the retired wait instead of rearming its identity", async () => {
     const h = setup();
     const first = await h.runtime.register(registration, run);

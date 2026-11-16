@@ -609,8 +609,9 @@ export class CiWakeRuntime {
         // channel) and `data`; the audit row records both for triage.
         const { code, reason, auditDetail } = refusalDetail(error);
         const content = `CI registration refused: ${code}. ${reason}`;
-        // Too little budget left for a full-ledger write: return the code unaudited.
-        if (ledger === undefined || left() < LIMITS.registrationAuditFloorMs) return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
+        // Too little budget left for a full-ledger write: return the code unaudited, unless
+        // the refusal already changed the ledger (a binding-changed retirement must persist).
+        if (ledger === undefined || (left() < LIMITS.registrationAuditFloorMs && code !== "registration_requires_new_run")) return { content, error: `CI registration refused: ${code}`, data: { code, reason } };
         // Refusal auditing is best-effort: a state-write failure must not
         // replace the sanitized refusal with a host exception.
         try {
