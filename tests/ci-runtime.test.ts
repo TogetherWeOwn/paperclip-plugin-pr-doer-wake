@@ -86,7 +86,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function setup(overrides: Record<string, unknown> = {}, runtimeOptions?: { secretResolveTimeoutMs?: number; registrationAdmissionMs?: number }) {
+function setup(overrides: Record<string, unknown> = {}, runtimeOptions?: { secretResolveTimeoutMs?: number; registrationAdmissionMs?: number; registrationBudgetMs?: number }) {
   let durable: Ledger | null = null;
   let now = START;
   let failWakingWrite = false;
@@ -1838,6 +1838,37 @@ describe("CI wait identity and serialization", () => {
     await poll;
     expect(h.ledger().audits.slice(auditsBefore).some((entry) => entry.operation === "register")).toBe(false);
     expect(await h.runtime.register(registration, run)).toMatchObject({ content: "CI wait already registered" });
+  });
+
+  it("refuses an admitted near-threshold registration with registration_deadline before the whole-call budget ends", async () => {
+    const h = setup({}, { registrationAdmissionMs: 40, registrationBudgetMs: 150 });
+    await h.runtime.register(registration, run);
+    const entered = deferred();
+    const release = deferred();
+    let calls = 0;
+    github.pull.mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) { entered.resolve(); await release.promise; return pull(); }
+      // The admitted registration's own PR read is slow but within its per-request deadline.
+      await new Promise((done) => setTimeout(done, 400));
+      return pull({ headSha: NEXT_HEAD });
+    });
+    h.resolveSecret.mockImplementation(async () => { await new Promise((done) => setTimeout(done, 60)); return TOKEN; });
+    const poll = h.runtime.poll();
+    await entered.promise;
+    const started = performance.now();
+    const pending = h.runtime.register({ ...registration, headSha: NEXT_HEAD }, run);
+    // Admitted just before the admission bound expires.
+    setTimeout(() => release.resolve(), 30);
+    const result = await pending;
+    const elapsed = performance.now() - started;
+    await poll;
+    expect(result).toMatchObject({ error: "CI registration refused: registration_deadline", data: { code: "registration_deadline" } });
+    expect(elapsed).toBeLessThan(300);
+    await new Promise((done) => setTimeout(done, 450));
+    // The late PR answer is discarded: no wait for the new head, refusal audited.
+    expect(h.ledger().waits.map((wait) => wait.headSha)).toEqual([HEAD]);
+    expect(h.ledger().audits.filter((entry) => entry.operation === "register").map((entry) => entry.outcome)).toContain("registration_deadline");
   });
 
   it("ends the poll without writing a stale ledger when the save at a yield fails", async () => {

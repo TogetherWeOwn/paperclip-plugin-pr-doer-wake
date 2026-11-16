@@ -11,7 +11,7 @@ function authIdentity(config: CiConfig): string {
   return JSON.stringify([config.githubTokenSecretRef, config.githubApp]);
 }
 
-export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, registrationAdmissionMs: 3_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
+export const LIMITS = { active: 300, retained: 8_000, audit: 5_000, deliveries: 10_000, reviewerWakes: 10_000, prHeadPending: 1_000, requestsPerTick: 3_600, wakePerTick: 100, waitMs: 7 * 86_400_000, retentionMs: 30 * 86_400_000, replayMs: 86_400_000, tickMs: 240_000, secretResolveMs: 15_000, registrationAdmissionMs: 3_000, registrationBudgetMs: 25_000, webhookPending: 32, webhookAdmissionPerMin: 240, webhookVerifyPerMin: 120, webhookHintsPerMin: 120, webhookDebounceMs: 10_000 } as const;
 export interface CiWakeRuntimeOptions {
   /** Per-secret-resolve deadline; default 15 seconds, at most 30 seconds (matches CiGithub). */
   secretResolveTimeoutMs?: number;
@@ -21,6 +21,12 @@ export interface CiWakeRuntimeOptions {
    * own bounded work, so it stays small against the host's 30-second timeout.
    */
   registrationAdmissionMs?: number;
+  /**
+   * Whole-call budget for one registration, counted from arrival: admission
+   * plus every read it makes. Default 25 seconds, at most 28, under the host's
+   * 30-second tool-call timeout.
+   */
+  registrationBudgetMs?: number;
 }
 const KEY = { scopeKind: "instance" as const, namespace: "ci-wake-v1", stateKey: "ledger" };
 type WaitStatus = "open" | "waking" | "woken" | "would_wake" | "unconfirmed" | "retired";
@@ -104,7 +110,7 @@ const REFUSAL_CODES = new Set([
   "binding_changed", "registration_requires_new_run", "wait_alias_capacity",
   "wait_capacity", "github_backoff", "github_backoff_capacity",
   "secret_resolution_timeout", "credential_unavailable",
-  "invalid_ledger", "ledger_busy", "registration_refused",
+  "invalid_ledger", "ledger_busy", "registration_deadline", "registration_refused",
 ]);
 
 function refusalCode(error: unknown): string {
@@ -149,6 +155,7 @@ const REFUSAL_REASONS: Record<string, string> = {
   credential_unavailable: "GitHub credential unavailable; retry shortly.",
   invalid_ledger: "The stored CI ledger is invalid; ask the operator to inspect it.",
   ledger_busy: "The CI ledger is busy with a poll step; retry registration in a few seconds.",
+  registration_deadline: "Registration ran out of time waiting on a host or GitHub read; retry shortly.",
   registration_refused: "Registration refused.",
 };
 
@@ -236,6 +243,7 @@ export class CiWakeRuntime {
 
   private readonly secretResolveTimeoutMs: number;
   private readonly registrationAdmissionMs: number;
+  private readonly registrationBudgetMs: number;
 
   constructor(private readonly ctx: PluginContext, private readonly now: () => number = Date.now, options: CiWakeRuntimeOptions = {}) {
     const timeoutMs = options.secretResolveTimeoutMs ?? LIMITS.secretResolveMs;
@@ -244,6 +252,9 @@ export class CiWakeRuntime {
     const admissionMs = options.registrationAdmissionMs ?? LIMITS.registrationAdmissionMs;
     if (!Number.isSafeInteger(admissionMs) || admissionMs < 1 || admissionMs > 5_000) throw new Error("invalid_registration_admission");
     this.registrationAdmissionMs = admissionMs;
+    const budgetMs = options.registrationBudgetMs ?? LIMITS.registrationBudgetMs;
+    if (!Number.isSafeInteger(budgetMs) || budgetMs < admissionMs || budgetMs > 28_000) throw new Error("invalid_registration_budget");
+    this.registrationBudgetMs = budgetMs;
   }
 
   /**
@@ -309,13 +320,31 @@ export class CiWakeRuntime {
    * sequential GitHub reads; a registration that cannot take the lock within
    * the admission bound gets a retriable refusal instead of outliving the
    * host's 30-second tool-call timeout. It never queued, so nothing is audited.
+   * Once admitted, the body races each host or GitHub read against what is
+   * left of the whole-call budget (`within`); a read that loses throws the
+   * retriable registration_deadline refusal while the lock is still held, and
+   * its late result is discarded without any ledger write.
    */
-  private async admitted(fn: () => Promise<ToolResult>): Promise<ToolResult> {
-    if (!await this.tryAcquire(this.registrationAdmissionMs)) {
+  private async admitted(fn: (within: <T>(read: Promise<T>) => Promise<T>) => Promise<ToolResult>): Promise<ToolResult> {
+    const arrived = performance.now();
+    const left = () => this.registrationBudgetMs - (performance.now() - arrived);
+    if (!await this.tryAcquire(Math.max(1, Math.min(this.registrationAdmissionMs, Math.floor(left()))))) {
       const { code, reason } = refusalDetail(new Error("ledger_busy"));
       return { content: `CI registration refused: ${code}. ${reason}`, error: `CI registration refused: ${code}`, data: { code, reason } };
     }
-    try { return await fn(); } finally { this.release(); }
+    const within = async <T>(read: Promise<T>): Promise<T> => {
+      // A late rejection after the deadline must not surface as unhandled.
+      read.catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([read, new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("registration_deadline")), Math.max(0, left()));
+        })]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    };
+    try { return await fn(within); } finally { this.release(); }
   }
 
   /**
@@ -503,7 +532,7 @@ export class CiWakeRuntime {
   }
 
   async register(params: unknown, run: ToolRunContext): Promise<ToolResult> {
-    return this.admitted(async () => {
+    return this.admitted(async (within) => {
       // The ledger load lives inside the refusal boundary: a malformed
       // persisted ledger (invalid_ledger) or a host state-read failure must
       // return { code } instead of escaping as a rejection that could leak
@@ -512,14 +541,14 @@ export class CiWakeRuntime {
       let ledger: Ledger | undefined;
       let waitId: string | undefined;
       try {
-        ledger = await this.load();
+        ledger = await within(this.load());
         this.compact(ledger);
         const registration = parseRegistration(params);
         if (![run.companyId, run.agentId, run.runId, run.projectId].every((s) => UUID.test(s))) throw new Error("invalid_run_context");
-        const config = await this.config(run.companyId);
+        const config = await within(this.config(run.companyId));
         if (!config.allowedRepos.includes(registration.repo)) throw new Error("repo_refused");
-        const actor = await this.registrationActor(registration.issueId, run);
-        const binding = await this.binding(registration, run.companyId, run.projectId);
+        const actor = await within(this.registrationActor(registration.issueId, run));
+        const binding = await within(this.binding(registration, run.companyId, run.projectId));
         waitId = createHash("sha256").update(JSON.stringify([run.companyId, run.runId, registration.issueId, registration.repo, registration.prNumber, registration.headSha])).digest("hex");
         const existing = ledger.waits.find((w) => w.waitId === waitId || w.aliases.includes(waitId!));
         if (existing) {
@@ -544,12 +573,12 @@ export class CiWakeRuntime {
         // Audit intent before resolving the credential or making any outbound request.
         this.audit(ledger, "register", "intent", run, waitId);
         await this.save(ledger);
-        const github = await this.client(run.companyId, config, registration.repo);
-        const pr = await github.pull(registration.repo, registration.prNumber);
+        const github = await within(this.client(run.companyId, config, registration.repo));
+        const pr = await within(github.pull(registration.repo, registration.prNumber));
         if (pr.number !== registration.prNumber || pr.state !== "open" || pr.merged || pr.headSha !== registration.headSha || pr.headRepo?.toLowerCase() !== registration.repo) throw new Error("pr_binding_refused");
         // Checkout ownership may have changed while GitHub answered.
-        if (await this.registrationActor(registration.issueId, run) !== actor) throw new Error("checkout_refused");
-        const current = await this.binding(registration, run.companyId, run.projectId);
+        if (await within(this.registrationActor(registration.issueId, run)) !== actor) throw new Error("checkout_refused");
+        const current = await within(this.binding(registration, run.companyId, run.projectId));
         if (current.workspaceId !== binding.workspaceId) throw new Error("binding_changed");
         // Custody binding proof, not a ci-wake gate: ci-wake still registers
         // repo-only registrations, but only a verified workspace-to-PR branch
