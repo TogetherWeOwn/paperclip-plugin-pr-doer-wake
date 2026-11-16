@@ -304,6 +304,26 @@ describe("custody native effects", () => {
 });
 
 describe("coverage, summary and cursor controls", () => {
+  it.each(["config", "state"] as const)("sanitizes an initial %s read failure without dispatch", async (source) => {
+    const h = fixture();
+    h.ctx[source].get.mockRejectedValueOnce(new Error("secret https://example.invalid/token"));
+    await expect(h.runtime.poll()).rejects.toThrow(/^custody_inventory_failed:other$/);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ctx.state.set).not.toHaveBeenCalled();
+  });
+  it("persists an incomplete report when the final save fails once", async () => {
+    const h = fixture({ dryRun: true, open: [] });
+    const save = h.ctx.state.set.getMockImplementation()!;
+    let failed = false;
+    h.ctx.state.set.mockImplementation(async (key, value) => {
+      if (!failed && value.report?.complete) { failed = true; throw new Error("secret storage error"); }
+      return save(key, value);
+    });
+    await expect(h.runtime.poll()).rejects.toThrow(/^custody_inventory_failed:other$/);
+    expect(failed).toBe(true);
+    expect(h.ledger().report).toMatchObject({ complete: false, unknown: ["inventory"], unknownReasons: ["other"], failure: "other" });
+    expect(JSON.stringify([...h.state.values()])).not.toContain("secret storage error");
+  });
   it("surfaces UNKNOWN as a failed job run with the reason recorded, never silent success", async () => {
     const h = fixture();
     vi.mocked(loadCustodyCards).mockRejectedValue(new Error("secret https://example.invalid/token"));

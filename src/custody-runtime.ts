@@ -29,6 +29,9 @@ function unknownReason(error: unknown, fallback: UnknownReason = "other"): Unkno
   }
   return fallback;
 }
+class CustodyInventoryFailure extends Error {
+  constructor(reason: UnknownReason) { super(`custody_inventory_failed:${reason}`); }
+}
 interface Ledger {
   version: 1;
   receipts: Record<string, Receipt>;
@@ -138,6 +141,14 @@ export class CustodyRuntime {
   }
 
   private async tick(): Promise<void> {
+    try { await this.tickInventory(); }
+    catch (error) {
+      if (error instanceof CustodyInventoryFailure) throw error;
+      throw new CustodyInventoryFailure(unknownReason(error));
+    }
+  }
+
+  private async tickInventory(): Promise<void> {
     // Fail closed without a captured company: never issue a company-less
     // config.get, which the installed host rejects during scheduled jobs.
     if (!this.custodyCompanyId) {
@@ -631,10 +642,11 @@ export class CustodyRuntime {
       // then rethrow so the scheduler records this run as failed.
       const reason = unknownReason(error);
       unknown("inventory", reason);
+      ledger.report.complete = false;
       ledger.report.failure = reason;
       audit("inventory", "unknown");
       try { await save(); } catch { /* The sanitized error is the failure signal. */ }
-      throw new Error(`custody_inventory_failed:${reason}`);
+      throw new CustodyInventoryFailure(reason);
     }
     this.ctx.logger.info("pr-custody: inventory", { complete: ledger.report.complete, prs: ledger.report.rows.length, unknown: ledger.report.unknown.length, effects: ledger.report.effects, dryRun: config.dryRun });
   }
