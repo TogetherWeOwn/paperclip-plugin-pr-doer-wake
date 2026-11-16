@@ -1323,6 +1323,31 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_000);
     expect(h.ledger().report.complete).toBe(true);
   });
+  it("rotates past a partially serviced repository under repeated budget exhaustion", async () => {
+    const h = fixture({ dryRun: true });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [
+      { projectId, repoUrl: "https://github.com/example/project" },
+      { projectId, repoUrl: "https://github.com/example/tail" },
+    ]);
+    h.listing.mockImplementation(async (repo, status) => status !== "open" ? [] : repo === "example/project"
+      ? [pull(), pull({ number: 43 })]
+      : [pull({ repo: "example/tail", headRepo: "example/tail" })]);
+    h.seedHead.mockImplementation(async function (this: any, pr) {
+      if (pr.repo === "example/project" && pr.number === 43) {
+        h.advance(210_000);
+        await this.attempt("https://api.github.com/graphql", {});
+      }
+      return NOW;
+    });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain("example/project#43");
+    expect(h.ledger().attempted["example/tail"]).toBeUndefined();
+    h.listing.mockClear();
+    await h.restart().poll();
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+    expect(h.ledger().report.rows.find((row: any) => row.pr === "example/tail#42")?.unknown).not.toBe(true);
+  });
   it("classifies unexpected evidence errors without retaining their contents", async () => {
     const h = fixture({ dryRun: true });
     h.seedHead.mockRejectedValue(new Error("secret https://example.invalid/token"));
