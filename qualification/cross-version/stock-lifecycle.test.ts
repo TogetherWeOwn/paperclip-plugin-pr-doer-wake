@@ -8,6 +8,7 @@ import { companies, createDb, pluginMigrations, pluginState, plugins } from "@pa
 import { createHostClientHandlers } from "../../../packages/plugins/sdk/src/host-client-factory.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { pluginDatabaseService } from "../services/plugin-database.js";
+import { pluginRegistryService } from "../services/plugin-registry.js";
 import { createPluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -42,9 +43,11 @@ it("preserves migration and instance state across installed, previous, and resto
   expect(manifests.map((m) => m.id)).toEqual(Array(roots.length).fill("togetherweown.pr-doer-wake"));
   await db.insert(companies).values({ id: companyId, name: "Synthetic company", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
   await db.insert(plugins).values({ id: pluginId, pluginKey: manifests[0].id, packageName: "@togetherweown/paperclip-plugin-pr-doer-wake", version: manifests[0].version, apiVersion: 1, manifestJson: manifests[0] });
+  const config = { enabled: true, dryRun: false, allowedRepos: [repo], githubTokenSecretRef: { type: "secret_ref", secretId: randomUUID() } };
+  const registry = pluginRegistryService(db);
+  await registry.upsertConfig(pluginId, companyId, { configJson: config });
   const events = { forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }) };
   const services = buildHostServices(db, pluginId, manifests[0].id, events as any);
-  services.config.get = async () => ({ enabled: true, dryRun: false, allowedRepos: [repo], githubTokenSecretRef: { type: "secret_ref", secretId: randomUUID() } });
   services.secrets.resolve = async () => "synthetic-token";
   services.issues.get = async () => ({ id: issueId, companyId, projectId: runContext.projectId, executionWorkspaceId: workspaceId }) as any;
   services.issues.assertCheckoutOwner = async () => undefined as any;
@@ -87,17 +90,23 @@ it("preserves migration and instance state across installed, previous, and resto
       expect(await releaseStore.claim(companyId, release, randomUUID())).toBe("unknown");
       const stateBefore = await db.select().from(pluginState).where(eq(pluginState.pluginId, pluginId));
       if (previousState) expect(stateBefore).toEqual(previousState);
+      const configRows = await registry.listConfigs(pluginId);
+      expect(configRows.map((row) => ({ companyId: row.companyId, config: row.configJson }))).toEqual([{ companyId, config }]);
+      expect(await registry.getConfig(pluginId, randomUUID())).toBeNull();
       const handlers = createHostClientHandlers({ pluginId: manifest.id, capabilities: [...manifest.capabilities], services });
       const handle = await manager.startWorker(manifest.id, {
         entrypointPath: join(root, "dist/worker.js"), manifest, config: {}, databaseNamespace: namespace!.namespaceName,
         instanceInfo: { instanceId: "rollback-fixture", hostVersion: "2026.1106.0" }, apiVersion: 1,
         hostHandlers: handlers, autoRestart: false, rpcTimeoutMs: 10_000,
+        proactiveCompanyScopes: configRows.map((row) => row.companyId),
       });
       try {
         const started = handle.diagnostics();
         expect(started.status).toBe("running");
         expect(started.pid).not.toBeNull();
-        await manager.call(manifest.id, "configChanged", { companyId, config: {} });
+        for (const row of configRows) {
+          await manager.call(manifest.id, "configChanged", { companyId: row.companyId, config: row.configJson ?? {} });
+        }
         if (index === 0) {
           const result = await manager.call(manifest.id, "executeTool", { toolName: "ci_wait_register", parameters: { issueId, repo, prNumber: 17, headSha: sha }, runContext });
           expect(result.data).toMatchObject({ status: "open" });
@@ -111,7 +120,7 @@ it("preserves migration and instance state across installed, previous, and resto
         const wait = (row?.valueJson as any)?.waits.find((entry: any) => entry.waitId === waitId);
         expect(wait).toMatchObject({ waitId, issueId, companyId, repo, prNumber: 17, headSha: sha, status: index === 0 ? "open" : "woken" });
         expect(wakeups).toHaveLength(index === 0 ? 0 : 1);
-        console.info("rollback-start", JSON.stringify({ phase: index, pluginId, namespace: namespace!.namespaceName, pid: started.pid, ledger: ledger.map(({ migrationKey, checksum, status }) => ({ migrationKey, checksum, status })), stateRows: previousState.length }));
+        console.info("rollback-start", JSON.stringify({ phase: index, pluginId, configuredCompanies: configRows.map((row) => row.companyId), namespace: namespace!.namespaceName, pid: started.pid, ledger: ledger.map(({ migrationKey, checksum, status }) => ({ migrationKey, checksum, status })), stateRows: previousState.length }));
       } finally {
         await manager.stopWorker(manifest.id);
         const stopped = handle.diagnostics();
