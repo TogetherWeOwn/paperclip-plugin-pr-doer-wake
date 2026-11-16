@@ -1298,7 +1298,7 @@ describe("work-product discovery from a cold ledger", () => {
       return NOW - 8 * DAY;
     });
     await h.runtime.poll();
-    expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_000);
+    expect(h.ledger().attempted["example/project"]).toBe(NOW + 2);
     expect(h.ledger().attempted["example/tail"]).toBeUndefined();
     expect(h.ledger().report.unknown).toContain("example/tail#42");
     // Next tick the starved repo sorts first and is inventoried first.
@@ -1320,7 +1320,7 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().report.complete).toBe(false);
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     await h.restart().poll();
-    expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_000);
+    expect(h.ledger().attempted["example/project"]).toBe(NOW + 210_001);
     expect(h.ledger().report.complete).toBe(true);
   });
   it("rotates past a partially serviced repository under repeated budget exhaustion", async () => {
@@ -1347,6 +1347,35 @@ describe("work-product discovery from a cold ledger", () => {
     await h.restart().poll();
     expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
     expect(h.ledger().report.rows.find((row: any) => row.pr === "example/tail#42")?.unknown).not.toBe(true);
+  });
+  it("rotates equal-time partial service across ticks without advancing an incomplete closed cursor", async () => {
+    const h = fixture({ dryRun: true, open: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [
+      { projectId, repoUrl: "https://github.com/example/project" },
+      { projectId, repoUrl: "https://github.com/example/tail" },
+    ]);
+    h.listing.mockImplementation(async (repo, status) => status === "open" ? [] :
+      (repo === "example/project" ? [42] : [42, 43]).map((number) => pull({ repo, headRepo: repo, number, state: "closed", closedAt: NOW })));
+    vi.mocked(CustodyGithub.prototype.closureTexts).mockImplementation(async function (this: any, pr) {
+      if (pr.repo === "example/project") this.requests = 1099;
+      else this.requests++;
+      return [];
+    });
+    await h.runtime.poll();
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().report.unknown).toContain("example/tail#43");
+    expect(h.ledger().cursors["example/tail"]).toBeUndefined();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    h.listing.mockClear();
+    await h.restart().poll();
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+    expect(h.ledger().cursors["example/tail"]).toBe(NOW);
+    expect(h.ledger().report.rows.filter((row: any) => row.pr.startsWith("example/tail#")).every((row: any) => !row.unknown)).toBe(true);
+    await h.restart().poll();
+    expect(h.ledger().report.complete).toBe(false);
+    expect(h.ledger().cursors["example/tail"]).toBe(NOW);
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
   it("classifies unexpected evidence errors without retaining their contents", async () => {
     const h = fixture({ dryRun: true });

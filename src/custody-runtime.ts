@@ -381,7 +381,12 @@ export class CustodyRuntime {
       }
       for (const ref of Object.keys(ledger.prToCards)) if (!seenPrs.has(ref)) delete ledger.prToCards[ref];
       if (candidates.size) await loadCustodyTexts(this.ctx, config.companyId, guard, [...candidates.values()], budget);
+      // Order this tick's serviced repositories in reverse, even if the clock
+      // has millisecond ties; never-serviced repositories still sort first.
+      const attemptBase = Object.values(ledger.attempted).reduce((max, at) => Math.max(max, at), this.now());
+      let attemptOrder = sortedRepos.length;
       for (const repo of sortedRepos) {
+        const attemptAt = attemptBase + attemptOrder--;
         try {
           const inv = inventories.get(repo);
           if (!inv) continue;
@@ -500,7 +505,7 @@ export class CustodyRuntime {
           // Preserve priority for a wholly starved repo, but yield after a
           // completed evidence operation or admitted request so partial work
           // cannot repeatedly starve later repos when the budget runs out.
-          if (!budgetDenied || evidenceProgress || github.requestCount > requestsBeforeEvidence) ledger.attempted[repo] = this.now();
+          if (!budgetDenied || evidenceProgress || github.requestCount > requestsBeforeEvidence) ledger.attempted[repo] = attemptAt;
         } catch (error) { unknown(repo, unknownReason(error)); }
       }
       // Persist discovery clocks/removals as one batch before any effect can depend on them.
