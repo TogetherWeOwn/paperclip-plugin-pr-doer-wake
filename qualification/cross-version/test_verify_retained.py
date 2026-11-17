@@ -62,6 +62,14 @@ class RetainedPackageTest(unittest.TestCase):
                     v.verify(archive, "test", output)
                 self.assertFalse(output.exists())
 
+    def test_candidate_pin_is_distinct_from_installed_and_previous(self):
+        self.assertEqual(v.PINS["candidate"], (
+            "d9db670d273d731098c5d95e535f785614496665", "43997845680", 1,
+            "9075ff27f45159ddac776bf9ffd649682c18329806cb611bcdd2a93c18904f05",
+            "c2059ee643aa203bf668f616da6c9680cc4a65d5d34ee857e70759e0252f949b"))
+        self.assertNotEqual(v.PINS["candidate"], v.PINS["installed"])
+        self.assertNotEqual(v.PINS["candidate"], v.PINS["previous"])
+
     def test_valid_and_existing_destination(self):
         self.check(self.make_bundle(), True)
 
