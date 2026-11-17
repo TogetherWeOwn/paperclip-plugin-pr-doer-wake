@@ -787,6 +787,87 @@ describe("CI runtime polling and durable wake outcomes", () => {
       github.pull.mockResolvedValue(pull({ headSha: NEXT_HEAD }));
     }
 
+    it.each([true, false])("records a completed reviewer pass (shadow=%s)", async (shadow) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: shadow });
+      await movedHead(h);
+      await h.runtime.poll();
+      h.logger.info.mockClear();
+      await h.runtime.poll();
+      expect(h.logger.info).toHaveBeenCalledWith("pr-head-wake: reviewer pass started", expect.objectContaining({ entryCount: 1 }));
+      expect(h.logger.info).toHaveBeenCalledWith("pr-head-wake: reviewer pass completed", expect.objectContaining({
+        entryCount: 1, entriesExamined: 1, entriesAdmitted: 1, shadowConfiguredEntries: shadow ? 1 : 0,
+        entriesUnexamined: 0, outcome: "entries_examined",
+      }));
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
+    it("records an unknown-mode pass when the initial ledger save fails", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: true });
+      await movedHead(h);
+      await h.runtime.poll();
+      h.logger.info.mockClear();
+      h.logger.info.mockImplementation((message: string) => {
+        if (message === "pr-head-wake: reviewer pass started") h.set.mockImplementationOnce(async () => { throw new Error("initial save failed"); });
+      });
+      await expect(h.runtime.poll()).rejects.toThrow("initial save failed");
+      expect(h.logger.info).toHaveBeenCalledWith("pr-head-wake: reviewer pass completed", expect.objectContaining({
+        entryCount: 1, entriesExamined: 0, entriesAdmitted: 0, shadowConfiguredEntries: 0, entriesUnexamined: 1, outcome: "error",
+      }));
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
+    it("records a pass budget exhaustion after an admitted shadow entry", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: true });
+      await movedHead(h);
+      await h.runtime.poll();
+      const ledger = h.ledger();
+      ledger.prHeadPending![`${COMPANY}:${REPO}:18`] = {
+        companyId: COMPANY, repo: REPO, prNumber: 18, oldSha: HEAD, newSha: NEXT_HEAD, observedAt: START + 1,
+      };
+      h.seed(ledger);
+      h.logger.info.mockClear();
+      github.snapshot.mockImplementationOnce(async () => { h.advance(LIMITS.tickMs); return {}; });
+      await h.runtime.poll();
+      expect(h.logger.info).toHaveBeenCalledWith("pr-head-wake: reviewer pass completed", expect.objectContaining({
+        entryCount: 2, entriesExamined: 1, entriesAdmitted: 1, shadowConfiguredEntries: 1, entriesUnexamined: 1, outcome: "budget_exhausted",
+      }));
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
+    it("reports a candidate budget stop on the last entry", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: true });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      h.logger.info.mockClear();
+      github.readiness.mockReturnValue(verdict("pass"));
+      h.issueGet.mockClear();
+      h.configGet.mockImplementationOnce(async () => clone(h.rawConfig)).mockImplementationOnce(async () => {
+        // Expire during authority revalidation, after the entry deadline guard.
+        h.advance(LIMITS.tickMs);
+        return clone(h.rawConfig);
+      });
+      await h.runtime.poll();
+      expect(h.logger.info).toHaveBeenCalledWith("pr-head-wake: reviewer pass completed", expect.objectContaining({
+        entriesUnexamined: 0, outcome: "entries_examined", candidateBudgetStops: 1, entryRetryableErrors: 0,
+      }));
+      expect(h.issueGet).not.toHaveBeenCalled();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
+    it("reports retryable entry errors even when every entry was examined", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: true });
+      await movedHead(h);
+      await h.runtime.poll();
+      h.logger.info.mockClear();
+      github.snapshot.mockRejectedValueOnce(new Error("temporary failure"));
+      await h.runtime.poll();
+      expect(h.logger.info).toHaveBeenCalledWith("pr-head-wake: reviewer pass completed", expect.objectContaining({
+        entriesUnexamined: 0, outcome: "entries_examined", candidateBudgetStops: 0, entryRetryableErrors: 1,
+      }));
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
     it("wakes a pending reviewer once the new head settles", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
