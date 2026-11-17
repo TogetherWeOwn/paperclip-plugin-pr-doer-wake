@@ -208,6 +208,28 @@ jobs:
           node -e 'const r=require(process.argv[1]); const t=r.testResults.flatMap(f=>f.assertionResults).filter(t=>t.fullName.includes("aborts on issue read rollback of enabled")); if(t.length!==1 || t[0].status!=="failed" || !t[0].failureMessages.some(m=>m.includes("not be called"))) process.exit(1); console.log("expected stale-authority wake observed")' "$RUNNER_TEMP/reviewer-baseline.json"
           cp "$RUNNER_TEMP/ci-runtime.ts" src/ci-runtime.ts
           npx vitest run tests/ci-runtime.test.ts -t 'aborts on issue read rollback of enabled'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fa4be1ef4441025ecd70346bc250acf76a15e71d
+          path: unsent-baseline
+          persist-credentials: false
+      - name: Verify unsent wake recovery before and after the fix
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          test "$(git -C ../unsent-baseline rev-parse HEAD)" = fa4be1ef4441025ecd70346bc250acf76a15e71d
+          pattern='recovers an unsent reviewer wake after both deadline cleanup writes fail'
+          cp src/ci-runtime.ts "$RUNNER_TEMP/ci-runtime.ts"
+          trap 'cp "$RUNNER_TEMP/ci-runtime.ts" src/ci-runtime.ts' EXIT
+          cp ../unsent-baseline/src/ci-runtime.ts src/ci-runtime.ts
+          set +e
+          npx vitest run tests/ci-runtime.test.ts -t "$pattern" --reporter=json --outputFile="$RUNNER_TEMP/unsent-baseline.json"
+          result=$?
+          set -e
+          test "$result" -eq 1
+          node -e 'const r=require(process.argv[1]); const t=r.testResults.flatMap(f=>f.assertionResults).filter(t=>t.status==="failed"); if(t.length!==1 || t[0].title!==process.argv[2] || !t[0].failureMessages.some(m=>m.includes("recovered reviewer wake: expected [] to have a length of 1 but got +0"))) process.exit(1); console.log(t[0].failureMessages[0])' "$RUNNER_TEMP/unsent-baseline.json" "$pattern"
+          cp "$RUNNER_TEMP/ci-runtime.ts" src/ci-runtime.ts
+          npx vitest run tests/ci-runtime.test.ts -t "$pattern"
 
   stock-host-sql:
     name: Stock host SQL fixture
