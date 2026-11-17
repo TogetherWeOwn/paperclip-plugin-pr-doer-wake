@@ -359,6 +359,7 @@ export class CiGithub {
   private readonly requestTimeoutMs: number;
   private readonly now: () => number;
   private requests = 0;
+  private pendingAdmissions = 0;
   private readonly cache: CiGithubCache;
   private readonly backoff: { until: number };
   #credential: string | CiTokenSource;
@@ -649,11 +650,14 @@ export class CiGithub {
 
   private async attempt(url: string, headers: Record<string, string>, body?: string): Promise<CiHttpResponse | Response> {
     if (this.now() < Math.max(this.cache.backoffUntil, this.backoff.until)) throw new CiGithubError("backoff", undefined, Math.max(this.cache.backoffUntil, this.backoff.until));
-    if (this.requests >= this.maxRequests) throw new CiGithubError("budget");
+    if (this.requests + this.pendingAdmissions >= this.maxRequests) throw new CiGithubError("budget");
     this.beforeRequest?.();
-    this.requests++;
-    // Caller persistence is not a transport failure and must not trigger a conditional retry.
-    if (this.onRequestAdmitted) await this.onRequestAdmitted();
+    // Reserve capacity while persistence is pending, without counting a refused admission.
+    this.pendingAdmissions++;
+    try {
+      if (this.onRequestAdmitted) await this.onRequestAdmitted();
+      this.requests++;
+    } finally { this.pendingAdmissions--; }
     try { return await this.deadline(() => this.fetch(url, { method: body === undefined ? "GET" : "POST", headers, redirect: "error", ...(body === undefined ? {} : { body }) })); }
     catch (error) {
       if (error instanceof CiGithubError && error.code === "timeout") throw error;
