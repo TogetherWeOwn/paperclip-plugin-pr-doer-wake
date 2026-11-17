@@ -189,8 +189,16 @@ export class CustodyRuntime {
     // Admitted preflight yields durably even if it refuses before any native mutation.
     const admitDispatch = async (receipt: Receipt) => {
       guard();
+      const previousTurn = receipt.turn;
       receipt.turn = ++ledger.dispatchSequence;
-      await save();
+      try {
+        await save();
+      } catch (error) {
+        // No transport or native mutation can start until admission succeeds.
+        // Keep the sequence monotonic even when the write outcome is ambiguous.
+        receipt.turn = previousTurn;
+        throw error;
+      }
     };
     // Each trigger spends one slot at its first native mutation, including ambiguous attempts.
     const effectSlot = () => {

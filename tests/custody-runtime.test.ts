@@ -418,6 +418,28 @@ describe("coverage, summary and cursor controls", () => {
     }
     expect(h.ctx.issues.documents.upsert).toHaveBeenCalledTimes(1);
   });
+  it.each([false, true])("restores an unstarted turn after an admission save fails (write persisted: %s)", async (persistBeforeFailure) => {
+    const h = fixture({ cards: [card({ status: "done" })] });
+    h.activity.mockResolvedValue(NOW);
+    const key = `example/project#42|terminal|${ISSUE}:done:2`;
+    const save = h.ctx.state.set.getMockImplementation()!;
+    let failed = false;
+    h.ctx.state.set.mockImplementation(async (stateKey, value) => {
+      if (!failed && (value as any).receipts?.[key]?.turn === 1) {
+        failed = true;
+        if (persistBeforeFailure) await save(stateKey, value);
+        throw new Error("admission write failed");
+      }
+      return save(stateKey, value);
+    });
+    await h.runtime.poll();
+    expect(failed).toBe(true);
+    expect(h.ctx.http.fetch).not.toHaveBeenCalled();
+    expect(h.ctx.issues.create).not.toHaveBeenCalled();
+    expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(h.ledger().receipts[key].turn).toBe(0);
+    expect(h.ledger().dispatchSequence).toBe(1);
+  });
   it("retains a backoff-denied turn and revalidates it first after restart", async () => {
     const h = fixture({ cards: [card({ status: "done" })], open: [pull(), pull({ number: 43 })] });
     vi.mocked(CustodyGithub.prototype.pull).mockRestore();
