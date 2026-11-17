@@ -232,9 +232,25 @@ describe("CustodyGithub REST enumeration", () => {
     await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "response" });
   });
 
-  it("rejects non-descending closed results", async () => {
-    const { client } = fixtures(() => response([closed(1, UPDATED), closed(2, RECENT)]));
-    await expect(client.pulls(REPO, "closed", Date.parse(CREATED))).rejects.toMatchObject({ code: "response" });
+  it("reads past an old closed page and returns later large inversions and the inclusive boundary", async () => {
+    const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
+      ? Array.from({ length: 100 }, (_, index) => closed(index + 1, UPDATED))
+      : [closed(101, RECENT), closed(102, "2026-01-03T01:00:00Z")]));
+    const values = await client.pulls(REPO, "closed", Date.parse(RECENT));
+    expect(values.map((value) => value.number)).toEqual([101, 102]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("fails closed when the page limit is reached after an old closed page", async () => {
+    const { client } = fixtures(() => response(Array.from({ length: 100 }, (_, index) => closed(index + 1, UPDATED))), { maxPages: 1 });
+    await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "pages" });
+  });
+
+  it("validates old closed pages even after the cutoff", async () => {
+    const { client } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
+      ? Array.from({ length: 100 }, (_, index) => closed(index + 1, UPDATED))
+      : [{ ...closed(101, UPDATED), body: 3 }]));
+    await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "response" });
   });
 
   it("never follows Link URLs and rejects a short partial page", async () => {

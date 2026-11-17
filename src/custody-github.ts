@@ -137,13 +137,14 @@ export class CustodyGithub extends CiGithub {
     let previous = Infinity;
     const result = await this.collect(`/repos/${repo}/pulls?state=${state}&sort=updated&direction=desc`, (value) => {
       const parsed = pull(value, repo, state);
-      // GitHub's updated sort can disagree with the returned updated_at by a
-      // second or so. Small inversions are tolerated; a large one is refused.
-      if (parsed.updatedAt > previous + ORDER_SKEW_MS) return invalid();
+      // Open inventory still refuses substantial disorder. Closed inventory
+      // cannot safely use updated_at as a pagination boundary: GitHub's sort
+      // may differ by more than the skew. Enumerate it to exhaustion instead.
+      if (state === "open" && parsed.updatedAt > previous + ORDER_SKEW_MS) return invalid();
       previous = Math.min(previous, parsed.updatedAt);
       return { key: parsed.number, value: parsed };
-    }, state === "closed" ? (batch) => batch.some((value) => value.updatedAt < since! - ORDER_SKEW_MS) : undefined);
-    return state === "closed" ? result.filter((value) => value.updatedAt >= since!) : result;
+    }, state === "closed" ? (value) => value.updatedAt >= since! : undefined);
+    return result;
   }
 
   /**
@@ -309,7 +310,7 @@ export class CustodyGithub extends CiGithub {
   private async collect<T>(
     path: string,
     parse: (value: unknown) => { key: string | number; value: T },
-    stop?: (batch: T[]) => boolean,
+    include?: (value: T) => boolean,
   ): Promise<T[]> {
     const values: T[] = [];
     const seen = new Set<string | number>();
@@ -323,11 +324,10 @@ export class CustodyGithub extends CiGithub {
         seen.add(item.key);
         return item.value;
       });
-      values.push(...parsed);
+      values.push(...(include ? parsed.filter(include) : parsed));
       // Links are hints only. Reconstruct the next numbered page on the fixed origin.
       const next = /(?:^|,)\s*<[^>]+>\s*;\s*rel="next"/.test(response.link);
       if (next && batch.length < 100) return invalid();
-      if (stop?.(parsed)) return values;
       if (!next && batch.length < 100) return values;
     }
     throw new CiGithubError("pages");
