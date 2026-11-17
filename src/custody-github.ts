@@ -23,6 +23,8 @@ type ObjectValue = Record<string, unknown>;
 function invalid(): never { throw new CiGithubError("response"); }
 /** Tolerated disagreement between GitHub's updated sort and returned updated_at. */
 export const ORDER_SKEW_MS = 5 * 60_000;
+const PULL_RETAINED_ROWS = 10_000;
+const PULL_RETAINED_BYTES = 8 * 1024 * 1024;
 function object(value: unknown): ObjectValue {
   if (!value || typeof value !== "object" || Array.isArray(value)) return invalid();
   return value as ObjectValue;
@@ -142,8 +144,9 @@ export class CustodyGithub extends CiGithub {
       if (parsed.updatedAt > previous + ORDER_SKEW_MS) return invalid();
       previous = Math.min(previous, parsed.updatedAt);
       return { key: parsed.number, value: parsed };
-    }, state === "closed" ? (batch) => batch.some((value) => value.updatedAt < since! - ORDER_SKEW_MS) : undefined);
-    return state === "closed" ? result.filter((value) => value.updatedAt >= since!) : result;
+    }, state === "closed" ? (batch) => batch.some((value) => value.updatedAt < since! - ORDER_SKEW_MS) : undefined,
+    (value) => state === "open" || value.updatedAt >= since!);
+    return result;
   }
 
   /**
@@ -310,9 +313,11 @@ export class CustodyGithub extends CiGithub {
     path: string,
     parse: (value: unknown) => { key: string | number; value: T },
     stop?: (batch: T[]) => boolean,
+    include?: (value: T) => boolean,
   ): Promise<T[]> {
     const values: T[] = [];
     const seen = new Set<string | number>();
+    let retainedBytes = 0;
     for (let page = 1; page <= this.maxPages; page++) {
       const response = await this.request(`${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
       const batch = array(response.data);
@@ -323,7 +328,14 @@ export class CustodyGithub extends CiGithub {
         seen.add(item.key);
         return item.value;
       });
-      values.push(...parsed);
+      for (const value of parsed) {
+        if (include && !include(value)) continue;
+        if (include) {
+          retainedBytes += Buffer.byteLength(JSON.stringify(value), "utf8");
+          if (values.length >= PULL_RETAINED_ROWS || retainedBytes > PULL_RETAINED_BYTES) throw new CiGithubError("budget");
+        }
+        values.push(value);
+      }
       // Links are hints only. Reconstruct the next numbered page on the fixed origin.
       const next = /(?:^|,)\s*<[^>]+>\s*;\s*rel="next"/.test(response.link);
       if (next && batch.length < 100) return invalid();

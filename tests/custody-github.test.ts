@@ -90,6 +90,29 @@ describe("CustodyGithub REST enumeration", () => {
     }
   });
 
+  it("bounds open-list accumulation across individually admissible pages using UTF-8 bytes", async () => {
+    const { client, calls } = fixtures((url) => {
+      const page = Number(url.searchParams.get("page"));
+      return response(Array.from({ length: 100 }, (_, index) => rawPull((page - 1) * 100 + index + 1, { body: "é".repeat(22_500) })));
+    }, { maxBodyBytes: CUSTODY_LIMITS.bodyBytes });
+    await expect(client.pulls(REPO, "open")).rejects.toMatchObject({ code: "budget" });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("bounds retained closed bytes without counting filtered rows on the cutoff page", async () => {
+    const bigBody = "x".repeat(60_000);
+    const rows = (page: number, count: number, old = false) => Array.from({ length: count }, (_, index) => ({
+      ...closed((page - 1) * 100 + index + 1, old ? UPDATED : RECENT), body: bigBody,
+    }));
+    const complete = fixtures((url) => Number(url.searchParams.get("page")) === 1
+      ? response(rows(1, 100)) : response(rows(2, 50, true)), { maxBodyBytes: CUSTODY_LIMITS.bodyBytes });
+    expect(await complete.client.pulls(REPO, "closed", Date.parse(RECENT))).toHaveLength(100);
+    expect(complete.calls).toHaveLength(2);
+    const bounded = fixtures((url) => response(rows(Number(url.searchParams.get("page")), 100)), { maxBodyBytes: CUSTODY_LIMITS.bodyBytes });
+    await expect(bounded.client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "budget" });
+    expect(bounded.calls).toHaveLength(2);
+  });
+
   it("lists more than 100 open PRs without search or requiring total_count", async () => {
     const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
       ? Array.from({ length: 100 }, (_, index) => rawPull(index + 1)) : [rawPull(101)]));
