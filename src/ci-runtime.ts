@@ -884,58 +884,34 @@ export class CiWakeRuntime {
       const entries = allEntries
         .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
         .sort((a, b) => a[1].pollOrder! - b[1].pollOrder!);
-      const reviewerStartRequests = requests;
-      const reviewerStartedAt = this.now();
-      let entriesExamined = 0;
-      let entriesAdmitted = 0;
-      let shadowEntries = 0;
-      let entriesLogged = 0;
-      let entriesSuppressed = 0;
-      const entryLogLimit = 100;
-      let skippedLogged = 0;
-      let skippedSuppressed = 0;
-      const skippedLogLimit = 100;
-      let reviewerOutcome = "entries_examined";
-      // This aggregate is not proof that shadow was enabled: configuration has
-      // not yet been read. A start without completion also exposes interruption.
-      if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass started", { reviewerStartedAt, entryCount: entries.length });
-      try {
       if (allEntries.length) await this.save(ledger);
+      const reviewerStartRequests = requests;
       for (const [key] of entries) {
-        if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) { reviewerOutcome = "budget_exhausted"; break; }
+        if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
         const fresh = await this.yieldToQueued(ledger);
-        if (!fresh) { reviewerOutcome = "yield_aborted"; return; }
+        if (!fresh) return;
         ledger = fresh;
-        if (this.now() - started >= LIMITS.tickMs) { reviewerOutcome = "budget_exhausted"; break; }
-        entriesExamined += 1;
+        if (this.now() - started >= LIMITS.tickMs) break;
         // A registration during the yield may have retargeted this entry to a newer head.
         const entry = ledger.prHeadPending[key];
         if (!entry || entry.pollOrder === undefined || (only && entry.newSha !== only.sha)) continue;
-        entriesAdmitted += 1;
         const entryStartRequests = requests;
         const previousOrder = entry.pollOrder!;
         entry.pollOrder = ++sequence;
         await this.save(ledger);
-        let shadowTrace = false;
-        let entryOutcome = "retryable";
-        let candidateCount: number | null = null;
-        let candidatesVisited = 0;
-        const entryStartedAt = this.now();
         try {
           const config = await this.config(entry.companyId, false);
-          shadowTrace = config.prHeadWakeShadow || config.dryRun;
-          if (shadowTrace) shadowEntries += 1;
           // Feature off: drop the entry rather than accumulate stale wakes.
-          if (!config.enabled || !config.prHeadWakeEnabled) { delete ledger.prHeadPending[key]; await this.save(ledger); entryOutcome = "feature_disabled"; continue; }
-          if (!config.allowedRepos.includes(entry.repo)) { delete ledger.prHeadPending[key]; await this.save(ledger); entryOutcome = "repo_not_allowed"; continue; }
+          if (!config.enabled || !config.prHeadWakeEnabled) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (!config.allowedRepos.includes(entry.repo)) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
           const github = await this.client(entry.companyId, config, entry.repo, fetch, cycle);
           const current = await github.pull(entry.repo, entry.prNumber);
-          if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); entryOutcome = "pr_ineligible"; continue; }
+          if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
           if (current.headSha !== entry.newSha) {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
             entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
-            await this.save(ledger); entryOutcome = "head_retargeted"; continue;
+            await this.save(ledger); continue;
           }
           const snapshot = await github.snapshot(entry.repo, entry.newSha, current.baseBranch);
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
@@ -943,25 +919,25 @@ export class CiWakeRuntime {
           const medianMs = sorted.length ? sorted[Math.floor(sorted.length / 2)]! : config.repoMedianMs[entry.repo] ?? 30 * 60_000;
           const verdict = evaluateReadiness(snapshot, { registeredAt: entry.observedAt, now: this.now(), medianMs, draft: current.draft });
           // Unsettled heads do not wake yet; the entry stays for a later tick.
-          if (verdict.kind === "pending") { entryOutcome = "readiness_pending"; continue; }
+          if (verdict.kind === "pending") continue;
           // Mirror the CI path: re-read the live PR after the readiness
           // snapshot and before any wake intent. A push during the snapshot
           // must retarget the entry, never wake for the stale SHA.
           const checked = await github.pull(entry.repo, entry.prNumber);
-          if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); entryOutcome = "pr_ineligible"; continue; }
+          if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
           if (checked.headSha !== entry.newSha) {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
             entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
-            await this.save(ledger); entryOutcome = "head_retargeted"; continue;
+            await this.save(ledger); continue;
           }
-          if (checked.draft !== current.draft) { entryOutcome = "draft_changed"; continue; }
+          if (checked.draft !== current.draft) continue;
           if (checked.baseBranch !== current.baseBranch) {
             // Base-only edit: the head the reviewer last saw is unchanged, so
             // keep oldSha/newSha (never collapse them into a meaningless
             // same-SHA wake) and retry against the new base next tick.
             entry.observedAt = this.now();
-            await this.save(ledger); entryOutcome = "base_changed"; continue;
+            await this.save(ledger); continue;
           }
           // Revalidate binding, enablement, allowlist, pr-head flags, dry-run
           // and the credential identity immediately after the final GitHub
@@ -974,7 +950,6 @@ export class CiWakeRuntime {
           // rollback via dryRun: true silences this path too.
           const shadow = revalidated.prHeadWakeShadow || revalidated.dryRun;
           const candidates = [...new Set(ledger.waits.filter((w) => w.companyId === entry.companyId && w.repo === entry.repo && w.prNumber === entry.prNumber).map((w) => w.issueId))];
-          candidateCount = candidates.length;
           entry.candidateOrder ??= {};
           const liveCandidates = new Set(candidates);
           for (const id of Object.keys(entry.candidateOrder)) if (!liveCandidates.has(id)) delete entry.candidateOrder[id];
@@ -986,20 +961,7 @@ export class CiWakeRuntime {
           let outstanding = false;
           for (const issueId of candidates) {
             const wakeKey = `${entry.companyId}:${issueId}:${entry.newSha}`;
-            if (ledger.reviewerWakes[wakeKey] !== undefined) {
-              candidatesVisited += 1;
-              if (shadow) {
-                if (skippedLogged >= skippedLogLimit) skippedSuppressed += 1;
-                else {
-                  skippedLogged += 1;
-                  this.ctx.logger.info("pr-head-wake: candidate skipped", {
-                    companyId: entry.companyId, issueId, repo: entry.repo, prNumber: entry.prNumber,
-                    oldSha: entry.oldSha, newSha: entry.newSha, outcome: "wake_already_recorded",
-                  });
-                }
-              }
-              continue;
-            }
+            if (ledger.reviewerWakes[wakeKey] !== undefined) continue;
             // Admission precedes host reads too: slow or failing reads must not
             // repeatedly consume the invocation before later cards are visited.
             if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) {
@@ -1009,33 +971,21 @@ export class CiWakeRuntime {
             entry.candidateOrder[issueId] = ++candidateSequence;
             entry.candidateSequence = candidateSequence;
             await this.save(ledger);
-            candidatesVisited += 1;
             let issue: any;
             const eligibilityReadStartedAt = this.now();
-            let eligibilityReadCompletedAt = eligibilityReadStartedAt;
-            const skipped = (outcome: string) => {
-              if (!shadow) return;
-              if (skippedLogged >= skippedLogLimit) { skippedSuppressed += 1; return; }
-              skippedLogged += 1;
-              this.ctx.logger.info("pr-head-wake: candidate skipped", {
-                companyId: entry.companyId, issueId, repo: entry.repo, prNumber: entry.prNumber,
-                oldSha: entry.oldSha, newSha: entry.newSha, eligibilityReadStartedAt,
-                eligibilityReadCompletedAt, outcome,
-              });
-            };
             try { issue = await this.ctx.issues.get(issueId, entry.companyId); }
-            catch { eligibilityReadCompletedAt = this.now(); skipped("read_failed"); outstanding = true; continue; }
-            eligibilityReadCompletedAt = this.now();
-            if (!issue || issue.id !== issueId || issue.companyId !== entry.companyId) { skipped("identity_mismatch"); outstanding = true; continue; }
-            if (issue.status !== "in_review") { skipped("not_in_review"); continue; }
+            catch { outstanding = true; continue; }
+            const eligibilityReadCompletedAt = this.now();
+            if (!issue || issue.id !== issueId || issue.companyId !== entry.companyId) { outstanding = true; continue; }
+            if (issue.status !== "in_review") continue;
             const state = issue.executionState;
-            if (!state || state.status !== "pending" || state.currentStageId == null || !state.currentParticipant) { skipped("no_pending_participant"); continue; }
+            if (!state || state.status !== "pending" || state.currentStageId == null || !state.currentParticipant) continue;
             // The host's issues.get omits work products (Paperclip 2026.1106.0). Then the
             // card's latest wait on this PR must still match its current project,
             // workspace and repository; a historical registration alone is not a link.
             // A supplied work-product list must still name this PR.
             if (issue.workProducts !== undefined) {
-              if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) { skipped("work_product_mismatch"); continue; }
+              if (!this.hasPrWorkProduct(issue, entry.repo, entry.prNumber)) continue;
             } else {
               // The card's most recent registration on any PR in this repo is its
               // current link (ties go to ledger order); an older PR it has moved
@@ -1044,15 +994,11 @@ export class CiWakeRuntime {
                 .map((w, index) => ({ w, index }))
                 .filter(({ w }) => w.companyId === entry.companyId && w.issueId === issueId && w.repo === entry.repo && w.reason !== "binding_changed")
                 .sort((a, b) => (b.w.registeredAt - a.w.registeredAt) || (b.index - a.index))[0]?.w;
-              if (!latest || latest.prNumber !== entry.prNumber) { skipped("registration_mismatch"); continue; }
+              if (!latest || latest.prNumber !== entry.prNumber) continue;
               try { await this.checkBinding(latest); }
-              catch (error) {
-                skipped(error instanceof BindingChanged ? "binding_changed" : "binding_read_failed");
-                if (!(error instanceof BindingChanged)) outstanding = true;
-                continue;
-              }
+              catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
             }
-            if (this.isAuthorParticipant(issue, ledger, entry)) { skipped("author_participant"); continue; }
+            if (this.isAuthorParticipant(issue, ledger, entry)) continue;
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
               entry.shadowLogged ??= [];
@@ -1068,8 +1014,6 @@ export class CiWakeRuntime {
                   participantAgentId: typeof state.currentParticipant.agentId === "string" ? state.currentParticipant.agentId.slice(0, 128) : null,
                   outcome: "shadow_no_dispatch",
                 });
-              } else {
-                skipped("shadow_already_logged");
               }
               outstanding = true;
               continue;
@@ -1114,36 +1058,13 @@ export class CiWakeRuntime {
           }
           // Clear only when every candidate is woken/deduped/ineligible/excluded.
           if (!outstanding && !shadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
-          entryOutcome = candidatesVisited < candidates.length ? "candidate_budget_exhausted" : "candidates_visited";
         } catch (error) {
           // Retry a request-truncated entry first next tick, unless it already
           // had the whole reviewer share: then rotate it to avoid blocking peers.
           if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
           this.audit(ledger, "pr_head_wake", "retryable");
           await this.save(ledger);
-        } finally {
-          if (shadowTrace) {
-            if (entriesLogged >= entryLogLimit) entriesSuppressed += 1;
-            else {
-              entriesLogged += 1;
-              this.ctx.logger.info("pr-head-wake: entry completed", {
-                companyId: entry.companyId, repo: entry.repo, prNumber: entry.prNumber,
-                oldSha: entry.oldSha, newSha: entry.newSha, entryStartedAt, entryCompletedAt: this.now(),
-                candidateCount, candidatesVisited, outcome: entryOutcome,
-              });
-            }
-          }
         }
-      }
-      } catch (error) {
-        reviewerOutcome = "error";
-        throw error;
-      } finally {
-        if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass completed", {
-          reviewerStartedAt, reviewerCompletedAt: this.now(), entryCount: entries.length,
-          entriesExamined, entriesAdmitted, shadowEntries, entriesUnexamined: entries.length - entriesExamined,
-          entriesLogged, entriesSuppressed, skippedLogged, skippedSuppressed, outcome: reviewerOutcome,
-        });
       }
     }
     await this.save(ledger);
