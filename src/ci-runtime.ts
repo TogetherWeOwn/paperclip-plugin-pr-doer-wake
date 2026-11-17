@@ -1003,6 +1003,7 @@ export class CiWakeRuntime {
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
             if (this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
             await validateAuthority();
+            if (this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
               entry.shadowLogged ??= [];

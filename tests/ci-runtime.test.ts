@@ -1101,6 +1101,37 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
     });
 
+    it.each([
+      { prHeadWakeShadow: true, dryRun: false },
+      { prHeadWakeShadow: false, dryRun: true },
+    ])("defers shadow effects when candidate authority read exhausts the tick: %j", async (mode) => {
+      const h = setup({ prHeadWakeEnabled: true, ...mode });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      github.readiness.mockReturnValue(verdict("pass"));
+      let issueRead = false;
+      let expired = false;
+      h.issueGet.mockImplementation(async () => { issueRead = true; return clone(h.issue); });
+      h.configGet.mockImplementation(async () => {
+        if (issueRead && !expired) { expired = true; h.advance(LIMITS.tickMs); }
+        return clone(h.rawConfig);
+      });
+      const key = `${COMPANY}:${REPO}:17`;
+      const shadowLogs = () => h.logger.info.mock.calls.filter(([message]) => message === "pr-head-wake: would wake");
+      await h.runtime.poll();
+      expect(expired).toBe(true);
+      expect(h.ledger().prHeadPending?.[key]?.shadowLogged ?? []).toEqual([]);
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(0);
+      expect(shadowLogs()).toHaveLength(0);
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      await h.runtime.poll();
+      expect(h.ledger().prHeadPending?.[key]?.shadowLogged).toEqual([ISSUE]);
+      expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1);
+      expect(shadowLogs()).toHaveLength(1);
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+    });
+
     it("clears intent and retries when the post-intent authority read exhausts the tick", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
