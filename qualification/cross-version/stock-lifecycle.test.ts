@@ -23,11 +23,13 @@ beforeAll(async () => {
 }, 60_000);
 afterAll(async () => { await tempDb?.cleanup(); });
 
-it("preserves migration and instance state across installed, previous, and restored workers", async () => {
+it("preserves migration and instance state across fresh packaged workers", async () => {
   const installed = process.env.INSTALLED_PACKAGE_ROOT;
   const previous = process.env.PREVIOUS_PACKAGE_ROOT;
   if (!installed || !previous) throw new Error("Both verified package roots are required");
-  const roots = [installed, previous, previous, installed];
+  const roots = process.env.CANDIDATE_RECOVERY === "1"
+    ? [installed, previous, previous]
+    : [installed, previous, previous, installed];
   const manifests = await Promise.all(roots.map(async (root) => (await import(pathToFileURL(join(root, "dist/manifest.js")).href)).default));
   const pluginId = randomUUID();
   const companyId = randomUUID();
@@ -46,7 +48,7 @@ it("preserves migration and instance state across installed, previous, and resto
   expect(manifests.map((m) => m.id)).toEqual(Array(roots.length).fill("togetherweown.pr-doer-wake"));
   await db.insert(companies).values({ id: companyId, name: "Synthetic company", issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
   await db.insert(plugins).values({ id: pluginId, pluginKey: manifests[0].id, packageName: "@togetherweown/paperclip-plugin-pr-doer-wake", version: manifests[0].version, apiVersion: 1, manifestJson: manifests[0] });
-  const config = { enabled: true, dryRun: false, allowedRepos: [repo], githubTokenSecretRef: { type: "secret_ref", secretId: randomUUID() } };
+  const config = { enabled: true, dryRun: false, custodyEnabled: false, allowedRepos: [repo], githubTokenSecretRef: { type: "secret_ref", secretId: randomUUID() } };
   await pluginRegistryService(db).upsertConfig(pluginId, companyId, { configJson: config });
   const events = { forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }) };
   const manager = createPluginWorkerManager();
@@ -83,8 +85,18 @@ it("preserves migration and instance state across installed, previous, and resto
       const archiveId = "synthetic-completed-receipt";
       const archiveKey = { scopeKind: "company" as const, scopeId: companyId, namespace: "pr-custody-v1", stateKey: `example:live:receipt:${createHash("sha256").update(archiveId).digest("hex")}` };
       const archiveValue = { version: 1, key: archiveId, value: { at: 1, status: "woken" } };
-      if (index === 0) await services.state.set({ ...archiveKey, value: archiveValue });
+      const hotKey = { ...archiveKey, stateKey: "example:live" };
+      const hotValue = { version: 1, receipts: { ambiguous: { at: 1, status: "unconfirmed", phase: "wake" } }, cursors: { [repo]: 17 }, attempted: {}, activityAfter: {}, dispatchSequence: 1, heads: { [repo]: { sha, at: 1 } }, dispositions: { held: 1 }, prToCards: {}, audits: [], report: { at: 1, complete: false, rows: [], unknown: [], effects: 0 } };
+      const dispositionKey = { ...archiveKey, stateKey: `example:live:disposition:${createHash("sha256").update("held").digest("hex")}` };
+      const dispositionValue = { version: 1, key: "held", value: 1 };
+      if (index === 0) {
+        await services.state.set({ ...archiveKey, value: archiveValue });
+        await services.state.set({ ...hotKey, value: hotValue });
+        await services.state.set({ ...dispositionKey, value: dispositionValue });
+      }
       expect(await services.state.get(archiveKey)).toEqual(archiveValue);
+      expect(await services.state.get(hotKey)).toEqual(hotValue);
+      expect(await services.state.get(dispositionKey)).toEqual(dispositionValue);
       const database = pluginDatabaseService(db);
       const manifest = manifests[index];
       const namespace = await database.applyMigrations(pluginId, manifest, root);
@@ -119,6 +131,11 @@ it("preserves migration and instance state across installed, previous, and resto
         for (const row of configRows) {
           await manager.call(manifest.id, "configChanged", { companyId: row.companyId, config: row.configJson ?? {} });
         }
+        const beforeDisabled = await db.select().from(pluginState).where(eq(pluginState.pluginId, pluginId));
+        const wakesBeforeDisabled = wakeups.length;
+        await manager.call(manifest.id, "runJob", { job: { jobKey: "pr-custody", runId: randomUUID(), trigger: "manual", scheduledAt: new Date().toISOString() } });
+        expect(await db.select().from(pluginState).where(eq(pluginState.pluginId, pluginId))).toEqual(beforeDisabled);
+        expect(wakeups).toHaveLength(wakesBeforeDisabled);
         if (index === 0) {
           const result = await manager.call(manifest.id, "executeTool", { toolName: "ci_wait_register", parameters: { issueId, repo, prNumber: 17, headSha: sha }, runContext });
           expect(result.data).toMatchObject({ status: "open" });

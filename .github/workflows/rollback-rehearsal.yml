@@ -28,6 +28,7 @@ jobs:
           set -euo pipefail
           mkdir "$RUNNER_TEMP/retained-archives"
           for record in \
+            'candidate 14290013579 43997845680 d9db670d273d731098c5d95e535f785614496665' \
             'installed 14208841476 43831163440 356a733ad1e2aee3b289b4812429b85d7bac29a2' \
             'previous 14186900141 43776281685 2ed5a9840e005c082733135f2b3a395d348ed116'; do
             read -r kind artifact run source <<< "$record"
@@ -53,6 +54,7 @@ jobs:
       - name: Verify and extract exact packages without executing workers
         run: |
           set -euo pipefail
+          python3 -I qualification/cross-version/verify-retained.py candidate "$RUNNER_TEMP/retained-archives/candidate.zip" "$RUNNER_TEMP/candidate-package"
           python3 -I qualification/cross-version/verify-retained.py installed "$RUNNER_TEMP/retained-archives/installed.zip" "$RUNNER_TEMP/installed-package"
           python3 -I qualification/cross-version/verify-retained.py previous "$RUNNER_TEMP/retained-archives/previous.zip" "$RUNNER_TEMP/previous-package"
           printf '%s\n' 'Package validation only; no rollback lifecycle was exercised.'
@@ -75,7 +77,7 @@ jobs:
             manifest.exports = manifest.publishConfig.exports;
             fs.writeFileSync(path, JSON.stringify(manifest, null, 2) + "\n");
           '
-          for package in "$RUNNER_TEMP/installed-package" "$RUNNER_TEMP/previous-package"; do
+          for package in "$RUNNER_TEMP/candidate-package" "$RUNNER_TEMP/installed-package" "$RUNNER_TEMP/previous-package"; do
             mkdir -p "$package/node_modules/@paperclipai"
             ln -s "$PWD/packages/plugins/sdk" "$package/node_modules/@paperclipai/plugin-sdk"
           done
@@ -89,11 +91,23 @@ jobs:
           set -euo pipefail
           pnpm exec vitest run server/src/__tests__/stock-lifecycle.test.ts --reporter=verbose 2>&1 | tee "$RUNNER_TEMP/stock-lifecycle.log"
           printf '%s\n' 'Disposable synthetic-effects lifecycle passed; production rollback is not exercised.'
+      - name: Run candidate forward recovery lifecycle
+        working-directory: stock-host
+        env:
+          INSTALLED_PACKAGE_ROOT: ${{ runner.temp }}/installed-package
+          PREVIOUS_PACKAGE_ROOT: ${{ runner.temp }}/candidate-package
+          CANDIDATE_RECOVERY: '1'
+        run: |
+          set -euo pipefail
+          pnpm exec vitest run server/src/__tests__/stock-lifecycle.test.ts --reporter=verbose 2>&1 | tee "$RUNNER_TEMP/candidate-lifecycle.log"
+          printf '%s\n' 'Synthetic installed-to-candidate restart only; candidate downgrade and production are not exercised.'
       - name: Retain lifecycle output
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: stock-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/stock-lifecycle.log
+          path: |
+            ${{ runner.temp }}/stock-lifecycle.log
+            ${{ runner.temp }}/candidate-lifecycle.log
           if-no-files-found: warn
           retention-days: 7

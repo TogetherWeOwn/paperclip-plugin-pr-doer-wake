@@ -10,6 +10,9 @@ import tarfile
 import zipfile
 
 PINS = {
+    "candidate": ("d9db670d273d731098c5d95e535f785614496665", "43997845680", 1,
+                  "9075ff27f45159ddac776bf9ffd649682c18329806cb611bcdd2a93c18904f05",
+                  "c2059ee643aa203bf668f616da6c9680cc4a65d5d34ee857e70759e0252f949b"),
     "installed": ("356a733ad1e2aee3b289b4812429b85d7bac29a2", "43831163440", 1,
                   "9d86b1620cfecc52b8b97116d0abbba657b0a902d9e34002bbf697e0dbcc4d5f",
                   "c839010aa32de13ed805e870888e145f3218ed7c549e38c83add4a42439cee7a"),
@@ -104,5 +107,5 @@ def verify(archive, kind, destination):
 
 
 if __name__ == "__main__":
-    require(len(sys.argv) == 4 and sys.argv[1] in PINS, "usage: verify-retained.py installed|previous archive.zip new-directory")
+    require(len(sys.argv) == 4 and sys.argv[1] in PINS, "usage: verify-retained.py candidate|installed|previous archive.zip new-directory")
     verify(sys.argv[2], sys.argv[1], sys.argv[3])
