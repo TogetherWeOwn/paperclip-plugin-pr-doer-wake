@@ -884,23 +884,37 @@ export class CiWakeRuntime {
       const entries = allEntries
         .filter(([, e]) => !only || (e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha))
         .sort((a, b) => a[1].pollOrder! - b[1].pollOrder!);
-      if (allEntries.length) await this.save(ledger);
       const reviewerStartRequests = requests;
+      const reviewerStartedAt = this.now();
+      let entriesExamined = 0;
+      let entriesAdmitted = 0;
+      let shadowConfiguredEntries = 0;
+      let candidateBudgetStops = 0;
+      let entryRetryableErrors = 0;
+      let entryFinalPrReadDeadlineStops = 0; // Subset of entryRetryableErrors.
+      let reviewerOutcome = "entries_examined";
+      // Configuration is not yet known; this aggregate does not assert shadow mode.
+      if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass started", { reviewerStartedAt, entryCount: entries.length });
+      try {
+      if (allEntries.length) await this.save(ledger);
       for (const [key] of entries) {
-        if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) break;
+        if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) { reviewerOutcome = "budget_exhausted"; break; }
         const fresh = await this.yieldToQueued(ledger);
-        if (!fresh) return;
+        if (!fresh) { reviewerOutcome = "yield_aborted"; return; }
         ledger = fresh;
-        if (this.now() - started >= LIMITS.tickMs) break;
+        if (this.now() - started >= LIMITS.tickMs) { reviewerOutcome = "budget_exhausted"; break; }
+        entriesExamined += 1;
         // A registration during the yield may have retargeted this entry to a newer head.
         const entry = ledger.prHeadPending[key];
         if (!entry || entry.pollOrder === undefined || (only && entry.newSha !== only.sha)) continue;
+        entriesAdmitted += 1;
         const entryStartRequests = requests;
         const previousOrder = entry.pollOrder!;
         entry.pollOrder = ++sequence;
         await this.save(ledger);
         try {
           const config = await this.config(entry.companyId, false);
+          if (config.prHeadWakeShadow || config.dryRun) shadowConfiguredEntries += 1;
           // Feature off: drop the entry rather than accumulate stale wakes.
           if (!config.enabled || !config.prHeadWakeEnabled) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
           if (!config.allowedRepos.includes(entry.repo)) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
@@ -940,7 +954,10 @@ export class CiWakeRuntime {
             await this.save(ledger); continue;
           }
           // The final GitHub read can finish after the tick's admission budget.
-          if (this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
+          if (this.now() - started >= LIMITS.tickMs) {
+            entryFinalPrReadDeadlineStops += 1;
+            throw new Error("tick_budget");
+          }
           // Revalidate binding, enablement, allowlist, pr-head flags, dry-run
           // and the credential identity immediately after the final GitHub
           // read: an operator rollback (dryRun: true, disable, revoke) made
@@ -972,6 +989,7 @@ export class CiWakeRuntime {
             // repeatedly consume the invocation before later cards are visited.
             if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) {
               if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
+              candidateBudgetStops += 1;
               outstanding = true; break;
             }
             entry.candidateOrder[issueId] = ++candidateSequence;
@@ -1005,9 +1023,9 @@ export class CiWakeRuntime {
               catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
             }
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
-            if (this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            if (this.now() - started >= LIMITS.tickMs) { candidateBudgetStops += 1; outstanding = true; break; }
             await validateAuthority();
-            if (this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            if (this.now() - started >= LIMITS.tickMs) { candidateBudgetStops += 1; outstanding = true; break; }
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
               entry.shadowLogged ??= [];
@@ -1031,7 +1049,7 @@ export class CiWakeRuntime {
             // one PR can have many eligible cards. Stop dispatching, keep
             // the entry, and resume the rest on the next tick; already
             // woken cards stay deduped via reviewerWakes.
-            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { candidateBudgetStops += 1; outstanding = true; break; }
             // Persist dedupe intent BEFORE the host call. A lost reply or
             // restart never repeats this (card, SHA) effect.
             ledger.reviewerWakes[wakeKey] = this.now();
@@ -1043,6 +1061,7 @@ export class CiWakeRuntime {
             // The intent write also yields; rollback there must remove the marker
             // before retrying, since no host wake has been attempted yet.
             if (this.now() - started >= LIMITS.tickMs) {
+              candidateBudgetStops += 1;
               delete ledger.reviewerWakes[wakeKey];
               await this.save(ledger);
               outstanding = true;
@@ -1054,6 +1073,7 @@ export class CiWakeRuntime {
               throw new Error("configuration_changed");
             }
             if (this.now() - started >= LIMITS.tickMs) {
+              candidateBudgetStops += 1;
               delete ledger.reviewerWakes[wakeKey];
               await this.save(ledger);
               outstanding = true;
@@ -1090,9 +1110,20 @@ export class CiWakeRuntime {
           // Retry a request-truncated entry first next tick, unless it already
           // had the whole reviewer share: then rotate it to avoid blocking peers.
           if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
+          entryRetryableErrors += 1;
           this.audit(ledger, "pr_head_wake", "retryable");
           await this.save(ledger);
         }
+      }
+      } catch (error) {
+        reviewerOutcome = "error";
+        throw error;
+      } finally {
+        if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass completed", {
+          reviewerStartedAt, reviewerCompletedAt: this.now(), entryCount: entries.length,
+          entriesExamined, entriesAdmitted, shadowConfiguredEntries, entriesUnexamined: entries.length - entriesExamined,
+          candidateBudgetStops, entryRetryableErrors, entryFinalPrReadDeadlineStops, outcome: reviewerOutcome,
+        });
       }
     }
     await this.save(ledger);
