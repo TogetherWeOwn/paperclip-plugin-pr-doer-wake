@@ -172,6 +172,43 @@ jobs:
           node -e 'const r=require(process.argv[1]); const t=r.testResults.flatMap(f=>f.assertionResults).filter(t=>t.fullName.includes("suppresses protected directives") && t.status==="failed"); if(t.length!==3 || t.some(x=>!x.failureMessages.some(m=>m.includes("to be null")))) process.exit(1); console.log("separator regressions:", t.length)' "$RUNNER_TEMP/baseline.json"
           npx vitest run tests/custody-policy.test.ts -t 'suppresses protected directives'
 
+  reviewer-rollback-baseline:
+    name: Reviewer rollback pinned regression control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: c7982fcbdc88e150ce6f26ec1f2cb06df07ee8f8
+          path: baseline
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - working-directory: candidate
+        run: npm ci --ignore-scripts
+      - name: Verify issue-read rollback fails before the fix
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          test "$(git -C ../baseline rev-parse HEAD)" = c7982fcbdc88e150ce6f26ec1f2cb06df07ee8f8
+          cp src/ci-runtime.ts "$RUNNER_TEMP/ci-runtime.ts"
+          trap 'cp "$RUNNER_TEMP/ci-runtime.ts" src/ci-runtime.ts' EXIT
+          cp ../baseline/src/ci-runtime.ts src/ci-runtime.ts
+          set +e
+          npx vitest run tests/ci-runtime.test.ts -t 'aborts on issue read rollback of enabled' --reporter=json --outputFile="$RUNNER_TEMP/reviewer-baseline.json"
+          result=$?
+          set -e
+          test "$result" -eq 1
+          node -e 'const r=require(process.argv[1]); const t=r.testResults.flatMap(f=>f.assertionResults).filter(t=>t.fullName.includes("aborts on issue read rollback of enabled")); if(t.length!==1 || t[0].status!=="failed" || !t[0].failureMessages.some(m=>m.includes("not be called"))) process.exit(1); console.log("expected stale-authority wake observed")' "$RUNNER_TEMP/reviewer-baseline.json"
+          cp "$RUNNER_TEMP/ci-runtime.ts" src/ci-runtime.ts
+          npx vitest run tests/ci-runtime.test.ts -t 'aborts on issue read rollback of enabled'
+
   stock-host-sql:
     name: Stock host SQL fixture
     runs-on: ubuntu-24.04
