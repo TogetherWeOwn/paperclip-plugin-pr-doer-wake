@@ -891,6 +891,7 @@ export class CiWakeRuntime {
       let shadowConfiguredEntries = 0;
       let candidateBudgetStops = 0;
       let entryRetryableErrors = 0;
+      let entryFinalPrReadDeadlineStops = 0; // Subset of entryRetryableErrors.
       let reviewerOutcome = "entries_examined";
       // Configuration is not yet known; this aggregate does not assert shadow mode.
       if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass started", { reviewerStartedAt, entryCount: entries.length });
@@ -953,7 +954,10 @@ export class CiWakeRuntime {
             await this.save(ledger); continue;
           }
           // The final GitHub read can finish after the tick's admission budget.
-          if (this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
+          if (this.now() - started >= LIMITS.tickMs) {
+            entryFinalPrReadDeadlineStops += 1;
+            throw new Error("tick_budget");
+          }
           // Revalidate binding, enablement, allowlist, pr-head flags, dry-run
           // and the credential identity immediately after the final GitHub
           // read: an operator rollback (dryRun: true, disable, revoke) made
@@ -1019,9 +1023,9 @@ export class CiWakeRuntime {
               catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
             }
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
-            if (this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            if (this.now() - started >= LIMITS.tickMs) { candidateBudgetStops += 1; outstanding = true; break; }
             await validateAuthority();
-            if (this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
+            if (this.now() - started >= LIMITS.tickMs) { candidateBudgetStops += 1; outstanding = true; break; }
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
               entry.shadowLogged ??= [];
@@ -1057,6 +1061,7 @@ export class CiWakeRuntime {
             // The intent write also yields; rollback there must remove the marker
             // before retrying, since no host wake has been attempted yet.
             if (this.now() - started >= LIMITS.tickMs) {
+              candidateBudgetStops += 1;
               delete ledger.reviewerWakes[wakeKey];
               await this.save(ledger);
               outstanding = true;
@@ -1068,6 +1073,7 @@ export class CiWakeRuntime {
               throw new Error("configuration_changed");
             }
             if (this.now() - started >= LIMITS.tickMs) {
+              candidateBudgetStops += 1;
               delete ledger.reviewerWakes[wakeKey];
               await this.save(ledger);
               outstanding = true;
@@ -1116,7 +1122,7 @@ export class CiWakeRuntime {
         if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass completed", {
           reviewerStartedAt, reviewerCompletedAt: this.now(), entryCount: entries.length,
           entriesExamined, entriesAdmitted, shadowConfiguredEntries, entriesUnexamined: entries.length - entriesExamined,
-          candidateBudgetStops, entryRetryableErrors, outcome: reviewerOutcome,
+          candidateBudgetStops, entryRetryableErrors, entryFinalPrReadDeadlineStops, outcome: reviewerOutcome,
         });
       }
     }
