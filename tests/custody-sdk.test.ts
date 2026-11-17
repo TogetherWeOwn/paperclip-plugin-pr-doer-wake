@@ -219,6 +219,27 @@ describe("scheduled pr-custody job over the real SDK/host contract", () => {
     } finally { h.stop(); }
   });
 
+  it("does not publish partial evidence or dispatch effects when a later comment page is invalid", async () => {
+    const liveConfig = { ...custodyConfig, custodyDryRun: false };
+    const comments = Array.from({ length: 201 }, (_, i) => comment(i + 1, i === 0 ? DIRECTIVE : "ordinary comment"));
+    comments[200]!.author_type = "invalid";
+    const h = await custodyHost(liveConfig, { open: true, issues: [issue(1, PR_URL, null)], comments });
+    try {
+      await h.send("initialize-partial", "initialize", initialize);
+      await h.send("config-partial", "configChanged", { config: liveConfig, companyId: COMPANY });
+      await expect(h.send("job-partial", "runJob", runJob)).rejects.toThrow("custody_inventory_failed:other");
+      expect(h.calls.filter((c) => c.method === "db.query" && String(c.params.sql).includes("public.issue_comments"))).toHaveLength(2);
+      expect(h.ledger()?.report).toMatchObject({ complete: false, unknown: ["inventory"], unknownReasons: ["other"], effects: 0, failure: "other", rows: [] });
+      expect(h.ledger()?.dispositions).toEqual({});
+      const readsAndLedger = new Set(["events.subscribe", "config.get", "state.get", "state.set", "db.query", "projects.get", "projects.listWorkspaces", "issues.get", "secrets.resolve", "http.fetch"]);
+      expect(h.calls.filter((c) => !readsAndLedger.has(c.method))).toEqual([]);
+      for (const call of h.calls.filter((c) => c.method === "http.fetch")) {
+        const method = (call.params.init as { method?: string } | undefined)?.method ?? "GET";
+        expect(method === "GET" || (method === "POST" && new URL(String(call.params.url)).pathname === "/graphql")).toBe(true);
+      }
+    } finally { h.stop(); }
+  });
+
   it.each([0, 1])("shares the metadata and mapped comment budget at the ceiling + %i byte", async (extra) => {
     // Individually valid bodies, with metadata and comments each below the
     // ceiling but their combined size exactly at it (or one byte over).

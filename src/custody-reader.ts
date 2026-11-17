@@ -71,6 +71,11 @@ const STATUSES = new Set(["backlog", "todo", "in_progress", "in_review", "done",
 type Row = Record<string, unknown>;
 type Table = "issues" | "issue_comments" | "issue_documents";
 
+export class SharedTextLimit extends Error {
+  constructor(reason: "total byte budget exceeded" | "issue_comments row budget exceeded") {
+    super(`UNKNOWN custody snapshot: ${reason}`);
+  }
+}
 function unknown(reason: string): never {
   throw new Error(`UNKNOWN custody snapshot: ${reason}`);
 }
@@ -157,9 +162,9 @@ export function custodyByteBudget() {
   let totalBytes = 0;
   return (body: string): void => {
     const bytes = Buffer.byteLength(body, "utf8");
-    if (body.length > MAX_BODY_CHARS || bytes > MAX_BODY_BYTES) unknown("body budget exceeded");
     totalBytes += bytes;
-    if (totalBytes > MAX_TOTAL_BYTES) unknown("total byte budget exceeded");
+    if (totalBytes > MAX_TOTAL_BYTES) throw new SharedTextLimit("total byte budget exceeded");
+    if (body.length > MAX_BODY_CHARS || bytes > MAX_BODY_BYTES) unknown("body budget exceeded");
   };
 }
 
@@ -240,14 +245,15 @@ export async function loadCustodyCards(
 
 /**
  * Load comment bodies for an explicit candidate set only (no document bodies).
- * Appends to each card's texts in place and returns the same array. Callers
+ * Publishes text only after the entire candidate traversal succeeds. Callers
  * should pass only cards already mapped to a PR in the current inventory so
  * the byte budget tracks PR count, not company history size. Any failure
- * rejects the whole batch (fail closed): callers must treat the affected
- * PRs as UNKNOWN, never as evidence-free.
+ * rejects the whole batch without publishing partial evidence: callers must
+ * treat the affected PRs as UNKNOWN, never as evidence-free.
  */
 export async function loadCustodyTexts(
   ctx: PluginContext, companyId: string, guard: () => void, cards: CustodyCard[], budget: ReturnType<typeof custodyByteBudget>,
+  rowBudget: { comments: number } = { comments: 0 },
 ): Promise<CustodyCard[]> {
   id(companyId);
   const acquired = (value: unknown): void => { if (typeof value === "string") budget(value); };
@@ -259,8 +265,10 @@ export async function loadCustodyTexts(
     byId.set(card.id, card);
   }
   const issueIds = [...byId.keys()];
+  const staged = new Map(issueIds.map((issueId) => [issueId, [] as CustodyCard["texts"]]));
   async function rows(table: Table, columns: string, cap: number, visit: (row: Row) => void): Promise<void> {
-    let count = 0;
+    let count = rowBudget.comments;
+    if (count > cap) throw new SharedTextLimit("issue_comments row budget exceeded");
     let cursor: string | null = null;
     for (;;) {
       const limit = Math.min(PAGE_SIZE, cap - count + 1);
@@ -270,15 +278,29 @@ export async function loadCustodyTexts(
         ORDER BY id ASC LIMIT $3`;
       guard();
       const page = await ctx.db.query(sql, [companyId, cursor, limit, `{${issueIds.join(",")}}`]);
-      if (!Array.isArray(page) || page.length > limit) unknown(`${table} malformed page`);
+      if (!Array.isArray(page)) unknown(`${table} malformed page`);
+      // The host has already returned the whole page, even if its first row is
+      // invalid. Charge all acquired rows and bodies before validating any row.
+      rowBudget.comments += page.length;
+      count = rowBudget.comments;
+      let chargeError: unknown;
+      for (const value of page) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+        try {
+          acquired((value as Row).body);
+        } catch (error) {
+          if (chargeError === undefined || error instanceof SharedTextLimit) chargeError = error;
+        }
+      }
+      if (count > cap) throw new SharedTextLimit("issue_comments row budget exceeded");
+      if (chargeError !== undefined) throw chargeError;
+      if (page.length > limit) unknown(`${table} malformed page`);
       for (const value of page) {
         const row = record(value);
         if (row.company_id !== companyId) unknown(`${table} cross-company row`);
         const next = id(row.id);
         if (cursor !== null && next <= cursor) unknown(`${table} duplicate or unordered row`);
         cursor = next;
-        if (count === cap) unknown(`${table} row budget exceeded`);
-        count++;
         visit(row);
       }
       if (page.length < limit) return;
@@ -293,16 +315,15 @@ export async function loadCustodyTexts(
   await rows("issue_comments", `id, company_id, issue_id, body,
     author_agent_id, author_user_id, author_type, deleted_at, updated_at`, MAX_COMMENTS, (row) => {
     const card = parent(row);
-    // Every acquired body counts, including deleted comments skipped below.
-    acquired(row.body);
     if (nullableTime(row.deleted_at) !== null) return;
     const agent = nullableId(row.author_agent_id);
     const user = nullableText(row.author_user_id, "author_user_id");
     const authorType = nullableText(row.author_type, "author_type");
     if (authorType !== null && !["agent", "user", "system"].includes(authorType)) unknown("invalid comment author_type");
     const body = text(row.body, "comment body");
-    card.texts.push({ id: `comment:${id(row.id)}`, body, at: time(row.updated_at), ownership: agent !== null && user === null && (authorType === null || authorType === "agent") });
+    staged.get(card.id)!.push({ id: `comment:${id(row.id)}`, body, at: time(row.updated_at), ownership: agent !== null && user === null && (authorType === null || authorType === "agent") });
   });
+  for (const [issueId, texts] of staged) for (const entry of texts) byId.get(issueId)!.texts.push(entry);
 
   // Directives are read from comments only: document bodies are never
   // loaded, so an oversized document can no longer abort the whole snapshot.
