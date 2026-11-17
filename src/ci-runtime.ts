@@ -1034,6 +1034,12 @@ export class CiWakeRuntime {
               await this.save(ledger);
               throw new Error("configuration_changed");
             }
+            if (this.now() - started >= LIMITS.tickMs) {
+              delete ledger.reviewerWakes[wakeKey];
+              await this.save(ledger);
+              outstanding = true;
+              break;
+            }
             wakes += 1;
             let result: Awaited<ReturnType<PluginContext["issues"]["requestWakeup"]>>;
             try {

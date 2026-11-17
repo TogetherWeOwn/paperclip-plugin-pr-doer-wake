@@ -1060,6 +1060,26 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().reviewerWakes ?? {}).toEqual({});
     });
 
+    it("defers an unsent intent when the tick budget expires during persistence", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      github.readiness.mockReturnValue(verdict("pass"));
+      const set = h.set.getMockImplementation()!;
+      h.set.mockImplementation(async (key, ledger) => {
+        await set(key, ledger);
+        if ((ledger as Ledger).audits.at(-1)?.outcome === "intent") h.advance(LIMITS.tickMs);
+      });
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().reviewerWakes ?? {}).toEqual({});
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      h.set.mockImplementation(set);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
     it("revalidates between candidates without repeating the first wake", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
