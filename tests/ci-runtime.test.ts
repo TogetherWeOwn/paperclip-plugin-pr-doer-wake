@@ -1204,6 +1204,71 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     });
 
+    it("recovers an unsent reviewer wake after both deadline cleanup writes fail", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      github.readiness.mockReturnValue(verdict("pass"));
+      const wakeKey = `${COMPANY}:${ISSUE}:${NEXT_HEAD}`;
+      const set = h.set.getMockImplementation()!;
+      let failedWrites = 0;
+      let expired = false;
+      h.set.mockImplementation(async (key, value) => {
+        if (h.ledger().reviewerWakes?.[wakeKey] !== undefined && (value as Ledger).reviewerWakes?.[wakeKey] === undefined) {
+          failedWrites++;
+          throw new Error("cleanup write unavailable before commit");
+        }
+        await set(key, value);
+      });
+      h.configGet.mockImplementation(async () => {
+        if (!expired && h.ledger().reviewerWakes?.[wakeKey] !== undefined) {
+          expired = true;
+          h.advance(LIMITS.tickMs);
+        }
+        return clone(h.rawConfig);
+      });
+      await expect(h.runtime.poll()).rejects.toThrow("cleanup write unavailable before commit");
+      expect(expired).toBe(true);
+      expect(failedWrites).toBe(2);
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().reviewerWakes?.[wakeKey]).toBe(START);
+      expect(h.ledger().prHeadPending?.[`${COMPANY}:${REPO}:17`]?.newSha).toBe(NEXT_HEAD);
+
+      h.set.mockImplementation(set);
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls, "recovered reviewer wake").toHaveLength(1);
+      expect(h.requestWakeup.mock.calls[0]).toEqual([ISSUE, COMPANY, expect.objectContaining({
+        idempotencyKey: `pr-head-wake:${REPO}:17:${NEXT_HEAD}:${ISSUE}`,
+      })]);
+      expect(h.ledger().prHeadPending).toEqual({});
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["queued", "ambiguous"])("keeps a %s reviewer wake deduped when outcome writes fail", async (outcome) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      github.readiness.mockReturnValue(verdict("pass"));
+      if (outcome === "ambiguous") h.requestWakeup.mockRejectedValueOnce(new Error("wake reply lost"));
+      const set = h.set.getMockImplementation()!;
+      h.set.mockImplementation(async (key, value) => {
+        if (h.requestWakeup.mock.calls.length) throw new Error("outcome write unavailable before commit");
+        await set(key, value);
+      });
+      await expect(h.runtime.poll()).rejects.toThrow("outcome write unavailable before commit");
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().reviewerWakes?.[`${COMPANY}:${ISSUE}:${NEXT_HEAD}`]).toBe(START);
+      expect(h.ledger().prHeadPending?.[`${COMPANY}:${REPO}:17`]?.newSha).toBe(NEXT_HEAD);
+
+      h.set.mockImplementation(set);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(h.ledger().prHeadPending).toEqual({});
+    });
+
     it("revalidates between candidates without repeating the first wake", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);

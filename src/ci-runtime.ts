@@ -241,6 +241,9 @@ export class CiWakeRuntime {
   private pollInFlight = false;
   private targetedPoll = false;
   private fullPollRequested = false;
+  // At most one known-unsent deadline rollback can fail before the poll exits.
+  // After a worker restart, a durable marker alone still means do not retry.
+  private unsentReviewerIntent?: { key: string; at: number };
   private readonly pendingTargets = new Map<string, { companyId: string; repo: string; sha: string }>();
   private pendingWebhooks = 0;
   private webhookAdmissions = { since: 0, used: 0 };
@@ -737,8 +740,11 @@ export class CiWakeRuntime {
 
   private async pollLocked(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
     let ledger = await this.load();
+    const unsent = this.unsentReviewerIntent;
+    if (unsent && ledger.reviewerWakes[unsent.key] === unsent.at) delete ledger.reviewerWakes[unsent.key];
     this.compact(ledger);
     await this.save(ledger);
+    this.unsentReviewerIntent = undefined;
     const started = this.now();
     let requests = 0;
     let wakes = 0;
@@ -1034,28 +1040,29 @@ export class CiWakeRuntime {
             if (wakes >= LIMITS.wakePerTick || requests >= LIMITS.requestsPerTick || this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
             // Persist dedupe intent BEFORE the host call. A lost reply or
             // restart never repeats this (card, SHA) effect.
-            ledger.reviewerWakes[wakeKey] = this.now();
+            const intentAt = this.now();
+            ledger.reviewerWakes[wakeKey] = intentAt;
             this.audit(ledger, "pr_head_wake", "intent");
             try { await this.save(ledger); } catch {
               delete ledger.reviewerWakes[wakeKey];
               outstanding = true; throw new Error("wake_intent_write_failed");
             }
-            // The intent write also yields; rollback there must remove the marker
-            // before retrying, since no host wake has been attempted yet.
-            if (this.now() - started >= LIMITS.tickMs) {
-              delete ledger.reviewerWakes[wakeKey];
-              await this.save(ledger);
-              outstanding = true;
-              break;
+            let expired = this.now() - started >= LIMITS.tickMs;
+            if (!expired) {
+              try { await validateAuthority(); } catch {
+                delete ledger.reviewerWakes[wakeKey];
+                await this.save(ledger);
+                throw new Error("configuration_changed");
+              }
+              expired = this.now() - started >= LIMITS.tickMs;
             }
-            try { await validateAuthority(); } catch {
+            if (expired) {
               delete ledger.reviewerWakes[wakeKey];
+              // If this and the outer catch's save fail, the next poll can
+              // clear this exact marker: no dispatch was attempted here.
+              this.unsentReviewerIntent = { key: wakeKey, at: intentAt };
               await this.save(ledger);
-              throw new Error("configuration_changed");
-            }
-            if (this.now() - started >= LIMITS.tickMs) {
-              delete ledger.reviewerWakes[wakeKey];
-              await this.save(ledger);
+              this.unsentReviewerIntent = undefined;
               outstanding = true;
               break;
             }
@@ -1092,6 +1099,7 @@ export class CiWakeRuntime {
           if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
           this.audit(ledger, "pr_head_wake", "retryable");
           await this.save(ledger);
+          this.unsentReviewerIntent = undefined;
         }
       }
     }
