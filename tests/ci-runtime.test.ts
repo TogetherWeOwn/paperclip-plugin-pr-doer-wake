@@ -807,6 +807,36 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(h.ledger().prHeadPending ?? {}).toEqual({});
     });
 
+    it.each([0, 1])("defers the initial reviewer authority read when the final PR read returns %i ms past the tick deadline", async (overrun) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll(); // Persist the head change while CI is pending.
+      github.readiness.mockReturnValue(verdict("pass"));
+      github.pull.mockClear();
+      github.pull.mockResolvedValueOnce(pull({ headSha: NEXT_HEAD })).mockImplementationOnce(async () => {
+        h.advance(LIMITS.tickMs + overrun);
+        return pull({ headSha: NEXT_HEAD });
+      });
+      h.configGet.mockClear();
+      h.issueGet.mockClear();
+
+      await h.runtime.poll();
+      expect(github.pull).toHaveBeenCalledTimes(2);
+      expect(h.configGet).toHaveBeenCalledTimes(1); // Entry config only, no authority re-read.
+      expect(h.issueGet).not.toHaveBeenCalled();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().reviewerWakes).toEqual({});
+      expect(h.ledger().prHeadPending?.[`${COMPANY}:${REPO}:17`]).toMatchObject({ oldSha: HEAD, newSha: NEXT_HEAD });
+
+      const restarted = new CiWakeRuntime(h.ctx, h.clock);
+      await restarted.poll();
+      expect(h.requestWakeup).toHaveBeenCalledExactlyOnceWith(ISSUE, COMPANY, expect.objectContaining({
+        idempotencyKey: `pr-head-wake:${REPO}:17:${NEXT_HEAD}:${ISSUE}`,
+      }));
+      expect(h.ledger().prHeadPending).toEqual({});
+    });
+
     // Paperclip 2026.1106.0 ctx.issues.get returns no workProducts; the candidate
     // card is already bound to this PR by its registered wait.
     it.each([true, false])("handles a reviewer when the host omits work products (shadow=%s), relying on the registered wait's binding", async (shadow) => {
