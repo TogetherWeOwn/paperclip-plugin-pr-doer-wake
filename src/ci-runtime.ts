@@ -943,8 +943,12 @@ export class CiWakeRuntime {
           // and the credential identity immediately after the final GitHub
           // read: an operator rollback (dryRun: true, disable, revoke) made
           // during that await must not be followed by a stale-authority wake.
-          const revalidated = await this.config(entry.companyId);
-          if (!revalidated.enabled || !revalidated.prHeadWakeEnabled || !revalidated.allowedRepos.includes(entry.repo) || revalidated.prHeadWakeShadow !== config.prHeadWakeShadow || revalidated.dryRun !== config.dryRun || authIdentity(revalidated) !== authIdentity(config)) throw new Error("configuration_changed");
+          const validateAuthority = async () => {
+            const current = await this.config(entry.companyId);
+            if (!current.enabled || !current.prHeadWakeEnabled || !current.allowedRepos.includes(entry.repo) || current.prHeadWakeShadow !== config.prHeadWakeShadow || current.dryRun !== config.dryRun || authIdentity(current) !== authIdentity(config)) throw new Error("configuration_changed");
+            return current;
+          };
+          const revalidated = await validateAuthority();
           // dryRun is the global rollback kill-switch: it forces no-fire
           // (effective shadow) exactly like prHeadWakeShadow, so an operator
           // rollback via dryRun: true silences this path too.
@@ -997,6 +1001,7 @@ export class CiWakeRuntime {
               catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
             }
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
+            await validateAuthority();
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
               entry.shadowLogged ??= [];
@@ -1021,6 +1026,13 @@ export class CiWakeRuntime {
             try { await this.save(ledger); } catch {
               delete ledger.reviewerWakes[wakeKey];
               outstanding = true; throw new Error("wake_intent_write_failed");
+            }
+            // The intent write also yields; rollback there must remove the marker
+            // before retrying, since no host wake has been attempted yet.
+            try { await validateAuthority(); } catch {
+              delete ledger.reviewerWakes[wakeKey];
+              await this.save(ledger);
+              throw new Error("configuration_changed");
             }
             wakes += 1;
             let result: Awaited<ReturnType<PluginContext["issues"]["requestWakeup"]>>;

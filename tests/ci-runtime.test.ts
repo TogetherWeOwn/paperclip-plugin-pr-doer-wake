@@ -1029,6 +1029,58 @@ describe("CI runtime polling and durable wake outcomes", () => {
       expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1); // retained, not fired
     });
 
+    it.each([
+      ["issue", "enabled", false],
+      ["issue", "prHeadWakeEnabled", false],
+      ["issue", "dryRun", true],
+      ["binding", "prHeadWakeShadow", true],
+      ["binding", "allowedRepos", []],
+      ["intent", "dryRun", true],
+    ])("aborts on %s read rollback of %s", async (where, field, value) => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      delete (h.issue as { workProducts?: unknown }).workProducts;
+      await movedHead(h);
+      await h.runtime.poll(); // record the moved head while readiness is pending
+      github.readiness.mockReturnValue(verdict("pass"));
+      if (where === "issue") {
+        h.issueGet.mockImplementation(async () => { h.rawConfig[field] = value; return clone(h.issue); });
+      } else if (where === "binding") {
+        h.workspaceGet.mockImplementation(async () => { h.rawConfig[field] = value; return clone(h.workspace); });
+      } else {
+        const set = h.set.getMockImplementation()!;
+        h.set.mockImplementation(async (key, ledger) => {
+          await set(key, ledger);
+          if ((ledger as Ledger).audits.at(-1)?.outcome === "intent") h.rawConfig[field] = value;
+        });
+      }
+      await h.runtime.poll();
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      expect(h.ledger().reviewerWakes ?? {}).toEqual({});
+    });
+
+    it("revalidates between candidates without repeating the first wake", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      const ledger = h.ledger();
+      ledger.waits.push({ ...ledger.waits[0]!, issueId: OTHER, waitId: OTHER });
+      h.seed(ledger);
+      h.issueGet.mockImplementation(async (id) => ({ ...clone(h.issue), id }));
+      github.readiness.mockReturnValue(verdict("pass"));
+      h.requestWakeup.mockImplementation(async () => { h.rawConfig.dryRun = true; return { queued: true }; });
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      h.rawConfig.dryRun = false;
+      h.requestWakeup.mockResolvedValue({ queued: true });
+      await h.runtime.poll();
+      expect(h.requestWakeup.mock.calls.map(([id]) => id)).toEqual([ISSUE, OTHER]);
+      expect(h.ledger().prHeadPending ?? {}).toEqual({});
+    });
+
     it("keeps the original oldSha on a base-branch-only edit", async () => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
       inReviewIssue(h, OTHER);
