@@ -1086,6 +1086,22 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().report.rows.map((row: any) => row.pr)).toEqual(["example/tail#42"]);
     expect(h.ledger().cursors["example/tail"]).toBe(NOW);
   });
+  it("serves every individually admissible repository across aggregate-capacity ticks", async () => {
+    const h = fixture({ dryRun: true, open: [] });
+    const repos = ["example/a", "example/b", "example/c"];
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(repos);
+    const body = "x".repeat(4_300_000);
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      await this.attempt(`https://api.github.com/list/${repo}/${status}`, {});
+      return status === "open" ? [pull({ repo, headRepo: repo, body })] : [];
+    });
+    const served: string[] = [];
+    for (let tick = 0; tick < 3; tick++) {
+      await h.restart().poll();
+      served.push(h.ledger().report.rows[0].pr);
+    }
+    expect(served).toEqual(repos.map((repo) => `${repo}#42`));
+  });
   it("persists listing turns on admitted partial work independently of legacy evidence order", async () => {
     const h = fixture({ open: [], dryRun: true });
     vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/tail", "example/project"]);
@@ -1147,6 +1163,18 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().listingTurns).toEqual({ "example/old": 1, "example/project": 2 });
     await h.restart().poll();
     expect(h.ledger().listingTurns).toEqual({ "example/project": 2 });
+  });
+  it("prunes removed index entries only after complete discovery and preserves failed listings", async () => {
+    const h = fixture({ open: [], dryRun: true });
+    const key = JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:dry" });
+    const prToCards = { "example/old#42": ISSUE, "example/project#42": ISSUE };
+    h.state.set(key, { version: 1, receipts: {}, cursors: {}, attempted: {}, heads: {}, dispositions: {}, audits: [], prToCards });
+    vi.mocked(CustodyGithub.prototype.repositories).mockRejectedValueOnce(new Error("incomplete"));
+    await expect(h.runtime.poll()).rejects.toThrow("custody_inventory_failed");
+    expect(h.ledger().prToCards).toEqual(prToCards);
+    h.listing.mockRejectedValue(new Error("listing failed"));
+    await h.restart().poll();
+    expect(h.ledger().prToCards).toEqual({ "example/project#42": ISSUE });
   });
   it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER])("rejects invalid listing turn %s", async (turn) => {
     const h = fixture({ dryRun: true });

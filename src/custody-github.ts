@@ -26,8 +26,10 @@ export const ORDER_SKEW_MS = 5 * 60_000;
 // Closed history is often much larger than live inventory. The shared request
 // budget and deadline still apply; these bounds do not guarantee completion.
 const CLOSED_PAGE_MULTIPLIER = 10;
-const CLOSED_RETAINED_ROWS = 10_000;
-const CLOSED_RETAINED_BYTES = 16 * 1024 * 1024;
+const PULL_RETAINED_ROWS = 10_000;
+// Each state has its own bounded accumulator; the runtime also enforces a
+// tighter aggregate limit across both states and all admitted repositories.
+const PULL_RETAINED_BYTES = 8 * 1024 * 1024;
 function object(value: unknown): ObjectValue {
   if (!value || typeof value !== "object" || Array.isArray(value)) return invalid();
   return value as ObjectValue;
@@ -148,12 +150,12 @@ export class CustodyGithub extends CiGithub {
       if (state === "open" && parsed.updatedAt > previous + ORDER_SKEW_MS) return invalid();
       previous = Math.min(previous, parsed.updatedAt);
       return { key: parsed.number, value: parsed };
-    }, state === "closed" ? {
-      include: (value) => value.updatedAt >= since!,
-      maxPages: this.maxPages * CLOSED_PAGE_MULTIPLIER,
-      maxRows: CLOSED_RETAINED_ROWS,
-      maxBytes: CLOSED_RETAINED_BYTES,
-    } : undefined);
+    }, {
+      include: (value) => state === "open" || value.updatedAt >= since!,
+      maxPages: state === "closed" ? this.maxPages * CLOSED_PAGE_MULTIPLIER : this.maxPages,
+      maxRows: PULL_RETAINED_ROWS,
+      maxBytes: PULL_RETAINED_BYTES,
+    });
     return result;
   }
 

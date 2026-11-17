@@ -90,6 +90,15 @@ describe("CustodyGithub REST enumeration", () => {
     }
   });
 
+  it("bounds open-list accumulation across individually admissible pages", async () => {
+    const { client, calls } = fixtures((url) => {
+      const page = Number(url.searchParams.get("page"));
+      return response(Array.from({ length: 100 }, (_, index) => rawPull((page - 1) * 100 + index + 1, { body: "é".repeat(22_500) })));
+    }, { maxBodyBytes: CUSTODY_LIMITS.bodyBytes });
+    await expect(client.pulls(REPO, "open")).rejects.toMatchObject({ code: "budget" });
+    expect(calls).toHaveLength(2);
+  });
+
   it("lists more than 100 open PRs without search or requiring total_count", async () => {
     const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
       ? Array.from({ length: 100 }, (_, index) => rawPull(index + 1)) : [rawPull(101)]));
@@ -276,7 +285,7 @@ describe("CustodyGithub REST enumeration", () => {
       })));
     }, { maxBodyBytes: CUSTODY_LIMITS.bodyBytes });
     await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "budget" });
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(2);
   });
 
   it("validates old closed pages even after the cutoff", async () => {

@@ -345,6 +345,7 @@ export class CustodyRuntime {
       for (const repo of Object.keys(listingTurns)) if (!monitored.has(repo)) delete listingTurns[repo];
       for (const repo of Object.keys(ledger.activityAfter)) if (!monitored.has(repo)) delete ledger.activityAfter[repo];
       for (const ref of Object.keys(ledger.heads)) if (!monitored.has(ref.split("#")[0]!)) delete ledger.heads[ref];
+      for (const ref of Object.keys(ledger.prToCards)) if (!monitored.has(ref.split("#")[0]!)) delete ledger.prToCards[ref];
       const summaries = new Set<string>();
       const pending: Array<{ pr: CustodyPull; card: CustodyCard; trigger: Trigger; repo: string; disposition: Disposition | null }> = [];
       const scanned = new Map<string, number>();
@@ -359,6 +360,7 @@ export class CustodyRuntime {
       let retainedRows = 0;
       let retainedBytes = 0;
       const oversized = new Set<string>();
+      const refused: string[] = [];
       for (const repo of sortedRepos) {
         try {
           if (!listingAvailable()) throw new Error("inventory_budget");
@@ -373,10 +375,7 @@ export class CustodyRuntime {
             // Only a listing that could fit on an empty tick gets priority;
             // permanently oversized repositories must still yield to others.
             if (open.length + closed.length <= CUSTODY_LIMITS.prs && bytes <= CUSTODY_LIMITS.retainedBytes) {
-              const others = Object.keys(listingTurns).filter((name) => name !== repo)
-                .sort((a, b) => listingTurns[a]! - listingTurns[b]! || (a < b ? -1 : a > b ? 1 : 0));
-              listingTurns[repo] = 1;
-              others.forEach((name, index) => { listingTurns[name] = index + 2; });
+              refused.push(repo);
             } else oversized.add(repo);
             throw new Error("inventory_budget");
           }
@@ -385,6 +384,14 @@ export class CustodyRuntime {
           inventories.set(repo, { open, closed, until });
         } catch (error) { unknown(repo, unknownReason(error)); }
         finally { listingRepo = undefined; }
+      }
+      // Preserve the order of all capacity-refused repositories ahead of
+      // serviced ones, so later refusals cannot starve between ticks.
+      if (refused.length) {
+        const refusedSet = new Set(refused);
+        const others = Object.keys(listingTurns).filter((name) => !refusedSet.has(name))
+          .sort((a, b) => listingTurns[a]! - listingTurns[b]! || (a < b ? -1 : a > b ? 1 : 0));
+        [...refused, ...others].forEach((name, index) => { listingTurns[name] = index + 1; });
       }
       // An individually oversized listing cannot benefit from an empty tick.
       // Keep it behind the other admitted listings on the next tick.
