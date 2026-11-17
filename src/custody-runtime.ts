@@ -281,13 +281,30 @@ export class CustodyRuntime {
         : await this.ctx.secrets.resolve(config.tokenRef!, { companyId: config.companyId, configPath: "githubTokenSecretRef" });
       // Reserve discovery capacity inside the client's admission gate, before its sole counter advances.
       const inventoryAvailable = () => github.requestCount < CUSTODY_LIMITS.requests - 100 && this.now() - started < CUSTODY_LIMITS.tickMs - 30_000;
+      // Keep a separate bounded slice for evidence, in addition to dispatch.
+      // Persist each admitted listing turn before its first network request.
+      let listingTurn: { repo: string; at: number } | undefined;
+      let listingPhase = false;
+      let listingSaveFailed = false;
       const github: CustodyGithub = new CustodyGithub((url, init) => this.ctx.http.fetch(url, init), credential, {
         now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100, maxBodyBytes: CUSTODY_LIMITS.bodyBytes,
         beforeRequest: () => {
           guard();
-          if (!dispatching && !inventoryAvailable()) throw new Error("custody_request_budget");
+          if (!dispatching && (!inventoryAvailable() || (listingPhase && (github.requestCount >= CUSTODY_LIMITS.requests - 200 || this.now() - started >= CUSTODY_LIMITS.tickMs - 60_000)))) throw new Error("custody_request_budget");
         },
         onRequestAdmitted: async () => {
+          if (listingTurn) {
+            const turn = listingTurn;
+            listingTurn = undefined;
+            const previous = ledger.attempted[turn.repo];
+            ledger.attempted[turn.repo] = turn.at;
+            try { await save(); } catch (error) {
+              if (previous === undefined) delete ledger.attempted[turn.repo];
+              else ledger.attempted[turn.repo] = previous;
+              listingSaveFailed = true;
+              throw error;
+            }
+          }
           if (dispatchReceipt) {
             const receipt = dispatchReceipt;
             dispatchReceipt = undefined; // A conditional retry belongs to the same scheduling turn.
@@ -313,8 +330,10 @@ export class CustodyRuntime {
       const attemptBase = Object.values(ledger.attempted).reduce((max, at) => Math.max(max, at), this.now());
       const attemptTimes = new Map(sortedRepos.map((repo, index) => [repo, attemptBase + sortedRepos.length - index]));
       const inventories = new Map<string, { open: CustodyPull[]; closed: CustodyPull[]; until: number }>();
+      const previousAttempts = new Map(sortedRepos.map((repo) => [repo, ledger.attempted[repo]]));
+      listingPhase = true;
       for (const repo of sortedRepos) {
-        const requestsBeforeListing = github.requestCount;
+        listingTurn = { repo, at: attemptTimes.get(repo)! };
         try {
           if (!inventoryAvailable()) throw new Error("inventory_budget");
           // GitHub REST timestamps have second precision; retain inclusive same-second overlap.
@@ -324,12 +343,11 @@ export class CustodyRuntime {
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
           inventories.set(repo, { open, closed, until });
         } catch (error) {
-          // A failed listing that consumed a request must yield its turn; a
-          // repository refused before admission keeps its existing priority.
-          if (github.requestCount > requestsBeforeListing) ledger.attempted[repo] = attemptTimes.get(repo)!;
+          if (listingSaveFailed) throw error;
           unknown(repo, unknownReason(error));
-        }
+        } finally { listingTurn = undefined; }
       }
+      listingPhase = false;
       // Phase B: explicit-tier mapping over metadata only, then bounded
       // evidence loads for mapped candidates only.
       const cardsById = new Map(cards.map((c) => [c.id, c]));
@@ -523,6 +541,11 @@ export class CustodyRuntime {
           // completed evidence operation or admitted request so partial work
           // cannot repeatedly starve later repos when the budget runs out.
           if (!budgetDenied || evidenceProgress || github.requestCount > requestsBeforeEvidence) ledger.attempted[repo] = attemptAt;
+          else {
+            const previous = previousAttempts.get(repo);
+            if (previous === undefined) delete ledger.attempted[repo];
+            else ledger.attempted[repo] = previous;
+          }
         } catch (error) { unknown(repo, unknownReason(error)); }
       }
       // Persist discovery clocks/removals as one batch before any effect can depend on them.

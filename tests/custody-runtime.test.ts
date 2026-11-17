@@ -988,7 +988,10 @@ describe("coverage, summary and cursor controls", () => {
     vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue([...oversized, healthy]);
     h.ctx.http.fetch.mockResolvedValue({ status: 200, headers: {}, body: "{}" } as any);
     h.listing.mockImplementation(async function (this: any, repo, status) {
-      if (repo === healthy) return status === "open" ? [pull({ repo, headRepo: repo, authorIsBot: true })] : [];
+      if (repo === healthy) {
+        await this.attempt(`https://api.github.com/repos/${repo}/pulls?state=${status}`, {});
+        return status === "open" ? [pull({ repo, headRepo: repo, authorIsBot: true })] : [];
+      }
       if (status !== failedState) return [pull({ repo, headRepo: repo, authorIsBot: true })];
       // Model 94 admitted pages followed by the pull collector's retained-byte
       // failure; its byte accounting is exercised by custody-github tests.
@@ -1003,10 +1006,49 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().report.complete).toBe(false);
     h.listing.mockClear();
     await h.restart().poll();
-    expect(h.listing.mock.calls[0]).toEqual([healthy, "open"]);
+    expect(h.listing.mock.calls[0]).toEqual([oversized[11], "open"]);
+    expect(h.listing).toHaveBeenCalledWith(healthy, "open");
     expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: `${healthy}#42` })]);
     expect(h.ledger().report.rows.every((row: any) => row.pr.startsWith(`${healthy}#`))).toBe(true);
     expect(h.ledger().cursors[oversized[0]!]).toBeUndefined();
+  });
+  it("persists the listing turn before the first admitted fetch", async () => {
+    const h = fixture({ cards: [], dryRun: true });
+    let atFetch: any;
+    h.ctx.http.fetch.mockImplementation(async () => {
+      atFetch = structuredClone(h.ledger());
+      throw new Error("interrupted");
+    });
+    h.listing.mockImplementation(async function (this: any) {
+      await this.attempt("https://api.github.com/repos/example/project/pulls?page=1", {});
+      return [];
+    });
+    await h.runtime.poll();
+    expect(atFetch.attempted["example/project"]).toBeDefined();
+    expect(atFetch.report.rows).toEqual([]);
+    expect(atFetch.cursors).toEqual({});
+  });
+  it("services mapped evidence when later rejected listings exhaust discovery", async () => {
+    const h = fixture({ dryRun: true });
+    const healthy = "example/project";
+    const oversized = Array.from({ length: 12 }, (_, i) => `example/z${String(i).padStart(2, "0")}`);
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue([healthy, ...oversized]);
+    h.ctx.http.fetch.mockResolvedValue({ status: 200, headers: {}, body: "{}" } as any);
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      if (repo === healthy) {
+        await this.attempt(`https://api.github.com/repos/${repo}/pulls?state=${status}`, {});
+        return status === "open" ? [pull()] : [];
+      }
+      for (let page = 0; page < 94; page++) await this.attempt(`https://api.github.com/repos/${repo}/pulls?page=${page}`, {});
+      throw new CiGithubError("budget");
+    });
+    for (let tick = 0; tick < 2; tick++) {
+      await h.restart().poll();
+      h.advance(DAY);
+    }
+    expect(h.seedHead).toHaveBeenCalled();
+    expect(h.activity).toHaveBeenCalled();
+    expect(h.ledger().report.rows.some((row: any) => row.pr !== `${healthy}#42`)).toBe(false);
   });
   it("rotates inventory to a budget-skipped repository on subsequent ticks", async () => {
     const h = fixture({ open: [] });
