@@ -1034,7 +1034,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
       ["issue", "prHeadWakeEnabled", false],
       ["issue", "dryRun", true],
       ["binding", "prHeadWakeShadow", true],
-      ["binding", "allowedRepos", []],
+      ["binding", "allowedRepos", ["acme/other"]],
       ["intent", "dryRun", true],
     ])("aborts on %s read rollback of %s", async (where, field, value) => {
       const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
@@ -1067,15 +1067,64 @@ describe("CI runtime polling and durable wake outcomes", () => {
       await h.runtime.poll();
       github.readiness.mockReturnValue(verdict("pass"));
       const set = h.set.getMockImplementation()!;
+      let intentSaved = false;
+      let readsAfterIntent = 0;
+      h.configGet.mockImplementation(async () => { if (intentSaved) readsAfterIntent++; return clone(h.rawConfig); });
       h.set.mockImplementation(async (key, ledger) => {
         await set(key, ledger);
-        if ((ledger as Ledger).audits.at(-1)?.outcome === "intent") h.advance(LIMITS.tickMs);
+        if (!intentSaved && (ledger as Ledger).audits.at(-1)?.operation === "pr_head_wake" && (ledger as Ledger).audits.at(-1)?.outcome === "intent") { intentSaved = true; h.advance(LIMITS.tickMs); }
       });
       await h.runtime.poll();
+      expect(readsAfterIntent).toBe(0);
       expect(h.requestWakeup).not.toHaveBeenCalled();
       expect(h.ledger().reviewerWakes ?? {}).toEqual({});
       expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
       h.set.mockImplementation(set);
+      await h.runtime.poll();
+      expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not start candidate authority read after issue read exhausts the tick", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      github.readiness.mockReturnValue(verdict("pass"));
+      let issueRead = false;
+      let readsAfterIssue = 0;
+      h.issueGet.mockImplementation(async () => { issueRead = true; h.advance(LIMITS.tickMs); return clone(h.issue); });
+      h.configGet.mockImplementation(async () => { if (issueRead) readsAfterIssue++; return clone(h.rawConfig); });
+      await h.runtime.poll();
+      expect(readsAfterIssue).toBe(0);
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().reviewerWakes ?? {}).toEqual({});
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+    });
+
+    it("clears intent and retries when the post-intent authority read exhausts the tick", async () => {
+      const h = setup({ prHeadWakeEnabled: true, prHeadWakeShadow: false });
+      inReviewIssue(h, OTHER);
+      await movedHead(h);
+      await h.runtime.poll();
+      github.readiness.mockReturnValue(verdict("pass"));
+      const set = h.set.getMockImplementation()!;
+      let intentSaved = false;
+      let readsAfterIntent = 0;
+      h.set.mockImplementation(async (key, ledger) => {
+        await set(key, ledger);
+        if ((ledger as Ledger).audits.at(-1)?.operation === "pr_head_wake" && (ledger as Ledger).audits.at(-1)?.outcome === "intent") intentSaved = true;
+      });
+      h.configGet.mockImplementation(async () => {
+        if (intentSaved) { readsAfterIntent++; h.advance(LIMITS.tickMs); }
+        return clone(h.rawConfig);
+      });
+      await h.runtime.poll();
+      expect(readsAfterIntent).toBe(1);
+      expect(h.requestWakeup).not.toHaveBeenCalled();
+      expect(h.ledger().reviewerWakes ?? {}).toEqual({});
+      expect(Object.keys(h.ledger().prHeadPending ?? {})).toHaveLength(1);
+      h.set.mockImplementation(set);
+      h.configGet.mockImplementation(async () => clone(h.rawConfig));
       await h.runtime.poll();
       expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     });

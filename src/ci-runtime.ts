@@ -1001,6 +1001,7 @@ export class CiWakeRuntime {
               catch (error) { if (!(error instanceof BindingChanged)) outstanding = true; continue; }
             }
             if (this.isAuthorParticipant(issue, ledger, entry)) continue;
+            if (this.now() - started >= LIMITS.tickMs) { outstanding = true; break; }
             await validateAuthority();
             const reason = `pr_head_changed: ${entry.repo}#${entry.prNumber} head ${entry.oldSha.slice(0, 7)} -> ${entry.newSha.slice(0, 7)}; CI ${verdict.kind}`;
             if (shadow) {
@@ -1029,6 +1030,12 @@ export class CiWakeRuntime {
             }
             // The intent write also yields; rollback there must remove the marker
             // before retrying, since no host wake has been attempted yet.
+            if (this.now() - started >= LIMITS.tickMs) {
+              delete ledger.reviewerWakes[wakeKey];
+              await this.save(ledger);
+              outstanding = true;
+              break;
+            }
             try { await validateAuthority(); } catch {
               delete ledger.reviewerWakes[wakeKey];
               await this.save(ledger);
