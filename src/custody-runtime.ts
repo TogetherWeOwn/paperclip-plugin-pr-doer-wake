@@ -310,8 +310,11 @@ export class CustodyRuntime {
       // before any card evidence is loaded, so candidate discovery is bounded
       // by PR count (CUSTODY_LIMITS.prs), never by company card history.
       const sortedRepos = repos.sort((a, b) => (ledger.attempted[a] ?? 0) - (ledger.attempted[b] ?? 0));
+      const attemptBase = Object.values(ledger.attempted).reduce((max, at) => Math.max(max, at), this.now());
+      const attemptTimes = new Map(sortedRepos.map((repo, index) => [repo, attemptBase + sortedRepos.length - index]));
       const inventories = new Map<string, { open: CustodyPull[]; closed: CustodyPull[]; until: number }>();
       for (const repo of sortedRepos) {
+        const requestsBeforeListing = github.requestCount;
         try {
           if (!inventoryAvailable()) throw new Error("inventory_budget");
           // GitHub REST timestamps have second precision; retain inclusive same-second overlap.
@@ -320,7 +323,12 @@ export class CustodyRuntime {
           const closed = await github.pulls(repo, "closed", ledger.cursors[repo] ?? config.closedSince);
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
           inventories.set(repo, { open, closed, until });
-        } catch (error) { unknown(repo, unknownReason(error)); }
+        } catch (error) {
+          // A failed listing that consumed a request must yield its turn; a
+          // repository refused before admission keeps its existing priority.
+          if (github.requestCount > requestsBeforeListing) ledger.attempted[repo] = attemptTimes.get(repo)!;
+          unknown(repo, unknownReason(error));
+        }
       }
       // Phase B: explicit-tier mapping over metadata only, then bounded
       // evidence loads for mapped candidates only.
@@ -392,12 +400,10 @@ export class CustodyRuntime {
       }
       for (const ref of Object.keys(ledger.prToCards)) if (!seenPrs.has(ref)) delete ledger.prToCards[ref];
       if (candidates.size) await loadCustodyTexts(this.ctx, config.companyId, guard, [...candidates.values()], budget);
-      // Order this tick's serviced repositories in reverse, even if the clock
-      // has millisecond ties; never-serviced repositories still sort first.
-      const attemptBase = Object.values(ledger.attempted).reduce((max, at) => Math.max(max, at), this.now());
-      let attemptOrder = sortedRepos.length;
+      // Use the same reverse-order turn clocks for listing and evidence service,
+      // even when the clock has millisecond ties.
       for (const repo of sortedRepos) {
-        const attemptAt = attemptBase + attemptOrder--;
+        const attemptAt = attemptTimes.get(repo)!;
         try {
           const inv = inventories.get(repo);
           if (!inv) continue;

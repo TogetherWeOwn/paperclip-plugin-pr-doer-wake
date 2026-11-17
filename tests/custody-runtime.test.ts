@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { CustodyPull } from "../src/custody-github.js";
 import { CustodyGithub } from "../src/custody-github.js";
+import { CiGithubError } from "../src/ci-github.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
 import { CustodyRuntime } from "../src/custody-runtime.js";
 import { CUSTODY_ORIGIN, DAY, hasCardClosure, hasPrClosure, latestDisposition } from "../src/custody-policy.js";
@@ -979,6 +980,33 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.ledger().report.complete).toBe(false);
     expect(h.ledger().cursors).toEqual({});
+  });
+  it.each(["open", "closed"] as const)("yields failed admitted %s listings to a healthy repository across restart", async (failedState) => {
+    const h = fixture({ cards: [], dryRun: true });
+    const oversized = Array.from({ length: 12 }, (_, i) => `example/a${String(i).padStart(2, "0")}`);
+    const healthy = "example/z-healthy";
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue([...oversized, healthy]);
+    h.ctx.http.fetch.mockResolvedValue({ status: 200, headers: {}, body: "{}" } as any);
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      if (repo === healthy) return status === "open" ? [pull({ repo, headRepo: repo, authorIsBot: true })] : [];
+      if (status !== failedState) return [pull({ repo, headRepo: repo, authorIsBot: true })];
+      // Model 94 admitted pages followed by the pull collector's retained-byte
+      // failure; its byte accounting is exercised by custody-github tests.
+      for (let page = 0; page < 94; page++) await this.attempt(`https://api.github.com/repos/${repo}/pulls?page=${page}`, {});
+      throw new CiGithubError("budget");
+    });
+    await h.runtime.poll();
+    expect(h.ledger().report.rows).toEqual([]);
+    expect(h.ledger().cursors).toEqual({});
+    expect(h.ledger().attempted[oversized[0]!]).toBeDefined();
+    expect(h.ledger().attempted[healthy]).toBeUndefined();
+    expect(h.ledger().report.complete).toBe(false);
+    h.listing.mockClear();
+    await h.restart().poll();
+    expect(h.listing.mock.calls[0]).toEqual([healthy, "open"]);
+    expect(h.ledger().report.rows).toEqual([expect.objectContaining({ pr: `${healthy}#42` })]);
+    expect(h.ledger().report.rows.every((row: any) => row.pr.startsWith(`${healthy}#`))).toBe(true);
+    expect(h.ledger().cursors[oversized[0]!]).toBeUndefined();
   });
   it("rotates inventory to a budget-skipped repository on subsequent ticks", async () => {
     const h = fixture({ open: [] });
