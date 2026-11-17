@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import type { CustodyPull } from "../src/custody-github.js";
 import { CustodyGithub } from "../src/custody-github.js";
+import { CustodyAppAuth } from "../src/custody-auth.js";
 import { loadCustodyCards, loadCustodyTexts, type CustodyCard } from "../src/custody-reader.js";
-import { CustodyRuntime } from "../src/custody-runtime.js";
+import { CUSTODY_LIMITS, CustodyRuntime } from "../src/custody-runtime.js";
 import { CUSTODY_ORIGIN, DAY, hasCardClosure, hasPrClosure, latestDisposition } from "../src/custody-policy.js";
 vi.mock("../src/custody-reader.js", () => ({ custodyByteBudget: () => () => {}, loadCustodyCards: vi.fn(), loadCustodyTexts: vi.fn(), parseWorkProductBindings: (raw: unknown) => Array.isArray(raw) ? raw.filter((w: any) => w?.type === "pull_request" && w?.provider === "github") : null }));
 
@@ -980,10 +981,188 @@ describe("coverage, summary and cursor controls", () => {
     expect(h.ledger().report.complete).toBe(false);
     expect(h.ledger().cursors).toEqual({});
   });
+  it("stops listing at 600 admitted requests but still admits evidence and dispatch", async () => {
+    const h = fixture();
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail", "example/z"]);
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      const count = repo === "example/tail" ? 599 : 1;
+      for (let page = 1; page <= count; page++) await this.attempt(`https://api.github.com/list/${repo}/${status}/${page}`, {});
+      return repo === "example/project" && status === "open" ? [pull()] : [];
+    });
+    h.seedHead.mockImplementation(async function (this: any) {
+      await this.attempt("https://api.github.com/graphql", {});
+      return NOW;
+    });
+    await h.runtime.poll();
+    const urls = h.ctx.http.fetch.mock.calls.map(([url]) => url);
+    expect(urls.filter((url) => url.includes("/list/"))).toHaveLength(600);
+    expect(urls.filter((url) => url.endsWith("/graphql"))).toHaveLength(1);
+    expect(urls.filter((url) => url.endsWith("/pulls/42"))).toHaveLength(1);
+    expect(h.ledger().report.unknown).toEqual(expect.arrayContaining(["example/tail", "example/z"]));
+    expect(h.ledger().cursors["example/tail"]).toBeUndefined();
+    expect(h.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    h.ctx.http.fetch.mockClear();
+    await h.restart().poll();
+    expect(h.ctx.http.fetch.mock.calls[0]![0]).toContain("/list/example/z/open/1");
+  });
+  it("restarts a real partial REST listing at page one after the listing deadline", async () => {
+    const h = fixture({ dryRun: true });
+    vi.mocked(CustodyGithub.prototype.repositories).mockRestore();
+    h.listing.mockRestore();
+    const raw = (number: number) => ({
+      number, state: "open", title: "Change", body: "", user: { login: "contributor", type: "User" },
+      head: { sha: "a".repeat(40), ref: `work/${ISSUE}`, repo: { full_name: "example/project" } },
+      base: { repo: { full_name: "example/project" } }, created_at: new Date(NOW - 20 * DAY).toISOString(),
+      updated_at: new Date(NOW - 10 * DAY).toISOString(), closed_at: null, merged_at: null,
+    });
+    h.ctx.http.fetch.mockImplementation(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === "/orgs/example/repos") return { status: 200, headers: {}, body: JSON.stringify([{ id: 1, full_name: "example/project", archived: false }]) };
+      if (url.pathname === "/repos/example/project/pulls") {
+        h.advance(180_000);
+        return { status: 200, headers: {}, body: JSON.stringify(Array.from({ length: 100 }, (_, i) => raw(i + 1))) };
+      }
+      throw new Error("unexpected request");
+    });
+    for (let tick = 0; tick < 2; tick++) {
+      h.ctx.http.fetch.mockClear();
+      await h.restart().poll();
+      const pages = h.ctx.http.fetch.mock.calls.map(([url]) => new URL(url)).filter((url) => url.pathname.endsWith("/pulls"));
+      expect(pages.map((url) => url.searchParams.get("page"))).toEqual(["1"]);
+      expect(h.ledger().report.unknown).toContain("example/project");
+      expect(h.ledger().report.rows).toEqual([]);
+      expect(h.ledger().cursors).toEqual({});
+    }
+  });
+  it("refuses listing transport if persisting its turn fails", async () => {
+    const h = fixture({ dryRun: true, open: [] });
+    const save = h.ctx.state.set.getMockImplementation()!;
+    h.ctx.state.set.mockImplementation(async (key, value) => {
+      if (Object.keys(value.listingTurns ?? {}).length) throw new Error("turn write failed");
+      return save(key, value);
+    });
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      await this.attempt(`https://api.github.com/list/${repo}/${status}`, {});
+      return [];
+    });
+    await h.runtime.poll();
+    expect(h.ctx.http.fetch).not.toHaveBeenCalled();
+    expect(h.ledger().listingTurns).toEqual({});
+    expect(h.ledger().report.unknown).toContain("example/project");
+    expect(h.ledger().cursors).toEqual({});
+  });
+  it("makes a permanently oversized listing yield its next turn", async () => {
+    const h = fixture({ dryRun: true, open: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      await this.attempt(`https://api.github.com/list/${repo}/${status}`, {});
+      return status === "open" && repo === "example/project" ? [pull({ body: "x".repeat(CUSTODY_LIMITS.retainedBytes) })] : [];
+    });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain("example/project");
+    h.ctx.http.fetch.mockClear();
+    await h.restart().poll();
+    expect(h.ctx.http.fetch.mock.calls[0]![0]).toContain("/list/example/tail/open");
+    expect(h.ledger().cursors["example/project"]).toBeUndefined();
+  });
+  it("limits aggregate retained inventory and preserves refused repository state", async () => {
+    const h = fixture({ dryRun: true, open: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
+    const key = JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:dry" });
+    h.state.set(key, { version: 1, receipts: {}, cursors: { "example/tail": NOW - DAY }, attempted: {}, heads: { "example/tail#42": { sha: "a".repeat(40), at: NOW } }, dispositions: {}, audits: [], prToCards: { "example/tail#42": ISSUE } });
+    const body = "x".repeat(4_300_000);
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      await this.attempt(`https://api.github.com/list/${repo}/${status}`, {});
+      return status === "open" ? [pull({ repo, headRepo: repo, body })] : [];
+    });
+    await h.runtime.poll();
+    expect(h.ledger().report.unknown).toContain("example/tail");
+    expect(h.ledger().report.unknownReasons).toContain("inventory_budget");
+    expect(h.ledger().cursors["example/tail"]).toBe(NOW - DAY);
+    expect(h.ledger().heads["example/tail#42"]).toBeDefined();
+    expect(h.ledger().prToCards["example/tail#42"]).toBe(ISSUE);
+    expect(h.ledger().report.rows.map((row: any) => row.pr)).toEqual(["example/project#42"]);
+    await h.restart().poll();
+    expect(h.ledger().report.rows.map((row: any) => row.pr)).toEqual(["example/tail#42"]);
+    expect(h.ledger().cursors["example/tail"]).toBe(NOW);
+  });
+  it("persists listing turns on admitted partial work independently of legacy evidence order", async () => {
+    const h = fixture({ open: [], dryRun: true });
+    vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/tail", "example/project"]);
+    const key = JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:dry" });
+    h.state.set(key, { version: 1, receipts: {}, cursors: {}, attempted: { "example/project": NOW, "example/tail": 1 }, heads: {}, dispositions: {}, audits: [] });
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      await this.attempt(`https://api.github.com/repos/${repo}/pulls?state=${status}`, {});
+      this.requests = 1100;
+      throw new Error("partial listing");
+    });
+    await h.runtime.poll();
+    expect(h.listing.mock.calls[0]![0]).toBe("example/project");
+    expect(h.ledger().listingTurns).toEqual({ "example/project": 1 });
+    expect(h.ledger().cursors).toEqual({});
+    h.listing.mockClear();
+    await h.restart().poll();
+    expect(h.listing.mock.calls[0]![0]).toBe("example/tail");
+    expect(h.ledger().listingTurns).toEqual({ "example/project": 1, "example/tail": 2 });
+    expect(h.ledger().cursors).toEqual({});
+  });
+  it("does not count an App token exchange as a listing admission", async () => {
+    const h = fixture({ open: [], dryRun: true });
+    delete h.config.githubTokenSecretRef;
+    Object.assign(h.config, { githubAppId: "1", githubInstallationId: "2", githubAppPrivateKeySecretRef: { type: "secret_ref", secretId: PROJECT } });
+    h.ctx.http.fetch.mockResolvedValue({ status: 201, headers: {}, body: "{}" });
+    vi.spyOn(CustodyAppAuth.prototype, "token").mockImplementation(async (_path, exchange) => {
+      await exchange("2", "jwt", { permissions: {} });
+      throw new Error("token rejected");
+    });
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      await this.request(`/repos/${repo}/pulls?state=${status}`);
+      return [];
+    });
+    await h.runtime.poll();
+    expect(h.ctx.http.fetch).toHaveBeenCalledTimes(1);
+    expect(h.ledger().listingTurns).toEqual({});
+    expect(h.ledger().cursors).toEqual({});
+  });
+  it("does not rotate listing priority when the admission guard refuses transport", async () => {
+    const h = fixture({ open: [], dryRun: true });
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      const before = this.beforeRequest;
+      this.beforeRequest = () => { before(); h.advance(240_000); };
+      try { await this.attempt(`https://api.github.com/repos/${repo}/pulls?state=${status}`, {}); }
+      finally { this.beforeRequest = before; }
+      return [];
+    });
+    await h.runtime.poll();
+    expect(h.ctx.http.fetch).not.toHaveBeenCalled();
+    expect(h.ledger().listingTurns).toEqual({});
+    expect(h.ledger().cursors).toEqual({});
+  });
+  it("preserves listing turns on discovery failure and prunes only after complete discovery", async () => {
+    const h = fixture({ open: [], dryRun: true });
+    const key = JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:dry" });
+    h.state.set(key, { version: 1, receipts: {}, cursors: {}, attempted: {}, listingTurns: { "example/old": 1, "example/project": 2 }, heads: {}, dispositions: {}, audits: [] });
+    vi.mocked(CustodyGithub.prototype.repositories).mockRejectedValueOnce(new Error("incomplete"));
+    await expect(h.runtime.poll()).rejects.toThrow("custody_inventory_failed");
+    expect(h.ledger().listingTurns).toEqual({ "example/old": 1, "example/project": 2 });
+    await h.restart().poll();
+    expect(h.ledger().listingTurns).toEqual({ "example/project": 2 });
+  });
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER])("rejects invalid listing turn %s", async (turn) => {
+    const h = fixture({ dryRun: true });
+    const key = JSON.stringify({ scopeKind: "company", scopeId: COMPANY, namespace: "pr-custody-v1", stateKey: "example:dry" });
+    h.state.set(key, { version: 1, receipts: {}, cursors: {}, attempted: {}, listingTurns: { "example/project": turn }, heads: {}, dispositions: {}, audits: [] });
+    await expect(h.runtime.poll()).rejects.toThrow("custody_inventory_failed");
+    expect(h.listing).not.toHaveBeenCalled();
+  });
   it("rotates inventory to a budget-skipped repository on subsequent ticks", async () => {
     const h = fixture({ open: [] });
     vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
-    h.listing.mockImplementation(async () => { h.advance(210_000); return []; });
+    h.listing.mockImplementation(async function (this: any, repo, status) {
+      await this.attempt(`https://api.github.com/repos/${repo}/pulls?state=${status}`, {});
+      h.advance(210_000);
+      return [];
+    });
     await h.runtime.poll();
     expect(h.ledger().attempted["example/tail"]).toBeUndefined();
     h.advance(DAY);
@@ -1311,7 +1490,7 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ctx.issues.create).not.toHaveBeenCalled();
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
-  it("does not stamp a Phase B-starved repo in Phase A, so it rotates first next tick", async () => {
+  it("keeps Phase B-starved evidence priority independent of listing order", async () => {
     const h = fixture({ open: [] });
     vi.mocked(CustodyGithub.prototype.repositories).mockResolvedValue(["example/project", "example/tail"]);
     h.ctx.projects.listWorkspaces.mockImplementation(async (projectId: string) => [
@@ -1331,10 +1510,11 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().attempted["example/project"]).toBe(NOW + 2);
     expect(h.ledger().attempted["example/tail"]).toBeUndefined();
     expect(h.ledger().report.unknown).toContain("example/tail#42");
-    // Next tick the starved repo sorts first and is inventoried first.
+    // The mocks admit no listing requests; evidence still services the starved repo first.
     h.listing.mockClear();
     await h.restart().poll();
-    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/project");
+    expect(h.ledger().report.rows[0].pr).toBe("example/tail#42");
   });
   it("retains priority when an admitted evidence operation reaches the request gate", async () => {
     const h = fixture({ dryRun: true });
@@ -1401,7 +1581,8 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ledger().attempted["example/tail"]).toBeUndefined();
     h.listing.mockClear();
     await h.restart().poll();
-    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/project");
+    expect(h.ledger().report.rows[0].pr).toBe("example/tail#42");
     expect(h.ledger().report.rows.find((row: any) => row.pr === "example/tail#42")?.unknown).not.toBe(true);
   });
   it("rotates equal-time partial service across ticks without advancing an incomplete closed cursor", async () => {
@@ -1425,7 +1606,8 @@ describe("work-product discovery from a cold ledger", () => {
     expect(h.ctx.issues.requestWakeup).not.toHaveBeenCalled();
     h.listing.mockClear();
     await h.restart().poll();
-    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/tail");
+    expect(h.listing.mock.calls.find((call) => call[1] === "open")![0]).toBe("example/project");
+    expect(h.ledger().report.rows[0].pr).toBe("example/tail#43");
     expect(h.ledger().cursors["example/tail"]).toBe(NOW);
     expect(h.ledger().report.rows.filter((row: any) => row.pr.startsWith("example/tail#")).every((row: any) => !row.unknown)).toBe(true);
     await h.restart().poll();

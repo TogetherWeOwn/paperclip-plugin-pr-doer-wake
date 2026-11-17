@@ -23,6 +23,11 @@ type ObjectValue = Record<string, unknown>;
 function invalid(): never { throw new CiGithubError("response"); }
 /** Tolerated disagreement between GitHub's updated sort and returned updated_at. */
 export const ORDER_SKEW_MS = 5 * 60_000;
+// Closed history is often much larger than live inventory. The shared request
+// budget and deadline still apply; these bounds do not guarantee completion.
+const CLOSED_PAGE_MULTIPLIER = 10;
+const CLOSED_RETAINED_ROWS = 10_000;
+const CLOSED_RETAINED_BYTES = 16 * 1024 * 1024;
 function object(value: unknown): ObjectValue {
   if (!value || typeof value !== "object" || Array.isArray(value)) return invalid();
   return value as ObjectValue;
@@ -143,7 +148,12 @@ export class CustodyGithub extends CiGithub {
       if (state === "open" && parsed.updatedAt > previous + ORDER_SKEW_MS) return invalid();
       previous = Math.min(previous, parsed.updatedAt);
       return { key: parsed.number, value: parsed };
-    }, state === "closed" ? (value) => value.updatedAt >= since! : undefined);
+    }, state === "closed" ? {
+      include: (value) => value.updatedAt >= since!,
+      maxPages: this.maxPages * CLOSED_PAGE_MULTIPLIER,
+      maxRows: CLOSED_RETAINED_ROWS,
+      maxBytes: CLOSED_RETAINED_BYTES,
+    } : undefined);
     return result;
   }
 
@@ -310,11 +320,12 @@ export class CustodyGithub extends CiGithub {
   private async collect<T>(
     path: string,
     parse: (value: unknown) => { key: string | number; value: T },
-    include?: (value: T) => boolean,
+    limits?: { include: (value: T) => boolean; maxPages: number; maxRows: number; maxBytes: number },
   ): Promise<T[]> {
     const values: T[] = [];
     const seen = new Set<string | number>();
-    for (let page = 1; page <= this.maxPages; page++) {
+    let retainedBytes = 0;
+    for (let page = 1; page <= (limits?.maxPages ?? this.maxPages); page++) {
       const response = await this.request(`${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
       const batch = array(response.data);
       if (batch.length > 100) return invalid();
@@ -324,7 +335,14 @@ export class CustodyGithub extends CiGithub {
         seen.add(item.key);
         return item.value;
       });
-      values.push(...(include ? parsed.filter(include) : parsed));
+      for (const value of parsed) {
+        if (limits && !limits.include(value)) continue;
+        if (limits) {
+          retainedBytes += Buffer.byteLength(JSON.stringify(value), "utf8");
+          if (values.length >= limits.maxRows || retainedBytes > limits.maxBytes) throw new CiGithubError("budget");
+        }
+        values.push(value);
+      }
       // Links are hints only. Reconstruct the next numbered page on the fixed origin.
       const next = /(?:^|,)\s*<[^>]+>\s*;\s*rel="next"/.test(response.link);
       if (next && batch.length < 100) return invalid();

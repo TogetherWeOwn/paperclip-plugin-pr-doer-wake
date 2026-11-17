@@ -143,7 +143,7 @@ describe("CustodyGithub REST enumeration", () => {
     expect(calls).toHaveLength(2);
   });
 
-  it("replays the closed timestamp boundary across pages and stops only below it", async () => {
+  it("replays the closed timestamp boundary across pages and filters older rows", async () => {
     const { client, calls } = fixtures((url) => response(Number(url.searchParams.get("page")) === 1
       ? Array.from({ length: 100 }, (_, index) => closed(index + 1, RECENT))
       : [closed(101, RECENT), closed(102, UPDATED)]));
@@ -241,9 +241,42 @@ describe("CustodyGithub REST enumeration", () => {
     expect(calls).toHaveLength(2);
   });
 
-  it("fails closed when the page limit is reached after an old closed page", async () => {
-    const { client } = fixtures(() => response(Array.from({ length: 100 }, (_, index) => closed(index + 1, UPDATED))), { maxPages: 1 });
-    await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "pages" });
+  it("uses the higher closed page cap and fails closed at its boundary", async () => {
+    const rows = (url: URL) => Array.from({ length: 100 }, (_, index) => closed((Number(url.searchParams.get("page")) - 1) * 100 + index + 1, UPDATED));
+    const complete = fixtures((url) => response(Number(url.searchParams.get("page")) <= 9 ? rows(url) : [closed(901, RECENT)]), { maxPages: 1 });
+    expect((await complete.client.pulls(REPO, "closed", Date.parse(RECENT))).map((value) => value.number)).toEqual([901]);
+    expect(complete.calls).toHaveLength(10);
+    const incomplete = fixtures((url) => response(rows(url)), { maxPages: 1 });
+    await expect(incomplete.client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "pages" });
+    expect(incomplete.calls).toHaveLength(10);
+  });
+
+  it("still applies the shared request budget to closed history", async () => {
+    const { client, calls } = fixtures((url) => response(Array.from({ length: 100 }, (_, index) =>
+      closed((Number(url.searchParams.get("page")) - 1) * 100 + index + 1, UPDATED))), { maxPages: 1, maxRequests: 2 });
+    await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "budget" });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("bounds retained closed rows without counting filtered history", async () => {
+    const { client } = fixtures((url) => {
+      const page = Number(url.searchParams.get("page"));
+      return response(Array.from({ length: page === 102 ? 1 : 100 }, (_, index) =>
+        closed((page - 1) * 100 + index + 1, page === 1 ? UPDATED : RECENT)));
+    }, { maxPages: 20, maxRequests: 200 });
+    await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "budget" });
+  });
+
+  it("bounds retained closed bytes while allowing large filtered bodies", async () => {
+    const bigBody = "x".repeat(60_000);
+    const { client, calls } = fixtures((url) => {
+      const page = Number(url.searchParams.get("page"));
+      return response(Array.from({ length: 100 }, (_, index) => ({
+        ...closed((page - 1) * 100 + index + 1, page === 1 && index < 20 ? UPDATED : RECENT), body: bigBody,
+      })));
+    }, { maxBodyBytes: CUSTODY_LIMITS.bodyBytes });
+    await expect(client.pulls(REPO, "closed", Date.parse(RECENT))).rejects.toMatchObject({ code: "budget" });
+    expect(calls).toHaveLength(3);
   });
 
   it("validates old closed pages even after the cutoff", async () => {

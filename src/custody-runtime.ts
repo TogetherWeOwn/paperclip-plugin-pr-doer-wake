@@ -11,7 +11,7 @@ import { CUSTODY_ORIGIN, DAY, classifyDirectiveLines, custodyTriggers, dispositi
 
 // A 100-PR listing page carries full PR bodies; long bodies push it past the
 // default 2 MiB response cap, so custody uses the transport's 8 MiB maximum.
-export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000, bodyBytes: 8 * 1024 * 1024 } as const;
+export const CUSTODY_LIMITS = { effects: 15, requests: 1_200, listingRequests: 600, listingMs: 180_000, retainedBytes: 8 * 1024 * 1024, hostReads: 20_000, tickMs: 240_000, receipts: 20_000, prs: 10_000, audits: 1_000, bodyBytes: 8 * 1024 * 1024 } as const;
 type Receipt = { at: number; turn?: number; status: "pending" | "attempting" | "woken" | "unconfirmed" | "cleared"; phase?: "create" | "wake"; issueId?: string; childId?: string };
 function delivered(receipt: Receipt): boolean { return receipt.status === "woken"; }
 interface InventoryRow { pr: string; state: string; cardId: string | null; mapping: string; triggers: string[]; unknown?: boolean }
@@ -37,6 +37,7 @@ interface Ledger {
   receipts: Record<string, Receipt>;
   cursors: Record<string, number>;
   attempted: Record<string, number>;
+  listingTurns?: Record<string, number>;
   activityAfter: Record<string, number>;
   dispatchSequence: number;
   heads: Record<string, { sha: string; at: number | null; provenance?: "seeded" | "warmup"; floor?: number }>;
@@ -171,6 +172,13 @@ export class CustodyRuntime {
     const stored = await this.ctx.state.get(key) as Ledger | null;
     if (stored && (stored.version !== 1 || !stored.receipts || !stored.cursors || !stored.attempted || !stored.heads || !stored.dispositions || !Array.isArray(stored.audits))) throw new Error("invalid_custody_ledger");
     const ledger = stored ?? empty(this.now());
+    // Legacy ledgers start all listing work at equal priority; evidence order is
+    // deliberately not imported. Reject corrupt or unbounded scheduling state.
+    if (ledger.listingTurns !== undefined && (ledger.listingTurns === null || typeof ledger.listingTurns !== "object" || Array.isArray(ledger.listingTurns)
+      || Object.entries(ledger.listingTurns).length > CUSTODY_LIMITS.prs
+      || Object.entries(ledger.listingTurns).some(([repo, turn]) => !/^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9_.-]{1,100}$/.test(repo) || !Number.isSafeInteger(turn) || turn < 1 || turn > CUSTODY_LIMITS.prs))) throw new Error("invalid_custody_ledger");
+    ledger.listingTurns ??= {};
+    const listingTurns = ledger.listingTurns;
     ledger.activityAfter ??= {};
     ledger.prToCards ??= {};
     ledger.dispatchSequence ??= 0;
@@ -279,25 +287,62 @@ export class CustodyRuntime {
         ? new CustodyAppAuth({ appId: app.appId, installationId: app.installationId, org: config.org, now: this.now, cycleMs: CUSTODY_LIMITS.tickMs,
             resolvePrivateKey: () => this.ctx.secrets.resolve(app.privateKeySecretRef, { companyId: config.companyId, configPath: "githubAppPrivateKeySecretRef" }) })
         : await this.ctx.secrets.resolve(config.tokenRef!, { companyId: config.companyId, configPath: "githubTokenSecretRef" });
-      // Reserve discovery capacity inside the client's admission gate, before its sole counter advances.
+      // Token exchange is itself an admitted request, not a repository listing.
+      let exchangingToken = false;
+      const githubCredential = typeof credential === "string" ? credential : {
+        invalidate: () => credential.invalidate(),
+        token: (path: string, exchange: import("./ci-github.js").CiTokenExchange) => credential.token(path, async (...args) => {
+          exchangingToken = true;
+          try { return await exchange(...args); } finally { exchangingToken = false; }
+        }),
+      };
+      let listingRepo: string | undefined;
+      // Listing and evidence share the single transport counter, but listing
+      // stops earlier to leave evidence room; both preserve dispatch capacity.
+      let listing = true;
       const inventoryAvailable = () => github.requestCount < CUSTODY_LIMITS.requests - 100 && this.now() - started < CUSTODY_LIMITS.tickMs - 30_000;
-      const github: CustodyGithub = new CustodyGithub((url, init) => this.ctx.http.fetch(url, init), credential, {
+      const listingAvailable = () => github.requestCount < CUSTODY_LIMITS.listingRequests && this.now() - started < CUSTODY_LIMITS.listingMs;
+      const github: CustodyGithub = new CustodyGithub((url, init) => this.ctx.http.fetch(url, init), githubCredential, {
         now: this.now, cache: this.caches.get(cacheKey)!, maxRequests: CUSTODY_LIMITS.requests, maxPages: 100, maxBodyBytes: CUSTODY_LIMITS.bodyBytes,
         beforeRequest: () => {
           guard();
-          if (!dispatching && !inventoryAvailable()) throw new Error("custody_request_budget");
+          if (!dispatching && !(listing ? listingAvailable() : inventoryAvailable())) throw new Error("custody_request_budget");
         },
         onRequestAdmitted: async () => {
+          guard();
+          if (!dispatching && !(listing ? listingAvailable() : inventoryAvailable())) throw new Error("custody_request_budget");
+          if (listingRepo && !exchangingToken) {
+            const repo = listingRepo;
+            listingRepo = undefined; // Subsequent pages belong to the same turn.
+            const previous = { ...listingTurns };
+            const ordered = Object.keys(listingTurns).filter((name) => name !== repo)
+              .sort((a, b) => listingTurns[a]! - listingTurns[b]! || (a < b ? -1 : a > b ? 1 : 0));
+            ordered.forEach((name, index) => { listingTurns[name] = index + 1; });
+            listingTurns[repo] = ordered.length + 1;
+            try {
+              await save();
+              guard();
+              if (!listingAvailable()) throw new Error("custody_request_budget");
+            }
+            catch (error) {
+              for (const name of Object.keys(listingTurns)) delete listingTurns[name];
+              Object.assign(listingTurns, previous);
+              throw error;
+            }
+          }
           if (dispatchReceipt) {
             const receipt = dispatchReceipt;
             dispatchReceipt = undefined; // A conditional retry belongs to the same scheduling turn.
             await admitDispatch(receipt);
           }
-          guard();
         },
       });
       const repos = await github.repositories(config.org);
       const monitored = new Set(repos);
+      if (monitored.size > CUSTODY_LIMITS.prs) throw new Error("custody_listing_capacity");
+      // repositories() returns only after complete discovery; failed discovery
+      // must never discard priority for repositories that were not observed.
+      for (const repo of Object.keys(listingTurns)) if (!monitored.has(repo)) delete listingTurns[repo];
       for (const repo of Object.keys(ledger.activityAfter)) if (!monitored.has(repo)) delete ledger.activityAfter[repo];
       for (const ref of Object.keys(ledger.heads)) if (!monitored.has(ref.split("#")[0]!)) delete ledger.heads[ref];
       const summaries = new Set<string>();
@@ -309,19 +354,44 @@ export class CustodyRuntime {
       // Phase A: GitHub-first inventory. Collect open+closed PRs per repo
       // before any card evidence is loaded, so candidate discovery is bounded
       // by PR count (CUSTODY_LIMITS.prs), never by company card history.
-      const sortedRepos = repos.sort((a, b) => (ledger.attempted[a] ?? 0) - (ledger.attempted[b] ?? 0));
+      const sortedRepos = [...repos].sort((a, b) => (listingTurns[a] ?? 0) - (listingTurns[b] ?? 0) || (a < b ? -1 : a > b ? 1 : 0));
       const inventories = new Map<string, { open: CustodyPull[]; closed: CustodyPull[]; until: number }>();
+      let retainedRows = 0;
+      let retainedBytes = 0;
+      const oversized = new Set<string>();
       for (const repo of sortedRepos) {
         try {
-          if (!inventoryAvailable()) throw new Error("inventory_budget");
+          if (!listingAvailable()) throw new Error("inventory_budget");
           // GitHub REST timestamps have second precision; retain inclusive same-second overlap.
           const until = Math.floor(this.now() / 1000) * 1000;
+          listingRepo = repo;
           const open = await github.pulls(repo, "open");
           const closed = await github.pulls(repo, "closed", ledger.cursors[repo] ?? config.closedSince);
           if (open.some((p) => closed.some((c) => p.number === c.number))) throw new Error("contradictory_inventory");
+          const bytes = Buffer.byteLength(JSON.stringify([open, closed]));
+          if (retainedRows + open.length + closed.length > CUSTODY_LIMITS.prs || retainedBytes + bytes > CUSTODY_LIMITS.retainedBytes) {
+            // Only a listing that could fit on an empty tick gets priority;
+            // permanently oversized repositories must still yield to others.
+            if (open.length + closed.length <= CUSTODY_LIMITS.prs && bytes <= CUSTODY_LIMITS.retainedBytes) {
+              const others = Object.keys(listingTurns).filter((name) => name !== repo)
+                .sort((a, b) => listingTurns[a]! - listingTurns[b]! || (a < b ? -1 : a > b ? 1 : 0));
+              listingTurns[repo] = 1;
+              others.forEach((name, index) => { listingTurns[name] = index + 2; });
+            } else oversized.add(repo);
+            throw new Error("inventory_budget");
+          }
+          retainedRows += open.length + closed.length;
+          retainedBytes += bytes;
           inventories.set(repo, { open, closed, until });
         } catch (error) { unknown(repo, unknownReason(error)); }
+        finally { listingRepo = undefined; }
       }
+      // An individually oversized listing cannot benefit from an empty tick.
+      // Keep it behind the other admitted listings on the next tick.
+      if (oversized.size) Object.keys(listingTurns)
+        .sort((a, b) => Number(oversized.has(a)) - Number(oversized.has(b)) || listingTurns[a]! - listingTurns[b]!)
+        .forEach((name, index) => { listingTurns[name] = index + 1; });
+      listing = false;
       // Phase B: explicit-tier mapping over metadata only, then bounded
       // evidence loads for mapped candidates only.
       const cardsById = new Map(cards.map((c) => [c.id, c]));
@@ -390,13 +460,14 @@ export class CustodyRuntime {
           }
         }
       }
-      for (const ref of Object.keys(ledger.prToCards)) if (!seenPrs.has(ref)) delete ledger.prToCards[ref];
+      for (const ref of Object.keys(ledger.prToCards)) if (inventories.has(ref.split("#")[0]!) && !seenPrs.has(ref)) delete ledger.prToCards[ref];
       if (candidates.size) await loadCustodyTexts(this.ctx, config.companyId, guard, [...candidates.values()], budget);
       // Order this tick's serviced repositories in reverse, even if the clock
       // has millisecond ties; never-serviced repositories still sort first.
       const attemptBase = Object.values(ledger.attempted).reduce((max, at) => Math.max(max, at), this.now());
-      let attemptOrder = sortedRepos.length;
-      for (const repo of sortedRepos) {
+      const evidenceRepos = [...repos].sort((a, b) => (ledger.attempted[a] ?? 0) - (ledger.attempted[b] ?? 0) || (a < b ? -1 : a > b ? 1 : 0));
+      let attemptOrder = evidenceRepos.length;
+      for (const repo of evidenceRepos) {
         const attemptAt = attemptBase + attemptOrder--;
         try {
           const inv = inventories.get(repo);
