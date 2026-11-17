@@ -939,6 +939,8 @@ export class CiWakeRuntime {
             entry.observedAt = this.now();
             await this.save(ledger); continue;
           }
+          // The final GitHub read can finish after the tick's admission budget.
+          if (this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
           // Revalidate binding, enablement, allowlist, pr-head flags, dry-run
           // and the credential identity immediately after the final GitHub
           // read: an operator rollback (dryRun: true, disable, revoke) made
