@@ -101,6 +101,18 @@ function host(data: { cards?: Row[]; comments?: Row[]; documents?: Row[] } = {})
   return { ctx, query, get, guard, trace };
 }
 
+describe("custody byte budget", () => {
+  it("charges rejected oversized bodies against the shared allowance", () => {
+    const budget = custodyByteBudget();
+    const oversized = "x".repeat(128_001);
+    const count = Math.floor(CUSTODY_READ_LIMITS.totalBytes / oversized.length);
+    for (let i = 0; i < count; i++) {
+      expect(() => budget(oversized)).toThrow("body budget exceeded");
+    }
+    expect(() => budget(oversized)).toThrow("total byte budget exceeded");
+  });
+});
+
 describe("loadCustodyCards", () => {
   it("scopes every read to the company and guards every RPC", async () => {
     const h = host({
@@ -182,6 +194,76 @@ describe("loadCustodyCards", () => {
     ]);
   });
 
+  it("does not publish earlier comments when later evidence is malformed", async () => {
+    const h = host({ comments: [comment(1, { body: "valid" }), comment(2, { author_type: "invalid" })] });
+    const budget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    const original = [...cards[0]!.texts];
+    const rows = { comments: 0 };
+    await expect(loadCustodyTexts(h.ctx, COMPANY, h.guard, cards, budget, rows)).rejects.toThrow();
+    expect(cards[0]!.texts).toEqual(original);
+    expect(rows.comments).toBe(2);
+  });
+
+  it("does not publish comments to any candidate when a later page is malformed", async () => {
+    const comments = Array.from({ length: 201 }, (_, i) => comment(i + 1, {
+      issue_id: uuid(i % 2 + 1), ...(i === 200 ? { author_type: "invalid" } : {}),
+    }));
+    const h = host({ cards: [card(1), card(2)], comments });
+    const budget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    const original = cards.map((candidate) => [...candidate.texts]);
+    const rows = { comments: 0 };
+    await expect(loadCustodyTexts(h.ctx, COMPANY, h.guard, cards, budget, rows)).rejects.toThrow("invalid comment author_type");
+    expect(cards.map((candidate) => candidate.texts)).toEqual(original);
+    expect(rows.comments).toBe(201);
+  });
+
+  it("does not publish a completed page when the next read is denied", async () => {
+    const h = host({ comments: Array.from({ length: 201 }, (_, i) => comment(i + 1)) });
+    const budget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    const original = [...cards[0]!.texts];
+    const rows = { comments: 0 };
+    let reads = 0;
+    await expect(loadCustodyTexts(h.ctx, COMPANY, () => {
+      if (++reads === 2) throw new Error("read denied");
+    }, cards, budget, rows)).rejects.toThrow("read denied");
+    expect(rows.comments).toBe(200);
+    expect(cards[0]!.texts).toEqual(original);
+  });
+
+  it("charges all returned rows and bodies before rejecting a malformed row", async () => {
+    const h = host({ comments: [
+      comment(1, { author_type: "invalid", body: "first" }),
+      comment(2, { body: "x".repeat(128_001) }),
+      comment(3, { body: "last" }),
+    ] });
+    const budget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    const original = [...cards[0]!.texts];
+    const charged = vi.fn(budget);
+    const rows = { comments: 0 };
+    await expect(loadCustodyTexts(h.ctx, COMPANY, h.guard, cards, charged, rows)).rejects.toThrow("body budget exceeded");
+    expect(rows.comments).toBe(3);
+    expect(charged.mock.calls.map(([body]) => body.length)).toEqual([5, 128_001, 4]);
+    expect(cards[0]!.texts).toEqual(original);
+  });
+
+  it("reports shared exhaustion when later acquired bodies cross the byte ceiling", async () => {
+    const h = host({ comments: [comment(1, { author_type: "invalid", body: "a".repeat(60) }), comment(2, { body: "b".repeat(60) })] });
+    const metadataBudget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, metadataBudget);
+    const budget = custodyByteBudget();
+    const available = CUSTODY_READ_LIMITS.totalBytes - 100;
+    for (let i = 0; i < Math.floor(available / 128_000); i++) budget("x".repeat(128_000));
+    budget("x".repeat(available % 128_000));
+    const rows = { comments: 0 };
+    await expect(loadCustodyTexts(h.ctx, COMPANY, h.guard, cards, budget, rows)).rejects.toThrow("total byte budget exceeded");
+    expect(rows.comments).toBe(2);
+    expect(cards[0]!.texts).toHaveLength(2);
+  });
+
   it("keyset-paginates without losing evidence after page one", async () => {
     const h = host({
       cards: Array.from({ length: 201 }, (_, i) => card(i + 1)),
@@ -204,6 +286,21 @@ describe("loadCustodyCards", () => {
     const issueCalls = h.query.mock.calls.filter(([sql]) => sql.includes("FROM public.issues\n"));
     expect(issueCalls).toHaveLength(count / 200 + 1);
     expect(issueCalls.at(-1)?.[1]).toEqual([COMPANY, uuid(count), 1]);
+  });
+
+  it("rejects an exact-cap metadata traversal when the exhaustion probe fails", async () => {
+    const count = CUSTODY_READ_LIMITS.cards;
+    const h = host({ cards: Array.from({ length: count }, (_, i) => card(i + 1, { description: null })) });
+    const query = h.query.getMockImplementation()!;
+    h.query.mockImplementation(async (sql, params) => {
+      if (sql.includes("FROM public.issues\n") && params?.[1] === uuid(count)) {
+        throw new Error("probe unavailable");
+      }
+      return query(sql, params);
+    });
+
+    await expect(loadCustodyCards(h.ctx, COMPANY, h.guard, custodyByteBudget())).rejects.toThrow("probe unavailable");
+    expect(h.query.mock.calls.at(-1)?.[1]).toEqual([COMPANY, uuid(count), 1]);
   });
 
   it.each([
@@ -379,6 +476,33 @@ describe("loadCustodyCards", () => {
     const textQueries = h.query.mock.calls.filter(([, params]) => Array.isArray(params) && params.length === 4);
     expect(textQueries.length).toBeGreaterThan(0);
     for (const [, params] of textQueries) expect(params![3]).toBe(`{${uuid(1)}}`);
+  });
+
+  it("shares the actual byte ceiling across candidate batches", async () => {
+    const body = "a".repeat(128_000);
+    const count = Math.floor(CUSTODY_READ_LIMITS.totalBytes / body.length) + 1;
+    const split = Math.floor(count / 2);
+    const h = host({
+      cards: [card(1), card(2)],
+      comments: Array.from({ length: count }, (_, i) => comment(i + 1, { issue_id: uuid(i < split ? 1 : 2), body })),
+    });
+    const budget = custodyByteBudget();
+    const rows = { comments: 0 };
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    await loadCustodyTexts(h.ctx, COMPANY, h.guard, [cards[0]!], budget, rows);
+    expect(cards[0]!.texts).toHaveLength(split + 2);
+    await expect(loadCustodyTexts(h.ctx, COMPANY, h.guard, [cards[1]!], budget, rows)).rejects.toThrow("total byte budget exceeded");
+    expect(rows.comments).toBe(count);
+  });
+
+  it("shares the comment row ceiling across candidate batches", async () => {
+    const h = host({ cards: [card(1), card(2)], comments: [comment(1), comment(2, { issue_id: uuid(2) })] });
+    const budget = custodyByteBudget();
+    const cards = await loadCustodyCards(h.ctx, COMPANY, h.guard, budget);
+    const rows = { comments: CUSTODY_READ_LIMITS.comments - 1 };
+    await loadCustodyTexts(h.ctx, COMPANY, h.guard, [cards[0]!], budget, rows);
+    expect(rows.comments).toBe(CUSTODY_READ_LIMITS.comments);
+    await expect(loadCustodyTexts(h.ctx, COMPANY, h.guard, [cards[1]!], budget, rows)).rejects.toThrow("issue_comments row budget exceeded");
   });
 
   it("parses only explicit GitHub pull-request work-product bindings", () => {
