@@ -815,9 +815,23 @@ describe("CI runtime polling and durable wake outcomes", () => {
       delete (h.issue as { workProducts?: unknown }).workProducts;
       await movedHead(h);
       github.readiness.mockReturnValue(verdict("pass"));
+      h.issueGet.mockImplementation(async () => {
+        h.advance(10);
+        return clone(h.issue);
+      });
+      const save = h.set.getMockImplementation()!;
+      h.set.mockImplementation(async (key, value) => {
+        await save(key, value);
+        if ((value as Ledger).audits.at(-1)?.outcome === "would_wake") h.advance(20);
+      });
       await h.runtime.poll();
       if (shadow) {
         expect(h.ledger().audits.filter((a) => a.operation === "pr_head_wake" && a.outcome === "would_wake")).toHaveLength(1);
+        expect(h.logger.info).toHaveBeenCalledWith("pr-head-wake: would wake", expect.objectContaining({
+          companyId: COMPANY, issueId: ISSUE, repo: REPO, prNumber: 17, oldSha: HEAD, newSha: NEXT_HEAD,
+          eligibilityReadStartedAt: START + 10, eligibilityReadCompletedAt: START + 20, decisionAt: START + 50,
+          stageId: "stage-1", participantType: "agent", participantAgentId: OTHER, outcome: "shadow_no_dispatch",
+        }));
         expect(h.requestWakeup).not.toHaveBeenCalled();
       } else {
         expect(h.requestWakeup).toHaveBeenCalledTimes(1);

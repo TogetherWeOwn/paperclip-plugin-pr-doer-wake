@@ -972,8 +972,10 @@ export class CiWakeRuntime {
             entry.candidateSequence = candidateSequence;
             await this.save(ledger);
             let issue: any;
+            const eligibilityReadStartedAt = this.now();
             try { issue = await this.ctx.issues.get(issueId, entry.companyId); }
             catch { outstanding = true; continue; }
+            const eligibilityReadCompletedAt = this.now();
             if (!issue || issue.id !== issueId || issue.companyId !== entry.companyId) { outstanding = true; continue; }
             if (issue.status !== "in_review") continue;
             const state = issue.executionState;
@@ -1004,7 +1006,14 @@ export class CiWakeRuntime {
                 entry.shadowLogged.push(issueId);
                 this.audit(ledger, "pr_head_wake", "would_wake");
                 await this.save(ledger);
-                this.ctx.logger.info("pr-head-wake: would wake", { companyId: entry.companyId, issueId, repo: entry.repo, prNumber: entry.prNumber, oldSha: entry.oldSha, newSha: entry.newSha });
+                this.ctx.logger.info("pr-head-wake: would wake", {
+                  companyId: entry.companyId, issueId, repo: entry.repo, prNumber: entry.prNumber, oldSha: entry.oldSha, newSha: entry.newSha,
+                  eligibilityReadStartedAt, eligibilityReadCompletedAt, decisionAt: this.now(),
+                  stageId: typeof state.currentStageId === "string" ? state.currentStageId.slice(0, 128) : null,
+                  participantType: typeof state.currentParticipant.type === "string" ? state.currentParticipant.type.slice(0, 32) : null,
+                  participantAgentId: typeof state.currentParticipant.agentId === "string" ? state.currentParticipant.agentId.slice(0, 128) : null,
+                  outcome: "shadow_no_dispatch",
+                });
               }
               outstanding = true;
               continue;
