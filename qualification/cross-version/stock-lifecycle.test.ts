@@ -54,6 +54,7 @@ it("preserves migration and instance state across fresh packaged workers", async
   const manager = createPluginWorkerManager();
   let previousLedger: unknown[] | undefined;
   let previousState: any;
+  let expectedHot: unknown;
   try {
     for (const [index, root] of roots.entries()) {
       const registry = pluginRegistryService(db);
@@ -73,7 +74,8 @@ it("preserves migration and instance state across fresh packaged workers", async
         if (parsed.origin !== "https://api.github.com" || (init?.method && init.method !== "GET")) throw new Error("unexpected HTTP request");
         requests.push(parsed.pathname);
         let body: unknown;
-        if (parsed.pathname === `/repos/${repo}/pulls/17`) body = { number: 17, state: "open", draft: false, merged: false, mergeable: true, user: { login: "fixture" }, head: { sha, ref: "feature", repo: { full_name: repo } }, base: { ref: "main", repo: { full_name: repo } } };
+        if (parsed.pathname === "/orgs/example/repos") body = [];
+        else if (parsed.pathname === `/repos/${repo}/pulls/17`) body = { number: 17, state: "open", draft: false, merged: false, mergeable: true, user: { login: "fixture" }, head: { sha, ref: "feature", repo: { full_name: repo } }, base: { ref: "main", repo: { full_name: repo } } };
         else if (parsed.pathname === `/repos/${repo}/rules/branches/main`) body = [];
         else if (parsed.pathname === `/repos/${repo}/branches/main/protection/required_status_checks`) body = { contexts: ["build"] };
         else if (parsed.pathname === `/repos/${repo}/commits/${sha}/check-runs`) body = { total_count: 0, check_runs: [] };
@@ -86,16 +88,17 @@ it("preserves migration and instance state across fresh packaged workers", async
       const archiveKey = { scopeKind: "company" as const, scopeId: companyId, namespace: "pr-custody-v1", stateKey: `example:live:receipt:${createHash("sha256").update(archiveId).digest("hex")}` };
       const archiveValue = { version: 1, key: archiveId, value: { at: 1, status: "woken" } };
       const hotKey = { ...archiveKey, stateKey: "example:live" };
-      const hotValue = { version: 1, receipts: { ambiguous: { at: 1, status: "unconfirmed", phase: "wake" } }, cursors: { [repo]: 17 }, attempted: {}, activityAfter: {}, dispatchSequence: 1, heads: { [repo]: { sha, at: 1 } }, dispositions: { held: 1 }, prToCards: {}, audits: [], report: { at: 1, complete: false, rows: [], unknown: [], effects: 0 } };
+      const hotValue = { version: 1, receipts: { ambiguous: { at: 1, status: "attempting", phase: "wake" } }, cursors: { [repo]: 17 }, attempted: {}, activityAfter: {}, dispatchSequence: 1, heads: { [repo]: { sha, at: 1 } }, dispositions: { held: 1 }, prToCards: {}, audits: [], report: { at: 1, complete: false, rows: [], unknown: [], effects: 0 } };
       const dispositionKey = { ...archiveKey, stateKey: `example:live:disposition:${createHash("sha256").update("held").digest("hex")}` };
       const dispositionValue = { version: 1, key: "held", value: 1 };
       if (index === 0) {
         await services.state.set({ ...archiveKey, value: archiveValue });
         await services.state.set({ ...hotKey, value: hotValue });
         await services.state.set({ ...dispositionKey, value: dispositionValue });
+        expectedHot = hotValue;
       }
       expect(await services.state.get(archiveKey)).toEqual(archiveValue);
-      expect(await services.state.get(hotKey)).toEqual(hotValue);
+      expect(await services.state.get(hotKey)).toEqual(expectedHot);
       expect(await services.state.get(dispositionKey)).toEqual(dispositionValue);
       const database = pluginDatabaseService(db);
       const manifest = manifests[index];
@@ -156,6 +159,22 @@ it("preserves migration and instance state across fresh packaged workers", async
           expect(retry.data).toMatchObject({ waitId: completedWaitId, status: "woken" });
           await manager.call(manifest.id, "runJob", { job: { jobKey: "ci-wake-poll", runId: randomUUID(), trigger: "manual", scheduledAt: new Date().toISOString() } });
         }
+        if (process.env.CANDIDATE_RECOVERY === "1" && index === 1) {
+          const enabledConfig = { ...config, custodyEnabled: true, custodyDryRun: false, custodyCompanyId: companyId, custodySummaryAgentId: runContext.agentId, custodyOrg: "example", custodyClosedSince: "2026-01-01T00:00:00Z" };
+          await registry.upsertConfig(pluginId, companyId, { configJson: enabledConfig });
+          await manager.call(manifest.id, "configChanged", { companyId, config: enabledConfig });
+          const wakesBeforeRecovery = wakeups.length;
+          await manager.call(manifest.id, "runJob", { job: { jobKey: "pr-custody", runId: randomUUID(), trigger: "manual", scheduledAt: new Date().toISOString() } });
+          expectedHot = await services.state.get(hotKey);
+          expect(expectedHot).toMatchObject({ receipts: { ambiguous: { status: "unconfirmed", phase: "wake" } }, report: { complete: true, effects: 0 } });
+          expect(requests).toContain("/orgs/example/repos");
+          expect(wakeups).toHaveLength(wakesBeforeRecovery);
+          await registry.upsertConfig(pluginId, companyId, { configJson: config });
+          await manager.call(manifest.id, "configChanged", { companyId, config });
+          await manager.call(manifest.id, "runJob", { job: { jobKey: "pr-custody", runId: randomUUID(), trigger: "manual", scheduledAt: new Date().toISOString() } });
+          expect(await services.state.get(hotKey)).toEqual(expectedHot);
+          expect(wakeups).toHaveLength(wakesBeforeRecovery);
+        }
         previousState = await db.select().from(pluginState).where(eq(pluginState.pluginId, pluginId));
         const row = previousState.find((s: any) => s.namespace === "ci-wake-v1" && s.stateKey === "ledger");
         const wait = (row?.valueJson as any)?.waits.find((entry: any) => entry.waitId === waitId);
@@ -171,6 +190,8 @@ it("preserves migration and instance state across fresh packaged workers", async
         console.info("rollback-stop", JSON.stringify({ phase: index, status: stopped.status, pid: stopped.pid, pendingRequests: stopped.pendingRequests }));
         expect(stopped).toMatchObject({ status: "stopped", pid: null, pendingRequests: 0 });
         expect(await services.state.get(archiveKey)).toEqual(archiveValue);
+        expect(await services.state.get(hotKey)).toEqual(expectedHot);
+        expect(await services.state.get(dispositionKey)).toEqual(dispositionValue);
         services.dispose();
       }
       await db.$client.end({ timeout: 5 });
