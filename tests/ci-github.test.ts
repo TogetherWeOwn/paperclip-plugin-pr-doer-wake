@@ -700,6 +700,44 @@ describe("CiGithub REST reads", () => {
     expect(calls.filter(({ url }) => url.pathname.endsWith("check-runs")).map(({ url }) => url.searchParams.get("filter"))).toEqual(filters);
   });
 
+  it.each([
+    ["current", ["latest"]],
+    ["both recovered", ["latest", "all"]],
+    ["newer recovered", ["latest", "all"]],
+    ["superseded history", ["latest"]],
+    ["refresh and recovery", ["latest", "latest", "all"]],
+  ] as const)("prefers the newest suite with a required result over higher run IDs (%s)", async (scenario, filters) => {
+    const recoverRed = ["both recovered", "newer recovered", "refresh and recovery"].includes(scenario);
+    const recoverGreen = scenario === "both recovered";
+    const redSuite = scenario === "superseded history" ? 3 : 2;
+    let latestReads = 0;
+    const { fetch, calls } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "ci-ok", app_id: 7 }] });
+      if (url.pathname.endsWith("/check-runs")) {
+        const all = url.searchParams.get("filter") === "all";
+        if (!all) latestReads++;
+        const check_runs = [
+          ...(!recoverGreen || all ? [{ ...rawRun(300, "ci-ok"), check_suite: { id: 1 } }] : []),
+          ...(!recoverRed || all ? [{ ...rawRun(200, "ci-ok"), check_suite: { id: redSuite }, conclusion: "failure" }] : []),
+          ...(all ? [{ ...rawRun(190, "ci-ok"), check_suite: { id: redSuite } }] : []),
+          ...(scenario === "refresh and recovery" && latestReads >= 2 ? [{ ...rawRun(400, "optional"), check_suite: { id: 3 } }] : []),
+        ];
+        return response({ total_count: check_runs.length, check_runs });
+      }
+      if (url.pathname.endsWith("/check-suites")) {
+        const emptyFailed = (id: number) => ({ ...rawSuite(id), latest_check_runs_count: 0, conclusion: "startup_failure" });
+        const check_suites = [recoverGreen ? emptyFailed(1) : rawSuite(),
+          recoverRed || redSuite === 3 ? emptyFailed(2) : rawSuite(2),
+          ...(redSuite === 3 || scenario === "refresh and recovery" ? [rawSuite(3)] : []),
+        ];
+        return response({ total_count: check_suites.length, check_suites });
+      }
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "fail", failed: ["ci-ok [app 7]"], missing: [], pending: [] });
+    expect(calls.filter(({ url }) => url.pathname.endsWith("check-runs")).map(({ url }) => url.searchParams.get("filter"))).toEqual(filters);
+  });
+
   it("waits for completeness even after the refresh selects a required run from the newer suite", async () => {
     let reads = 0;
     const { fetch } = fixtures((url) => {

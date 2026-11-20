@@ -468,8 +468,7 @@ export class CiGithub {
       };
     });
     const unique = [...new Map(required.map((check) => [JSON.stringify([check.context, check.appId]), check])).values()];
-    const requiredRuns = () => latest(runs, (run) => JSON.stringify([run.name, run.appId])).filter((run) =>
-      unique.some((check) => matchesRun(check, run)));
+    const requiredRuns = () => latestRequiredRuns(runs).filter((run) => unique.some((check) => matchesRun(check, run)));
     let relevant = requiredRuns();
     // A newer suite may have completed between the two reads. Refresh once if
     // the run view may predate that completion; optional results do not decide readiness.
@@ -809,14 +808,24 @@ function conclusion(status: string, result: string | null): Verdict {
   if (status !== "completed") return "pending";
   return result !== null && PASS.has(result) ? "pass" : result !== null && FAIL.has(result) ? "fail" : "pending";
 }
-function latest<T extends { id: number }>(values: readonly T[], key: (value: T) => string): T[] {
+function latest<T extends { id: number }>(
+  values: readonly T[], key: (value: T) => string, compare: (a: T, b: T) => number = (a, b) => a.id - b.id,
+): T[] {
   const found = new Map<string, T>();
   for (const value of values) {
     const name = key(value);
     const previous = found.get(name);
-    if (!previous || value.id > previous.id) found.set(name, value);
+    if (!previous || compare(value, previous) > 0) found.set(name, value);
   }
   return [...found.values()];
+}
+function runKey(run: CiCheckRun): string {
+  return JSON.stringify([run.name, run.appId]);
+}
+function latestRequiredRuns(runs: readonly CiCheckRun[]): CiCheckRun[] {
+  // A rerun can increase the run ID without advancing the suite. An unbound
+  // run carries no evidence of a newer suite and cannot displace a bound run.
+  return latest(runs, runKey, (a, b) => (a.suiteId ?? 0) - (b.suiteId ?? 0) || a.id - b.id);
 }
 function label(check: CiRequiredContext): string {
   return check.appId === null ? check.context : `${check.context} [app ${check.appId}]`;
@@ -849,8 +858,9 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   if (![timing.now, timing.registeredAt, timing.medianMs, timing.readySince ?? 0].every(Number.isFinite) || timing.medianMs <= 0) {
     throw new CiGithubError("input");
   }
-  const runResults = snapshot.required.length ? [...snapshot.runs, ...(snapshot.historicalRequiredRuns ?? [])] : snapshot.runs;
-  const runs = latest(runResults, (run) => JSON.stringify([run.name, run.appId]));
+  const runs = snapshot.required.length
+    ? latestRequiredRuns([...snapshot.runs, ...(snapshot.historicalRequiredRuns ?? [])])
+    : latest(snapshot.runs, runKey);
   const statuses = latest(snapshot.statuses, (status) => status.context);
   // Multiple workflows share the GitHub Actions app ID; app ID is not suite identity.
   // Installed Apps can leave empty queued suites forever. Unknown states and suites
