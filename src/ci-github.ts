@@ -859,7 +859,11 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
         const associated = suites.find((suite) => suite.id === run.suiteId && suite.appId === run.appId);
         const ambiguous = associated ? associated.status !== "completed" : suites.some((suite) => suite.status !== "completed");
         const corroborated = associated && snapshot.currentAttemptRunIds?.includes(run.id);
-        record(label(required), ambiguous && !corroborated ? "pending" : conclusion(run.status, run.conclusion));
+        // A newer suite on this head can publish a replacement check late (e.g.
+        // ready-for-review CI after draft CI). Proof for the old suite cannot settle it.
+        const newerActiveSuite = associated && suites.some((suite) =>
+          suite.appId === associated.appId && suite.id > associated.id && suite.status !== "completed");
+        record(label(required), newerActiveSuite || (ambiguous && !corroborated) ? "pending" : conclusion(run.status, run.conclusion));
       }
       // Statuses do not identify their workflow/generation; defer while suites run.
       for (const status of matchingStatuses) record(label(required), suites.some((suite) => suite.status !== "completed") ? "pending" : statusVerdict(status.state));
