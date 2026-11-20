@@ -444,7 +444,7 @@ describe("CiGithub REST reads", () => {
     expect(actual.suites[0]).toMatchObject({ createdAt: Date.parse("2026-01-01T00:00:00Z"), completedAt: Date.parse("2026-01-01T00:01:00Z") });
     expect(calls[0]!.url.pathname).toContain("/rules/branches/release%2Fone");
     expect(calls[1]!.url.pathname).toContain("/branches/release%2Fone/protection/required_status_checks");
-    expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("all");
+    expect(calls.find((call) => call.url.pathname.endsWith("check-runs"))!.url.searchParams.get("filter")).toBe("latest");
   });
 
   it("verifies a Devin status through real GitHub App auth without poisoning the credential", async () => {
@@ -602,20 +602,47 @@ describe("CiGithub REST reads", () => {
       if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "ci-ok", app_id: 7 }] });
       if (url.pathname.endsWith("/check-runs")) {
         const check_runs = [rawRun(1, "ci-ok")];
-        if (++reads === 2) check_runs.push(rawRun(2, "optional"), { ...rawRun(3, name), app: { id: appId } });
+        if (++reads >= 2) check_runs.push(rawRun(2, "optional"), {
+          ...rawRun(3, name), app: { id: appId }, conclusion: name === "ci-ok" ? "failure" : "success",
+        });
         return response({ total_count: check_runs.length, check_runs });
       }
       if (url.pathname.endsWith("/check-suites")) {
-        expect(reads).toBe(1);
+        const newer = { ...rawSuite(3), app: { id: appId }, latest_check_runs_count: 1 };
         const check_suites = [rawSuite(), { ...rawSuite(2), latest_check_runs_count: 1 },
-          ...(listed ? [{ ...rawSuite(3), status: "in_progress", conclusion: null }] : [])];
+          ...(reads > 2 ? [newer] : listed ? [{ ...newer, status: "in_progress", conclusion: null }] : [])];
         return response({ total_count: check_suites.length, check_suites });
       }
     });
-    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    const github = new CiGithub(fetch, TOKEN);
+    const actual = await github.snapshot(REPO, SHA, "main");
     expect(evaluateReadiness(actual, timing).kind).toBe(verdict);
     expect(calls.filter(({ url }) => /\/check-(runs|suites)$/.test(url.pathname)).map(({ url }) => url.pathname.split("/").at(-1)))
       .toEqual(["check-runs", "check-suites", "check-runs"]);
+    expect(evaluateReadiness(await github.snapshot(REPO, SHA, "main"), timing)).toMatchObject(name === "ci-ok"
+      ? { kind: "fail", failed: ["ci-ok [app 7]"], pending: [] }
+      : { kind: "pass", failed: [], pending: [] });
+    expect(reads).toBe(3);
+  });
+
+  it.each([true, false])("accepts current same-name optional jobs (both visible on the first read: %s)", async (completeInitially) => {
+    let reads = 0;
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "ci-ok", app_id: 7 }] });
+      if (url.pathname.endsWith("/check-runs")) {
+        const check_runs = [rawRun(1, "ci-ok"), rawRun(2, "smoke")];
+        if (++reads > 1 || completeInitially) check_runs.push({
+          ...rawRun(3, "smoke"), check_suite: { id: 2 }, conclusion: "failure",
+        });
+        return response({ total_count: check_runs.length, check_runs });
+      }
+      if (url.pathname.endsWith("/check-suites")) return response({ total_count: 2, check_suites: [rawSuite(), {
+        ...rawSuite(2), latest_check_runs_count: 2, conclusion: "failure",
+      }] });
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(actual, timing)).toMatchObject({ kind: "pass", pending: [], failed: [] });
+    expect(reads).toBe(completeInitially ? 1 : 2);
   });
 
   it.each([true, false])("does not let historical runs hide a newer suite's shortfall (replacement arrives: %s)", async (replacementArrives) => {
@@ -623,7 +650,8 @@ describe("CiGithub REST reads", () => {
     const { fetch } = fixtures((url) => {
       if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "ci-ok", app_id: 7 }] });
       if (url.pathname.endsWith("/check-runs")) {
-        const check_runs = [rawRun(1, "ci-ok"), rawRun(2, "optional"), { ...rawRun(3, "optional"), check_suite: { id: 2 } }];
+        const check_runs = [rawRun(1, "ci-ok"), { ...rawRun(3, "optional"), check_suite: { id: 2 } }];
+        if (url.searchParams.get("filter") !== "latest") check_runs.push(rawRun(2, "optional"));
         if (++reads === 2 && replacementArrives) check_runs.push({ ...rawRun(4, "ci-ok"), check_suite: { id: 2 }, conclusion: "failure" });
         return response({ total_count: check_runs.length, check_runs });
       }

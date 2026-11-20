@@ -438,7 +438,9 @@ export class CiGithub {
     } catch (error) {
       if (!(error instanceof CiGithubError && error.code === "http" && error.status === 404)) throw error;
     }
-    const readRuns = async () => (await this.pages(`${root}/commits/${sha}/check-runs?filter=all`, "check_runs")).map((value): CiCheckRun => {
+    // Use the same current-run population as latest_check_runs_count, not
+    // all historical attempts or a local deduplication by display name.
+    const readRuns = async () => (await this.pages(`${root}/commits/${sha}/check-runs?filter=latest`, "check_runs")).map((value): CiCheckRun => {
       const run = object(value);
       if (fullSha(text(run.head_sha)) !== sha) return invalid();
       return {
@@ -468,7 +470,7 @@ export class CiGithub {
     // A newer suite may have completed between the two reads. Refresh once if
     // the run view may predate that completion; optional results do not decide readiness.
     if (relevant.some((run) => suites.some((suite) => isNewerSuite(suite, run) && suite.status === "completed"
-        && (suite.latestCheckRunsCount == null || hasUnseenRuns(suite, runs))))) {
+        && (suite.latestCheckRunsCount == null || hasRunCountMismatch(suite, runs))))) {
       runs = await readRuns();
       relevant = requiredRuns();
     }
@@ -807,13 +809,11 @@ function label(check: CiRequiredContext): string {
 function isNewerSuite(suite: CiCheckSuite, run: CiCheckRun): boolean {
   return run.suiteId != null && suite.appId === run.appId && suite.id > run.suiteId;
 }
-function hasUnseenRuns(suite: CiCheckSuite, runs: CiCheckRun[]): boolean {
-  const count = suite.latestCheckRunsCount ?? 0;
-  if (count === 0) return false;
-  // Repeated names in the same suite/app may be historical attempts, not
-  // additional jobs in its latest-run count.
-  const observedNames = new Set(runs.filter((run) => run.suiteId === suite.id && run.appId === suite.appId).map((run) => run.name));
-  return observedNames.size < count;
+function hasRunCountMismatch(suite: CiCheckSuite, runs: CiCheckRun[]): boolean {
+  const count = suite.latestCheckRunsCount;
+  if (count == null) return false;
+  const observedIds = new Set(runs.filter((run) => run.suiteId === suite.id && run.appId === suite.appId).map((run) => run.id));
+  return observedIds.size !== count;
 }
 
 /** Suites that can still contribute checks or represent observed work. */
@@ -891,10 +891,10 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
           : run.suiteId != null || suites.some((suite) => suite.status !== "completed");
         const corroborated = associated && snapshot.currentAttemptRunIds?.includes(run.id);
         // Check unfiltered suites here: a newer suite may not have published its
-        // first check yet. A completed suite with unseen runs is also unresolved.
+        // first check yet. A completed suite with a run-count mismatch is also unresolved.
         const newerUnresolvedSuite = (run.suiteId != null && (newestUnlisted.get(run.appId) ?? 0) > run.suiteId)
           || snapshot.suites.some((suite) => isNewerSuite(suite, run)
-            && (suite.status !== "completed" || hasUnseenRuns(suite, snapshot.runs)));
+            && (suite.status !== "completed" || hasRunCountMismatch(suite, snapshot.runs)));
         record(label(required), newerUnresolvedSuite || (ambiguous && !corroborated) ? "pending" : conclusion(run.status, run.conclusion));
       }
       // Statuses do not identify their workflow/generation; defer while suites run.
