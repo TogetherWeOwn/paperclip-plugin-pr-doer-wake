@@ -31,7 +31,7 @@ export const registrationTool = {
 const manifest: PaperclipPluginManifestV1 = {
   id: "togetherweown.pr-doer-wake",
   apiVersion: 1,
-  version: "0.3.0",
+  version: "0.3.1",
   displayName: "CI wake and PR custody",
   description: "Explicit CI completion waits plus opt-in hourly organization PR custody. Independent dry-run defaults, bounded native wakes and disposition cards; no automatic PR mutation.",
   author: "TogetherWeOwn",
