@@ -160,7 +160,9 @@ describe("evaluateReadiness", () => {
     }
   });
 
-  it.each(["queued", "in_progress"])("waits for a %s ready-for-review suite rather than passing on draft ci-ok", (status) => {
+  it.each([
+    ["queued", 0], ["queued", 1], ["in_progress", 0], ["in_progress", 1],
+  ])("waits for a %s ready-for-review suite with %i runs rather than passing on draft ci-ok", (status, latestCheckRunsCount) => {
     const input = snapshot({
       required: [{ context: "ci-ok", appId: 7 }],
       runs: [run(1, { name: "ci-ok" })],
@@ -168,9 +170,11 @@ describe("evaluateReadiness", () => {
     });
     expect(evaluateReadiness(input, { ...timing, draft: true }).kind).toBe("pass");
 
-    input.suites.push(suite(2, { status, conclusion: null, completedAt: null, latestCheckRunsCount: 1 }));
+    const readySuite = suite(2, { status, conclusion: null, completedAt: null, latestCheckRunsCount });
+    input.suites.push({ ...readySuite, appId: 8 });
+    expect(evaluateReadiness(input, timing).kind).toBe("pass");
+    input.suites[1] = readySuite;
     expect(evaluateReadiness(input, timing)).toMatchObject({ kind: "pending", pending: ["ci-ok [app 7]"] });
-    expect(evaluateReadiness({ ...input, currentAttemptRunIds: [1] }, timing).kind).toBe("pending");
 
     input.runs.push(run(2, { name: "ci-ok", suiteId: 2 }));
     input.suites[1] = suite(2);
@@ -562,6 +566,29 @@ describe("CiGithub REST reads", () => {
     expect(evaluateReadiness(await github.snapshot(REPO, SHA, "main"), timing).kind).toBe(result === "success" ? "pass" : "fail");
   });
 
+  it.each(["success", "failure", "optional only", "still missing"])("refreshes check runs after observing a newer completed suite (%s)", async (result) => {
+    let reads = 0;
+    const { fetch } = fixtures((url) => {
+      if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "ci-ok", app_id: 7 }] });
+      if (url.pathname.endsWith("check-runs")) {
+        const check_runs = [rawRun(1, "ci-ok")];
+        if (++reads > 1 && result !== "still missing") check_runs.push({
+          ...rawRun(2, result === "optional only" ? "optional" : "ci-ok"), conclusion: result === "success" ? "success" : "failure",
+        });
+        return response({ total_count: check_runs.length, check_runs });
+      }
+      if (url.pathname.endsWith("check-suites")) {
+        expect(reads).toBe(1);
+        return response({ total_count: 2, check_suites: [rawSuite(), {
+          ...rawSuite(2), latest_check_runs_count: 1, conclusion: result === "success" ? "success" : "failure",
+        }] });
+      }
+    });
+    const actual = await new CiGithub(fetch, TOKEN).snapshot(REPO, SHA, "main");
+    expect(evaluateReadiness(actual, timing).kind).toBe(result === "still missing" ? "pending" : result === "failure" ? "fail" : "pass");
+    expect(reads).toBe(2);
+  });
+
   it.each([7, 8])("checks whether a newer active suite from app %i could replace the required run", async (optionalApp) => {
     const { fetch } = fixtures((url) => {
       if (url.pathname.endsWith("required_status_checks")) return response({ contexts: [], checks: [{ context: "build", app_id: 7 }] });
@@ -703,6 +730,25 @@ function attemptFixtures(overrides: (url: URL, count: number) => CiHttpResponse 
 }
 
 describe("Actions current-attempt evidence", () => {
+  it("does not let corroboration in an older in-progress suite settle a newer queued suite", async () => {
+    let newerQueued = false;
+    const f = attemptFixtures((url) => {
+      if (newerQueued && url.pathname.endsWith("/check-suites")) return response({ total_count: 2, check_suites: [
+        f.activeSuite, { ...rawSuite(2), status: "queued", conclusion: null, latest_check_runs_count: 0 },
+      ] });
+    });
+    const github = new CiGithub(f.fetch, TOKEN);
+    const before = await github.snapshot(REPO, SHA, "main");
+    expect(before.currentAttemptRunIds).toEqual([1]);
+    expect(evaluateReadiness({ ...before, currentAttemptRunIds: [] }, timing).kind).toBe("pending");
+    expect(evaluateReadiness(before, timing).kind).toBe("pass");
+
+    newerQueued = true;
+    const after = await github.snapshot(REPO, SHA, "main");
+    expect(after.currentAttemptRunIds).toEqual([1]);
+    expect(evaluateReadiness(after, timing)).toMatchObject({ kind: "pending", pending: ["build [app 7]"] });
+  });
+
   it.each(["Acme/Widgets", "ACME/WIDGETS"])("accepts canonical %s job identities without fetching response URLs", async (repo) => {
     const f = attemptFixtures((url) => url.pathname.endsWith("/attempts/1/jobs")
       ? response({ total_count: 1, jobs: [{ ...f.job, check_run_url: `https://api.github.com/repos/${repo}/check-runs/1` }] }) : undefined);
