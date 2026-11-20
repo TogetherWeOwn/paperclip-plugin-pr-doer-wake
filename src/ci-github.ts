@@ -70,6 +70,8 @@ export interface CiSnapshot {
   baseBranch: string;
   required: CiRequiredContext[];
   runs: CiCheckRun[];
+  /** Last job-producing results hidden by empty failed reruns; not current-run evidence. */
+  historicalRequiredRuns?: CiCheckRun[];
   suites: CiCheckSuite[];
   statuses: CiCommitStatus[];
   /** Exact check-run IDs corroborated by terminal jobs in a stable Actions attempt. */
@@ -440,7 +442,9 @@ export class CiGithub {
     }
     // Use the same current-run population as latest_check_runs_count, not
     // all historical attempts or a local deduplication by display name.
-    const readRuns = async () => (await this.pages(`${root}/commits/${sha}/check-runs?filter=latest`, "check_runs")).map((value): CiCheckRun => {
+    const readRuns = async (filter: "latest" | "all") => (await this.pages(
+      `${root}/commits/${sha}/check-runs?filter=${filter}`, "check_runs", filter === "all",
+    )).map((value): CiCheckRun => {
       const run = object(value);
       if (fullSha(text(run.head_sha)) !== sha) return invalid();
       return {
@@ -449,7 +453,7 @@ export class CiGithub {
         status: text(run.status), conclusion: nullableText(run.conclusion),
       };
     });
-    let runs = await readRuns();
+    let runs = await readRuns("latest");
     const suites = (await this.pages(`${root}/commits/${sha}/check-suites`, "check_suites")).map((value): CiCheckSuite => {
       const suite = object(value);
       if (fullSha(text(suite.head_sha)) !== sha) return invalid();
@@ -465,15 +469,26 @@ export class CiGithub {
     });
     const unique = [...new Map(required.map((check) => [JSON.stringify([check.context, check.appId]), check])).values()];
     const requiredRuns = () => latest(runs, (run) => JSON.stringify([run.name, run.appId])).filter((run) =>
-      unique.some((check) => check.context === run.name && (check.appId === null || check.appId === run.appId)));
+      unique.some((check) => matchesRun(check, run)));
     let relevant = requiredRuns();
     // A newer suite may have completed between the two reads. Refresh once if
     // the run view may predate that completion; optional results do not decide readiness.
     if (relevant.some((run) => suites.some((suite) => isNewerSuite(suite, run) && suite.status === "completed"
         && (suite.latestCheckRunsCount == null || hasRunCountMismatch(suite, runs))))) {
-      runs = await readRuns();
+      runs = await readRuns("latest");
       relevant = requiredRuns();
     }
+    // A failed rerun that created no jobs can hide its last job-producing attempt
+    // from filter=latest. Recover only required results that lack a newer suite's run.
+    const historyContexts = new Map<string, Set<string>>();
+    for (const suite of suites) {
+      if (suite.latestCheckRunsCount !== 0 || conclusion(suite.status, suite.conclusion) !== "fail" || hasRunCountMismatch(suite, runs)) continue;
+      const candidates = unique.filter((check) => (check.appId === null || check.appId === suite.appId)
+        && !relevant.some((run) => matchesRun(check, run) && run.appId === suite.appId && (run.suiteId ?? 0) > suite.id));
+      if (candidates.length) historyContexts.set(suiteKey(suite.id, suite.appId), new Set(candidates.map((check) => check.context)));
+    }
+    const historicalRequiredRuns = historyContexts.size ? (await readRuns("all")).filter((run) =>
+      run.suiteId != null && historyContexts.get(suiteKey(run.suiteId, run.appId))?.has(run.name)) : [];
     // /status is a combined, truncated summary. /statuses is the paginated history we need.
     const statuses = (await this.pages(`${root}/commits/${sha}/statuses`)).map((value): CiCommitStatus => {
       const status = object(value);
@@ -509,7 +524,7 @@ export class CiGithub {
         }
       }
     }
-    return { repo, sha, baseBranch, required: unique, runs, suites, statuses, currentAttemptRunIds, fetchedAt: this.now() };
+    return { repo, sha, baseBranch, required: unique, runs, historicalRequiredRuns, suites, statuses, currentAttemptRunIds, fetchedAt: this.now() };
   }
 
   /**
@@ -806,6 +821,12 @@ function latest<T extends { id: number }>(values: readonly T[], key: (value: T) 
 function label(check: CiRequiredContext): string {
   return check.appId === null ? check.context : `${check.context} [app ${check.appId}]`;
 }
+function matchesRun(check: CiRequiredContext, run: CiCheckRun): boolean {
+  return check.context === run.name && (check.appId === null || check.appId === run.appId);
+}
+function suiteKey(suiteId: number, appId: number | null): string {
+  return `${suiteId}:${appId}`;
+}
 function isNewerSuite(suite: CiCheckSuite, run: CiCheckRun): boolean {
   return run.suiteId != null && suite.appId === run.appId && suite.id > run.suiteId;
 }
@@ -828,7 +849,8 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   if (![timing.now, timing.registeredAt, timing.medianMs, timing.readySince ?? 0].every(Number.isFinite) || timing.medianMs <= 0) {
     throw new CiGithubError("input");
   }
-  const runs = latest(snapshot.runs, (run) => JSON.stringify([run.name, run.appId]));
+  const runResults = snapshot.required.length ? [...snapshot.runs, ...(snapshot.historicalRequiredRuns ?? [])] : snapshot.runs;
+  const runs = latest(runResults, (run) => JSON.stringify([run.name, run.appId]));
   const statuses = latest(snapshot.statuses, (status) => status.context);
   // Multiple workflows share the GitHub Actions app ID; app ID is not suite identity.
   // Installed Apps can leave empty queued suites forever. Unknown states and suites
@@ -854,7 +876,6 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
     return state === "success" ? "pass" : state === "failure" || state === "error" ? "fail" : "pending";
   }
   if (snapshot.required.length) {
-    const suiteKey = (suiteId: number, appId: number | null) => `${suiteId}:${appId}`;
     const listedSuites = new Map(snapshot.suites.map((suite) => [suiteKey(suite.id, suite.appId), suite]));
     const newestUnlisted = new Map<number | null, number>();
     // A run reread can reveal suites missing from the earlier list, including
@@ -865,7 +886,7 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
       }
     }
     for (const required of snapshot.required) {
-      const matchingRuns = runs.filter((run) => run.name === required.context && (required.appId === null || run.appId === required.appId));
+      const matchingRuns = runs.filter((run) => matchesRun(required, run));
       // A context's state is its latest status, whoever set it. An app-bound
       // requirement counts only that status, and only when a verified app
       // lookup proves the required app set it: an older success from the
@@ -890,12 +911,14 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
         const ambiguous = associated ? associated.status !== "completed"
           : run.suiteId != null || suites.some((suite) => suite.status !== "completed");
         const corroborated = associated && snapshot.currentAttemptRunIds?.includes(run.id);
+        const incompleteSuite = associated?.status === "completed" && hasRunCountMismatch(associated, snapshot.runs);
         // Check unfiltered suites here: a newer suite may not have published its
         // first check yet. A completed suite with a run-count mismatch is also unresolved.
         const newerUnresolvedSuite = (run.suiteId != null && (newestUnlisted.get(run.appId) ?? 0) > run.suiteId)
           || snapshot.suites.some((suite) => isNewerSuite(suite, run)
             && (suite.status !== "completed" || hasRunCountMismatch(suite, snapshot.runs)));
-        record(label(required), newerUnresolvedSuite || (ambiguous && !corroborated) ? "pending" : conclusion(run.status, run.conclusion));
+        record(label(required), incompleteSuite || newerUnresolvedSuite || (ambiguous && !corroborated)
+          ? "pending" : conclusion(run.status, run.conclusion));
       }
       // Statuses do not identify their workflow/generation; defer while suites run.
       for (const status of matchingStatuses) record(label(required), suites.some((suite) => suite.status !== "completed") ? "pending" : statusVerdict(status.state));
