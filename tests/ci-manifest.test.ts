@@ -22,7 +22,7 @@ describe("stock manifest and config contract", () => {
     expect(manifest.jobs?.find((job) => job.jobKey === "pr-custody")?.schedule).toBe("17 * * * *");
     expect(manifest.jobs?.find((job) => job.jobKey === "gates-status-sweep")?.schedule).toBe("*/4 * * * *");
     expect(manifest.tools?.map((tool) => tool.name)).toEqual(["ci_wait_register"]);
-    expect(manifest.jobs?.[0]?.schedule).toBe("*/15 * * * *");
+    expect(manifest.jobs?.[0]?.schedule).toBe("*/5 * * * *");
     const props = manifest.instanceConfigSchema?.properties as Record<string, Record<string, unknown>> | undefined;
     expect(props?.gatesStatusEnabled).toMatchObject({ type: "boolean", default: false });
     expect(props?.gatesStatusShadow).toMatchObject({ type: "boolean", default: true });

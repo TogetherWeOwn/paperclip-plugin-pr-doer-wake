@@ -405,9 +405,9 @@ export class CiWakeRuntime {
   private audit(ledger: Ledger, operation: string, outcome: string, run?: ToolRunContext, waitId?: string, detail?: string): void {
     ledger.audits.push({ at: this.now(), operation, outcome, ...(run && UUID.test(run.runId) && UUID.test(run.companyId) ? { runId: run.runId, companyId: run.companyId } : {}), ...(waitId ? { waitId } : {}), ...(detail ? { detail } : {}) });
     while (ledger.audits.length > LIMITS.audit) {
-      // Keep the current call's durable intent, but evict older routine intents
-      // before wake/refusal evidence. This remains a bounded log, not an archive.
-      const routine = ledger.audits.findIndex((entry, index) => index < ledger.audits.length - 1 && entry.operation === "poll" && entry.outcome === "intent");
+      // Keep the current call's durable intent, but evict routine records
+      // before wake/refusal evidence. A new summary may itself be dropped.
+      const routine = ledger.audits.findIndex((entry, index) => entry.operation === "poll" && (entry.outcome === "completed" || (entry.outcome === "intent" && index < ledger.audits.length - 1)));
       ledger.audits.splice(routine < 0 ? 0 : routine, 1);
     }
   }
@@ -736,12 +736,34 @@ export class CiWakeRuntime {
   }
 
   private async pollLocked(only?: { companyId: string; repo: string; sha: string }): Promise<void> {
-    let ledger = await this.load();
+    const passStarted = this.now();
+    const elapsed = (since: number) => Math.max(0, this.now() - since);
+    let ledgerRpcMs = 0;
+    let ledgerWrites = 0;
+    let queuedYieldMs = 0;
+    let queuedYields = 0;
+    const measureLedger = async <T>(run: () => Promise<T>): Promise<T> => {
+      const since = this.now();
+      try { return await run(); } finally { ledgerRpcMs += elapsed(since); }
+    };
+    const save = (ledger: Ledger) => { ledgerWrites += 1; return measureLedger(() => this.save(ledger)); };
+    const yieldLedger = async (ledger: Ledger) => {
+      if (!this.lockWaiters.length) return ledger;
+      const since = this.now();
+      queuedYields += 1;
+      try { return await this.yieldToQueued(ledger); } finally { queuedYieldMs += elapsed(since); }
+    };
+    let ledger = await measureLedger(() => this.load());
     this.compact(ledger);
-    await this.save(ledger);
+    await save(ledger);
     const started = this.now();
     let requests = 0;
+    let notModified = 0;
     let wakes = 0;
+    let waitsAttempted = 0;
+    let waitMs = 0;
+    let maxWaitMs = 0;
+    let reviewerEntriesAdmitted = 0;
     // Reserve half of each count budget for reviewer work when both lanes
     // have work. The shared time budget remains an absolute limit.
     const hasReviewerWork = () => Object.values(ledger.prHeadPending).some((e) => !only || e.companyId === only.companyId && e.repo === only.repo && e.newSha === only.sha);
@@ -754,13 +776,15 @@ export class CiWakeRuntime {
     const fetch: PluginContext["http"]["fetch"] = async (url, init) => {
       if (requests >= requestLimit || this.now() - started >= LIMITS.tickMs) throw new Error("tick_budget");
       requests += 1;
-      return this.ctx.http.fetch(url, init);
+      const response = await this.ctx.http.fetch(url, init);
+      if (response.status === 304) notModified += 1; // CiGithub sends only authenticated requests.
+      return response;
     };
     // Oldest last-attempt first prevents one unavailable repository starving others.
     const pending = ledger.waits.filter((w) => w.status === "open" && (!only || w.companyId === only.companyId && w.repo === only.repo && w.headSha === only.sha)).sort((a, b) => (a.lastAttemptAt ?? 0) - (b.lastAttemptAt ?? 0));
     for (const queued of pending) {
       if (requests >= ciRequestLimit || wakes >= ciWakeLimit || this.now() - started >= LIMITS.tickMs) break;
-      const fresh = await this.yieldToQueued(ledger);
+      const fresh = await yieldLedger(ledger);
       // A failed save or reload at a yield ends this poll without further writes.
       if (!fresh) return;
       ledger = fresh;
@@ -771,22 +795,24 @@ export class CiWakeRuntime {
       // A registration that ran during the yield may have superseded or retired this wait.
       const wait = ledger.waits.find((w) => w.waitId === queued.waitId);
       if (!wait || wait.status !== "open") continue;
+      waitsAttempted += 1;
+      const waitStarted = this.now();
       try {
         wait.lastAttemptAt = this.now();
         const config = await this.config(wait.companyId, false);
         // Disabled polling still compacts above, but must not churn per-wait audit evidence.
         if (!config.enabled) continue;
-        if (!config.allowedRepos.includes(wait.repo)) { wait.status = "retired"; wait.reason = "repo_revoked"; wait.finishedAt = this.now(); await this.save(ledger); continue; }
+        if (!config.allowedRepos.includes(wait.repo)) { wait.status = "retired"; wait.reason = "repo_revoked"; wait.finishedAt = this.now(); await save(ledger); continue; }
         await this.checkBinding(wait);
         this.audit(ledger, "poll", "intent", undefined, wait.waitId);
-        await this.save(ledger);
+        await save(ledger);
         const github = await this.client(wait.companyId, config, wait.repo, fetch, cycle);
         const pr = await github.pull(wait.repo, wait.prNumber);
         if (pr.number !== wait.prNumber || pr.state !== "open" || pr.merged || pr.headSha !== wait.headSha || pr.headRepo?.toLowerCase() !== wait.repo) {
           if (pr.number === wait.prNumber && pr.state === "open" && !pr.merged && pr.headSha !== wait.headSha && pr.headRepo?.toLowerCase() === wait.repo) {
             this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, pr.headSha);
           }
-          wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
+          wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await save(ledger); continue;
         }
         const identity = `${wait.companyId}:${authIdentity(config)}`;
         let appIds = appIdsByIdentity.get(identity);
@@ -815,7 +841,7 @@ export class CiWakeRuntime {
           if (current.number === wait.prNumber && current.state === "open" && !current.merged && current.headSha !== wait.headSha && current.headRepo?.toLowerCase() === wait.repo) {
             this.noteHeadChange(ledger, wait.companyId, wait.repo, wait.prNumber, wait.headSha, current.headSha);
           }
-          wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await this.save(ledger); continue;
+          wait.status = "retired"; wait.reason = "head_moved_or_closed"; wait.finishedAt = this.now(); await save(ledger); continue;
         }
         if (!verdict.missing.length && !samples.some((s) => s.sha === wait.headSha)) {
           const suites = relevantSuites(snapshot);
@@ -836,13 +862,13 @@ export class CiWakeRuntime {
         if (config.dryRun) {
           wait.status = "would_wake"; wait.finishedAt = this.now();
           this.audit(ledger, "wake", "would_wake", undefined, wait.waitId);
-          await this.save(ledger);
+          await save(ledger);
           this.ctx.logger.info("ci-wake: would wake", { waitId: wait.waitId, repo: wait.repo, headSha: wait.headSha, verdict: verdict.kind });
         } else {
           // Persist before calling the host. Restart/ambiguous replies NEVER repeat an attempted effect.
           wait.status = "waking";
           this.audit(ledger, "wake", "intent", undefined, wait.waitId);
-          try { await this.save(ledger); } catch {
+          try { await save(ledger); } catch {
             // The write may have committed, but no wake call has been made: restoring open is safe.
             wait.status = "open";
             throw new Error("wake_intent_write_failed");
@@ -856,7 +882,7 @@ export class CiWakeRuntime {
             wait.status = deferred ? "open" : "unconfirmed";
             if (!deferred) wait.finishedAt = this.now();
             this.audit(ledger, "wake", deferred ? "host_deferred" : "unconfirmed", undefined, wait.waitId);
-            await this.save(ledger);
+            await save(ledger);
             if (!deferred) this.ctx.logger.warn("ci-wake: wake unconfirmed; use the card backstop", { waitId: wait.waitId });
             continue;
           }
@@ -864,14 +890,18 @@ export class CiWakeRuntime {
           if (result.queued) wait.finishedAt = this.now();
           this.audit(ledger, "wake", result.queued ? "woken" : "host_deferred", undefined, wait.waitId);
           // Recording failures after dispatch are never classified as a pre-queue refusal.
-          await this.save(ledger);
+          await save(ledger);
         }
       } catch (error) {
         if (error instanceof BindingChanged) {
           wait.status = "retired"; wait.reason = "binding_changed"; wait.finishedAt = this.now();
         }
         this.audit(ledger, "poll", error instanceof BindingChanged ? "binding_changed" : "retryable", undefined, wait.waitId);
-        await this.save(ledger);
+        await save(ledger);
+      } finally {
+        const duration = elapsed(waitStarted);
+        waitMs += duration;
+        maxWaitMs = Math.max(maxWaitMs, duration);
       }
     }
     // Reviewer wakes for observed head changes (settled heads only).
@@ -887,7 +917,6 @@ export class CiWakeRuntime {
       const reviewerStartRequests = requests;
       const reviewerStartedAt = this.now();
       let entriesExamined = 0;
-      let entriesAdmitted = 0;
       let shadowConfiguredEntries = 0;
       let candidateBudgetStops = 0;
       let entryRetryableErrors = 0;
@@ -896,10 +925,10 @@ export class CiWakeRuntime {
       // Configuration is not yet known; this aggregate does not assert shadow mode.
       if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass started", { reviewerStartedAt, entryCount: entries.length });
       try {
-      if (allEntries.length) await this.save(ledger);
+      if (allEntries.length) await save(ledger);
       for (const [key] of entries) {
         if (requests >= LIMITS.requestsPerTick || wakes >= LIMITS.wakePerTick || this.now() - started >= LIMITS.tickMs) { reviewerOutcome = "budget_exhausted"; break; }
-        const fresh = await this.yieldToQueued(ledger);
+        const fresh = await yieldLedger(ledger);
         if (!fresh) { reviewerOutcome = "yield_aborted"; return; }
         ledger = fresh;
         if (this.now() - started >= LIMITS.tickMs) { reviewerOutcome = "budget_exhausted"; break; }
@@ -907,25 +936,25 @@ export class CiWakeRuntime {
         // A registration during the yield may have retargeted this entry to a newer head.
         const entry = ledger.prHeadPending[key];
         if (!entry || entry.pollOrder === undefined || (only && entry.newSha !== only.sha)) continue;
-        entriesAdmitted += 1;
+        reviewerEntriesAdmitted += 1;
         const entryStartRequests = requests;
         const previousOrder = entry.pollOrder!;
         entry.pollOrder = ++sequence;
-        await this.save(ledger);
+        await save(ledger);
         try {
           const config = await this.config(entry.companyId, false);
           if (config.prHeadWakeShadow || config.dryRun) shadowConfiguredEntries += 1;
           // Feature off: drop the entry rather than accumulate stale wakes.
-          if (!config.enabled || !config.prHeadWakeEnabled) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
-          if (!config.allowedRepos.includes(entry.repo)) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (!config.enabled || !config.prHeadWakeEnabled) { delete ledger.prHeadPending[key]; await save(ledger); continue; }
+          if (!config.allowedRepos.includes(entry.repo)) { delete ledger.prHeadPending[key]; await save(ledger); continue; }
           const github = await this.client(entry.companyId, config, entry.repo, fetch, cycle);
           const current = await github.pull(entry.repo, entry.prNumber);
-          if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (current.number !== entry.prNumber || current.state !== "open" || current.merged || current.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await save(ledger); continue; }
           if (current.headSha !== entry.newSha) {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
             entry.oldSha = entry.newSha; entry.newSha = current.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
-            await this.save(ledger); continue;
+            await save(ledger); continue;
           }
           const snapshot = await github.snapshot(entry.repo, entry.newSha, current.baseBranch);
           const samples = ledger.samples[`${entry.companyId}:${entry.repo}`] ?? [];
@@ -938,12 +967,12 @@ export class CiWakeRuntime {
           // snapshot and before any wake intent. A push during the snapshot
           // must retarget the entry, never wake for the stale SHA.
           const checked = await github.pull(entry.repo, entry.prNumber);
-          if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await this.save(ledger); continue; }
+          if (checked.number !== entry.prNumber || checked.state !== "open" || checked.merged || checked.headRepo?.toLowerCase() !== entry.repo) { delete ledger.prHeadPending[key]; await save(ledger); continue; }
           if (checked.headSha !== entry.newSha) {
             // Newer push superseded the pending head: re-target, keeping the
             // oldest oldSha the reviewer last saw.
             entry.oldSha = entry.newSha; entry.newSha = checked.headSha; entry.observedAt = this.now(); entry.shadowLogged = [];
-            await this.save(ledger); continue;
+            await save(ledger); continue;
           }
           if (checked.draft !== current.draft) continue;
           if (checked.baseBranch !== current.baseBranch) {
@@ -951,7 +980,7 @@ export class CiWakeRuntime {
             // keep oldSha/newSha (never collapse them into a meaningless
             // same-SHA wake) and retry against the new base next tick.
             entry.observedAt = this.now();
-            await this.save(ledger); continue;
+            await save(ledger); continue;
           }
           // The final GitHub read can finish after the tick's admission budget.
           if (this.now() - started >= LIMITS.tickMs) {
@@ -980,7 +1009,7 @@ export class CiWakeRuntime {
           for (const id of candidates) if (entry.candidateOrder[id] === undefined) entry.candidateOrder[id] = ++candidateSequence;
           candidates.sort((a, b) => entry.candidateOrder![a]! - entry.candidateOrder![b]!);
           entry.candidateSequence = candidateSequence;
-          await this.save(ledger);
+          await save(ledger);
           let outstanding = false;
           for (const issueId of candidates) {
             const wakeKey = `${entry.companyId}:${issueId}:${entry.newSha}`;
@@ -994,7 +1023,7 @@ export class CiWakeRuntime {
             }
             entry.candidateOrder[issueId] = ++candidateSequence;
             entry.candidateSequence = candidateSequence;
-            await this.save(ledger);
+            await save(ledger);
             let issue: any;
             const eligibilityReadStartedAt = this.now();
             try { issue = await this.ctx.issues.get(issueId, entry.companyId); }
@@ -1032,7 +1061,7 @@ export class CiWakeRuntime {
               if (!entry.shadowLogged.includes(issueId) && !entry.shadowLogged.includes("*")) {
                 entry.shadowLogged.push(issueId);
                 this.audit(ledger, "pr_head_wake", "would_wake");
-                await this.save(ledger);
+                await save(ledger);
                 this.ctx.logger.info("pr-head-wake: would wake", {
                   companyId: entry.companyId, issueId, repo: entry.repo, prNumber: entry.prNumber, oldSha: entry.oldSha, newSha: entry.newSha,
                   eligibilityReadStartedAt, eligibilityReadCompletedAt, decisionAt: this.now(),
@@ -1054,7 +1083,7 @@ export class CiWakeRuntime {
             // restart never repeats this (card, SHA) effect.
             ledger.reviewerWakes[wakeKey] = this.now();
             this.audit(ledger, "pr_head_wake", "intent");
-            try { await this.save(ledger); } catch {
+            try { await save(ledger); } catch {
               delete ledger.reviewerWakes[wakeKey];
               outstanding = true; throw new Error("wake_intent_write_failed");
             }
@@ -1063,19 +1092,19 @@ export class CiWakeRuntime {
             if (this.now() - started >= LIMITS.tickMs) {
               candidateBudgetStops += 1;
               delete ledger.reviewerWakes[wakeKey];
-              await this.save(ledger);
+              await save(ledger);
               outstanding = true;
               break;
             }
             try { await validateAuthority(); } catch {
               delete ledger.reviewerWakes[wakeKey];
-              await this.save(ledger);
+              await save(ledger);
               throw new Error("configuration_changed");
             }
             if (this.now() - started >= LIMITS.tickMs) {
               candidateBudgetStops += 1;
               delete ledger.reviewerWakes[wakeKey];
-              await this.save(ledger);
+              await save(ledger);
               outstanding = true;
               break;
             }
@@ -1092,7 +1121,7 @@ export class CiWakeRuntime {
                 this.audit(ledger, "pr_head_wake", "unconfirmed");
                 this.ctx.logger.warn("pr-head-wake: wake unconfirmed; use the card backstop", { issueId, repo: entry.repo, prNumber: entry.prNumber });
               }
-              await this.save(ledger);
+              await save(ledger);
               continue;
             }
             if (result.queued) {
@@ -1102,17 +1131,17 @@ export class CiWakeRuntime {
               this.audit(ledger, "pr_head_wake", "host_deferred");
               outstanding = true;
             }
-            await this.save(ledger);
+            await save(ledger);
           }
           // Clear only when every candidate is woken/deduped/ineligible/excluded.
-          if (!outstanding && !shadow) { delete ledger.prHeadPending[key]; await this.save(ledger); }
+          if (!outstanding && !shadow) { delete ledger.prHeadPending[key]; await save(ledger); }
         } catch (error) {
           // Retry a request-truncated entry first next tick, unless it already
           // had the whole reviewer share: then rotate it to avoid blocking peers.
           if (requests >= LIMITS.requestsPerTick && entryStartRequests > reviewerStartRequests) entry.pollOrder = previousOrder;
           entryRetryableErrors += 1;
           this.audit(ledger, "pr_head_wake", "retryable");
-          await this.save(ledger);
+          await save(ledger);
         }
       }
       } catch (error) {
@@ -1121,10 +1150,19 @@ export class CiWakeRuntime {
       } finally {
         if (entries.length) this.ctx.logger.info("pr-head-wake: reviewer pass completed", {
           reviewerStartedAt, reviewerCompletedAt: this.now(), entryCount: entries.length,
-          entriesExamined, entriesAdmitted, shadowConfiguredEntries, entriesUnexamined: entries.length - entriesExamined,
+          entriesExamined, entriesAdmitted: reviewerEntriesAdmitted, shadowConfiguredEntries, entriesUnexamined: entries.length - entriesExamined,
           candidateBudgetStops, entryRetryableErrors, entryFinalPrReadDeadlineStops, outcome: reviewerOutcome,
         });
       }
+    }
+    if (!only) {
+      // Persist with the existing final write. Unknown/failed responses count
+      // against the upper bound; a host-hidden 304 cannot be classified here.
+      this.audit(ledger, "poll", "completed", undefined, undefined, JSON.stringify({
+        elapsedMs: elapsed(passStarted), waitsAtStart: pending.length, waitsAttempted, waitMs, maxWaitMs,
+        reviewerEntriesAdmitted, ledgerRpcMs, ledgerWrites, queuedYieldMs, queuedYields,
+        httpAttempts: requests, visible304s: notModified, quotaChargedUpperBound: requests - notModified,
+      }));
     }
     await this.save(ledger);
   }

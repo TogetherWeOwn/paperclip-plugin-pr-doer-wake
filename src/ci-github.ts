@@ -242,7 +242,7 @@ function refusalDetail(status: number, permissionDenied: boolean, path: string, 
  * client sets this one explicitly on every request — token exchange included.
  * Keep the version in sync with package.json / manifest.ts.
  */
-export const GITHUB_USER_AGENT = "togetherweown-paperclip-plugin-pr-doer-wake/0.3.1";
+export const GITHUB_USER_AGENT = "togetherweown-paperclip-plugin-pr-doer-wake/0.3.2";
 const ORIGIN = "https://api.github.com";
 const PAGE_SIZE = 100;
 // Recognize provider credential shapes without retaining expired/previous tokens.
