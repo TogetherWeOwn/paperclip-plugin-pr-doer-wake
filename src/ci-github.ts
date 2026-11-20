@@ -809,7 +809,11 @@ function isNewerSuite(suite: CiCheckSuite, run: CiCheckRun): boolean {
 }
 function hasUnseenRuns(suite: CiCheckSuite, runs: CiCheckRun[]): boolean {
   const count = suite.latestCheckRunsCount ?? 0;
-  return count > 0 && count > runs.filter((run) => run.suiteId === suite.id && run.appId === suite.appId).length;
+  if (count === 0) return false;
+  // Repeated names in the same suite/app may be historical attempts, not
+  // additional jobs in its latest-run count.
+  const observedNames = new Set(runs.filter((run) => run.suiteId === suite.id && run.appId === suite.appId).map((run) => run.name));
+  return observedNames.size < count;
 }
 
 /** Suites that can still contribute checks or represent observed work. */
@@ -850,6 +854,16 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
     return state === "success" ? "pass" : state === "failure" || state === "error" ? "fail" : "pending";
   }
   if (snapshot.required.length) {
+    const suiteKey = (suiteId: number, appId: number | null) => `${suiteId}:${appId}`;
+    const listedSuites = new Map(snapshot.suites.map((suite) => [suiteKey(suite.id, suite.appId), suite]));
+    const newestUnlisted = new Map<number | null, number>();
+    // A run reread can reveal suites missing from the earlier list, including
+    // those that have so far published only optional jobs.
+    for (const { suiteId, appId } of snapshot.runs) {
+      if (suiteId != null && !listedSuites.has(suiteKey(suiteId, appId))) {
+        newestUnlisted.set(appId, Math.max(suiteId, newestUnlisted.get(appId) ?? 0));
+      }
+    }
     for (const required of snapshot.required) {
       const matchingRuns = runs.filter((run) => run.name === required.context && (required.appId === null || run.appId === required.appId));
       // A context's state is its latest status, whoever set it. An app-bound
@@ -872,13 +886,15 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
       for (const run of matchingRuns) {
         // An active suite can hide a required rerun not yet materialized. Only
         // positive current-attempt job evidence permits same-suite optional work.
-        const associated = suites.find((suite) => suite.id === run.suiteId && suite.appId === run.appId);
-        const ambiguous = associated ? associated.status !== "completed" : suites.some((suite) => suite.status !== "completed");
+        const associated = run.suiteId == null ? undefined : listedSuites.get(suiteKey(run.suiteId, run.appId));
+        const ambiguous = associated ? associated.status !== "completed"
+          : run.suiteId != null || suites.some((suite) => suite.status !== "completed");
         const corroborated = associated && snapshot.currentAttemptRunIds?.includes(run.id);
         // Check unfiltered suites here: a newer suite may not have published its
         // first check yet. A completed suite with unseen runs is also unresolved.
-        const newerUnresolvedSuite = snapshot.suites.some((suite) => isNewerSuite(suite, run)
-          && (suite.status !== "completed" || hasUnseenRuns(suite, snapshot.runs)));
+        const newerUnresolvedSuite = (run.suiteId != null && (newestUnlisted.get(run.appId) ?? 0) > run.suiteId)
+          || snapshot.suites.some((suite) => isNewerSuite(suite, run)
+            && (suite.status !== "completed" || hasUnseenRuns(suite, snapshot.runs)));
         record(label(required), newerUnresolvedSuite || (ambiguous && !corroborated) ? "pending" : conclusion(run.status, run.conclusion));
       }
       // Statuses do not identify their workflow/generation; defer while suites run.
