@@ -440,8 +440,7 @@ export class CiGithub {
     } catch (error) {
       if (!(error instanceof CiGithubError && error.code === "http" && error.status === 404)) throw error;
     }
-    // Use the same current-run population as latest_check_runs_count, not
-    // all historical attempts or a local deduplication by display name.
+    // Match latest_check_runs_count with filter=latest, not history or name deduplication.
     const readRuns = async (filter: "latest" | "all") => (await this.pages(
       `${root}/commits/${sha}/check-runs?filter=${filter}`, "check_runs", filter === "all",
     )).map((value): CiCheckRun => {
@@ -470,8 +469,7 @@ export class CiGithub {
     const unique = [...new Map(required.map((check) => [JSON.stringify([check.context, check.appId]), check])).values()];
     const requiredRuns = () => latestRequiredRuns(runs).filter((run) => unique.some((check) => matchesRun(check, run)));
     let relevant = requiredRuns();
-    // A newer suite may have completed between the two reads. Refresh once if
-    // the run view may predate that completion; optional results do not decide readiness.
+    // Refresh once if the run view may predate a newer suite's completion.
     if (relevant.some((run) => suites.some((suite) => isNewerSuite(suite, run) && suite.status === "completed"
         && (suite.latestCheckRunsCount == null || hasRunCountMismatch(suite, runs))))) {
       runs = await readRuns("latest");
@@ -888,8 +886,7 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
   if (snapshot.required.length) {
     const listedSuites = new Map(snapshot.suites.map((suite) => [suiteKey(suite.id, suite.appId), suite]));
     const newestUnlisted = new Map<number | null, number>();
-    // A run reread can reveal suites missing from the earlier list, including
-    // those that have so far published only optional jobs.
+    // Runs can reveal unlisted suites, even if they contain only optional jobs.
     for (const { suiteId, appId } of snapshot.runs) {
       if (suiteId != null && !listedSuites.has(suiteKey(suiteId, appId))) {
         newestUnlisted.set(appId, Math.max(suiteId, newestUnlisted.get(appId) ?? 0));
@@ -913,7 +910,11 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
       const appReported = matchingRuns.length > 0 || snapshot.statuses.some((status) => status.context === required.context && status.verifiedAppId === required.appId);
       if (unverified) pending.push(label(required));
       if (foreign && appReported) record(label(required), "fail");
-      else if (foreign || !matchingRuns.length && !matchingStatuses.length && !unverified) missing.push(label(required));
+      else if (foreign || !matchingRuns.length && !matchingStatuses.length && !unverified) {
+        const incomplete = suites.some((suite) => (required.appId === null || suite.appId === required.appId)
+          && hasRunCountMismatch(suite, snapshot.runs));
+        (incomplete ? pending : missing).push(label(required));
+      }
       for (const run of matchingRuns) {
         // An active suite can hide a required rerun not yet materialized. Only
         // positive current-attempt job evidence permits same-suite optional work.
@@ -921,7 +922,7 @@ export function evaluateReadiness(snapshot: CiSnapshot, timing: CiReadinessTimin
         const ambiguous = associated ? associated.status !== "completed"
           : run.suiteId != null || suites.some((suite) => suite.status !== "completed");
         const corroborated = associated && snapshot.currentAttemptRunIds?.includes(run.id);
-        const incompleteSuite = associated?.status === "completed" && hasRunCountMismatch(associated, snapshot.runs);
+        const incompleteSuite = associated !== undefined && hasRunCountMismatch(associated, snapshot.runs);
         // Check unfiltered suites here: a newer suite may not have published its
         // first check yet. A completed suite with a run-count mismatch is also unresolved.
         const newerUnresolvedSuite = (run.suiteId != null && (newestUnlisted.get(run.appId) ?? 0) > run.suiteId)
