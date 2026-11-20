@@ -255,7 +255,7 @@ describe("native CI plugin entrypoint", () => {
     expect(manifest.tools).toEqual([registrationTool]);
     expect(registrationTool.parametersSchema).toMatchObject({ additionalProperties: false, required: ["issueId", "repo", "prNumber", "headSha"] });
     expect(manifest.jobs).toEqual([
-      expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/5 * * * *" }),
+      expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/2 * * * *" }),
       expect.objectContaining({ jobKey: "gates-status-sweep", schedule: "*/4 * * * *" }),
       expect.objectContaining({ jobKey: "pr-custody", schedule: "17 * * * *" }),
       expect.objectContaining({ jobKey: "dependency-wake", schedule: "*/5 * * * *" }),
@@ -2954,7 +2954,7 @@ describe("CI runtime bounded retention and work quotas", () => {
     expect(JSON.parse(audit.detail!)).toEqual({
       elapsedMs: 48, waitsAtStart: 2, waitsAttempted: 2, waitMs: 40, maxWaitMs: 23,
       reviewerEntriesAdmitted: 0, ledgerRpcMs: 23, ledgerWrites: 4, queuedYieldMs: 0, queuedYields: 0,
-      httpAttempts: 3, visible304s: 1, quotaChargedUpperBound: 2,
+      requests: 3, visible304s: 1, quotaChargedUpperBound: 2,
     });
     expect(audit.detail).not.toContain(TOKEN);
     expect(h.requestWakeup).not.toHaveBeenCalled();

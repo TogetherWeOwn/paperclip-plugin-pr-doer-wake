@@ -1161,7 +1161,7 @@ export class CiWakeRuntime {
       this.audit(ledger, "poll", "completed", undefined, undefined, JSON.stringify({
         elapsedMs: elapsed(passStarted), waitsAtStart: pending.length, waitsAttempted, waitMs, maxWaitMs,
         reviewerEntriesAdmitted, ledgerRpcMs, ledgerWrites, queuedYieldMs, queuedYields,
-        httpAttempts: requests, visible304s: notModified, quotaChargedUpperBound: requests - notModified,
+        requests, visible304s: notModified, quotaChargedUpperBound: requests - notModified,
       }));
     }
     await this.save(ledger);

@@ -47,7 +47,7 @@ const manifest: PaperclipPluginManifestV1 = {
   entrypoints: { worker: "./dist/worker.js" },
   tools: [registrationTool],
   jobs: [
-    { jobKey: "ci-wake-poll", displayName: "CI wait poll", description: "Recheck registered open waits without an LLM; backs up webhook hints when enabled. Retires moved heads and expired waits.", schedule: "*/5 * * * *" },
+    { jobKey: "ci-wake-poll", displayName: "CI wait poll", description: "Recheck registered open waits without an LLM; backs up webhook hints when enabled. Retires moved heads and expired waits.", schedule: "*/2 * * * *" },
     { jobKey: "gates-status-sweep", displayName: "Gates status sweep", description: "Publish paperclip/gates commit statuses from RM merge confirmations. Ships disabled; shadow mode logs only.", schedule: "*/4 * * * *" },
     { jobKey: "pr-custody", displayName: "PR custody", description: "Inventory organization PRs and request a disposition once per trigger. Separate opt-in and dry-run; incomplete evidence is UNKNOWN.", schedule: "17 * * * *" },
     { jobKey: "dependency-wake", displayName: "Dependency wake", description: "Wake in_review/in_progress dependents once per (dependent, blocker completion) after every blocker is done for 10 minutes, the assignee has not run since, and no run is live. Ships disabled and shadow-only; dryRun forces shadow.", schedule: "*/5 * * * *" },
