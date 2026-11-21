@@ -117,7 +117,7 @@ function setup(app = false) {
   return {
     runtime: () => new CiWakeRuntime(ctx, () => now),
     ledger: () => clone(durable!), effects, requestWakeup, fetch, resolveSecret,
-    advance: () => { now += 20_000; }, terminal: () => { terminal = true; },
+    advance: (ms = 20_000) => { now += ms; }, terminal: () => { terminal = true; },
     reply: (value: typeof reply) => { reply = value; },
     recoverState: () => { stateOffline = false; },
     nextRun: () => { ownerRun = NEXT_RUN; },
@@ -209,6 +209,38 @@ describe("plugin ledger without host idempotency", () => {
     expect(h.requestWakeup).toHaveBeenCalledTimes(1);
     expect(h.effects).toHaveLength(1);
     expect(h.ledger().audits.filter((a) => a.operation === "wake").map((a) => a.outcome)).toEqual(["intent", status]);
+  });
+
+  it("does not dispatch twice when the next scheduled poll overlaps an in-flight wake", async () => {
+    const h = setup(true);
+    const runtime = h.runtime();
+    expect(await runtime.register(registration, run)).toMatchObject({ data: { status: "open" } });
+    h.terminal();
+    let markDispatched!: () => void;
+    let releaseReply!: () => void;
+    const dispatched = new Promise<void>((resolve) => { markDispatched = resolve; });
+    const reply = new Promise<void>((resolve) => { releaseReply = resolve; });
+    const dispatch = h.requestWakeup.getMockImplementation()!;
+    h.requestWakeup.mockImplementationOnce(async (...args) => {
+      try { return await dispatch(...args); } finally { markDispatched(); await reply; }
+    });
+
+    const firstPoll = runtime.poll();
+    await Promise.race([dispatched, firstPoll]);
+    h.advance(300_000); // Force an overrun into the next five-minute schedule tick.
+    const overlappingPoll = runtime.poll();
+    try {
+      expect(h.ledger().waits[0]?.status).toBe("waking");
+      expect(h.effects).toEqual([{ issueId: ISSUE, companyId: COMPANY }]);
+    } finally {
+      releaseReply();
+      await Promise.all([firstPoll, overlappingPoll]);
+    }
+
+    expect(h.requestWakeup).toHaveBeenCalledTimes(1);
+    const ledger = h.ledger();
+    expect(ledger.waits[0]?.status).toBe("woken");
+    expect(ledger.audits.filter((a) => a.operation === "wake").map((a) => a.outcome)).toEqual(["intent", "woken"]);
   });
 
   it("recovers a durable waking intent after dispatch and total outcome-write failure without repeating the effect", async () => {

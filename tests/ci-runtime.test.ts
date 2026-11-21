@@ -55,7 +55,7 @@ const stateKey = { scopeKind: "instance", namespace: "ci-wake-v1", stateKey: "le
 type Ledger = {
   version: 1;
   waits: Wait[];
-  audits: Array<{ at: number; operation: string; outcome: string; waitId?: string }>;
+  audits: Array<{ at: number; operation: string; outcome: string; waitId?: string; detail?: string }>;
   deliveries: Record<string, number>;
   hints: Record<string, number>;
   samples: Record<string, Array<{ sha: string; ms: number }>>;
@@ -63,6 +63,7 @@ type Ledger = {
   reviewerWakes?: Record<string, number>;
 };
 const clone = <T>(value: T): T => structuredClone(value);
+const lastActionAudit = (ledger: Ledger) => ledger.audits.filter(({ operation, outcome }) => operation !== "poll" || outcome !== "completed").at(-1);
 const waitData = (result: ToolResult) => result.data as { waitId: string; status: string; expiresAt: number };
 function config(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { enabled: true, dryRun: false, allowedRepos: [REPO], githubTokenSecretRef: TOKEN_REF, webhooksEnabled: true, webhookSecretRef: WEBHOOK_REF, ...overrides };
@@ -254,7 +255,7 @@ describe("native CI plugin entrypoint", () => {
     expect(manifest.tools).toEqual([registrationTool]);
     expect(registrationTool.parametersSchema).toMatchObject({ additionalProperties: false, required: ["issueId", "repo", "prNumber", "headSha"] });
     expect(manifest.jobs).toEqual([
-      expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/15 * * * *" }),
+      expect.objectContaining({ jobKey: "ci-wake-poll", schedule: "*/2 * * * *" }),
       expect.objectContaining({ jobKey: "gates-status-sweep", schedule: "*/4 * * * *" }),
       expect.objectContaining({ jobKey: "pr-custody", schedule: "17 * * * *" }),
       expect.objectContaining({ jobKey: "dependency-wake", schedule: "*/5 * * * *" }),
@@ -744,7 +745,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     await h.runtime.poll();
     expect(h.requestWakeup).not.toHaveBeenCalled();
     expect(h.ledger().waits[0]?.status).toBe("would_wake");
-    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "wake", outcome: "would_wake" });
+    expect(lastActionAudit(h.ledger())).toMatchObject({ operation: "wake", outcome: "would_wake" });
     expect(h.logger.info).toHaveBeenCalledTimes(1);
     expect(h.logger.info).toHaveBeenCalledWith("ci-wake: would wake", expect.objectContaining({ repo: REPO, headSha: HEAD, verdict: "pass" }));
   });
@@ -911,7 +912,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
 
       await h.runtime.poll();
       expectReviewerDeadlineStops(h, 1, 0);
-      expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "pr_head_wake", outcome: "retryable" });
+      expect(lastActionAudit(h.ledger())).toMatchObject({ operation: "pr_head_wake", outcome: "retryable" });
       expect(github.pull).toHaveBeenCalledTimes(2);
       expect(h.configGet).toHaveBeenCalledTimes(1); // Entry config only, no authority re-read.
       expect(h.issueGet).not.toHaveBeenCalled();
@@ -1571,7 +1572,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     expect(h.ledger().waits[0]?.status).toBe(change === "tenant" ? "open" : "retired");
     if (change !== "tenant") {
       expect(h.ledger().waits[0]).toMatchObject({ reason: "binding_changed", finishedAt: START });
-      expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "poll", outcome: "binding_changed" });
+      expect(lastActionAudit(h.ledger())).toMatchObject({ operation: "poll", outcome: "binding_changed" });
       const attempts = github.pull.mock.calls.length;
       await h.runtime.poll();
       expect(github.pull).toHaveBeenCalledTimes(attempts);
@@ -1611,7 +1612,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     else h.workspaceGet.mockResolvedValueOnce(null as never);
     await h.runtime.poll();
     expect(h.ledger().waits[0]).toMatchObject({ status: "open" });
-    expect(h.ledger().audits.at(-1)?.outcome).toBe("retryable");
+    expect(lastActionAudit(h.ledger())?.outcome).toBe("retryable");
     expect(h.requestWakeup).not.toHaveBeenCalled();
     await h.runtime.poll();
     expect(h.ledger().waits[0]?.status).toBe("open");
@@ -1782,7 +1783,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     await h.runtime.poll();
     expect(h.ledger().waits[0]?.status).toBe("open");
     expect(h.ledger().waits[0]?.finishedAt).toBeUndefined();
-    expect(h.ledger().audits.at(-1)?.outcome).toBe("host_deferred");
+    expect(lastActionAudit(h.ledger())?.outcome).toBe("host_deferred");
     await h.runtime.poll();
     expect(h.requestWakeup).toHaveBeenCalledTimes(2);
     expect(h.requestWakeup.mock.calls[0]).toEqual(h.requestWakeup.mock.calls[1]);
@@ -1809,7 +1810,7 @@ describe("CI runtime polling and durable wake outcomes", () => {
     await h.runtime.poll();
     expect(h.ledger().waits[0]?.status).toBe("open");
     expect(h.ledger().waits[0]?.finishedAt).toBeUndefined();
-    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "wake", outcome: "host_deferred" });
+    expect(lastActionAudit(h.ledger())).toMatchObject({ operation: "wake", outcome: "host_deferred" });
     expect(h.logger.warn).not.toHaveBeenCalled();
     const restarted = new CiWakeRuntime(h.ctx, h.clock);
     await restarted.poll();
@@ -2634,7 +2635,7 @@ describe("bounded secret resolution", () => {
     expect(h.ledger().waits[0]).toMatchObject({ status: "open" });
     expect(github.snapshot).not.toHaveBeenCalled();
     expect(h.requestWakeup).not.toHaveBeenCalled();
-    expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "poll", outcome: "retryable" });
+    expect(lastActionAudit(h.ledger())).toMatchObject({ operation: "poll", outcome: "retryable" });
     hanging.settle(TOKEN);
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(github.snapshot).not.toHaveBeenCalled();
@@ -2919,6 +2920,44 @@ describe("CI runtime bounded retention and work quotas", () => {
     expect(github.snapshot).not.toHaveBeenCalled();
     expect(h.ledger().deliveries[`${COMPANY}:${DELIVERY}`]).toBe(START);
     expect(h.ledger().audits.at(-1)).toMatchObject({ operation: "webhook", outcome: "debounced" });
+  });
+
+  it("records aggregate wait time, persistence and conservative HTTP counts without extra state RPCs", async () => {
+    const h = setup();
+    await h.runtime.register(registration, run);
+    const ledger = h.ledger();
+    ledger.waits.push({ ...ledger.waits[0]!, waitId: "second-wait" });
+    h.seed(ledger);
+    const get = h.get.getMockImplementation()!;
+    const set = h.set.getMockImplementation()!;
+    h.get.mockImplementation(async (...args) => { h.advance(3); return get(...args); });
+    h.set.mockImplementation(async (...args) => { h.advance(5); return set(...args); });
+    h.get.mockClear();
+    h.set.mockClear();
+    h.fetch.mockResolvedValueOnce({ status: 304, headers: {}, body: "" });
+    h.fetch.mockResolvedValueOnce({ status: 200, headers: {}, body: "{}" });
+    h.fetch.mockRejectedValueOnce(new Error(TOKEN));
+    github.snapshot.mockImplementation(async () => {
+      const fetch = github.construct.mock.lastCall![0] as PluginContext["http"]["fetch"];
+      h.advance(7);
+      await fetch("https://api.github.com/repos/acme/widget");
+      h.advance(11);
+      await fetch("https://api.github.com/repos/acme/widget");
+      return {};
+    });
+    github.readiness.mockReturnValue(verdict("pending"));
+    await h.runtime.poll();
+    expect(h.get).toHaveBeenCalledTimes(1); // No per-wait reload without a queued writer.
+    expect(h.set).toHaveBeenCalledTimes(5); // Initial, two intents, one retryable, final summary piggyback.
+    const audit = h.ledger().audits.at(-1)!;
+    expect(audit).toMatchObject({ operation: "poll", outcome: "completed" });
+    expect(JSON.parse(audit.detail!)).toEqual({
+      elapsedMs: 48, waitsAtStart: 2, waitsAttempted: 2, waitMs: 40, maxWaitMs: 23,
+      reviewerEntriesAdmitted: 0, ledgerRpcMs: 23, ledgerWrites: 4, queuedYieldMs: 0, queuedYields: 0,
+      requests: 3, visible304s: 1, quotaChargedUpperBound: 2,
+    });
+    expect(audit.detail).not.toContain(TOKEN);
+    expect(h.requestWakeup).not.toHaveBeenCalled();
   });
 
   it("enforces the tick HTTP request budget before making an over-budget host request", async () => {
